@@ -1,0 +1,86 @@
+﻿<div>
+    <h4>ASP.Net MVC Pagination</h4>
+    <hr />
+</div>
+<div class="row">
+    <div class="col-lg-4">
+        <b>Search</b>
+        <input id="Search" class="form-control form-control-sm" />
+    </div>
+</div>
+<div class="table-responsive pt-4">
+    <table class="table table-sm" id="htmlTable_Users">
+        <thead>
+            <tr>
+                <th>Id</th>
+                <th>FirstName</th>
+                <th>LastName</th>
+                <th>Age</th>
+                <th>DateCreated</th>
+            </tr>
+        </thead>
+        <tbody>
+            @{
+                try // TAKE NOTE YOU MUST USE TRY CATCH HERE
+                {
+                    for (int i = Model.start; i < Model.end; i++)
+                    {
+                        <tr>
+                            <td>@Model.table[i].id</td>
+                            <td>@Model.table[i].firstname</td>
+                            <td>@Model.table[i].lastname</td>
+                            <td>@Model.table[i].age</td>
+                            <td>@Model.table[i].datecreated</td>
+                        </tr>
+                    }
+                }
+                catch { }
+
+                //THE PAGE ENTRY AND PAGINATION MUST BE ALWAY BELOW OR ABOVE THE TRY CATCH
+                <tr>
+                    <td colspan="5">
+                        <div>
+                            @Model.page_entry
+
+                        </div>
+                        <div>
+                            @Model.pagination
+                        </div>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+<script>
+
+    // FOR THE START UP USE GET METHOD
+    function SearchEvent(search) {
+        var url = document.location.origin + '/Home?data=' + search;
+        $.ajax({
+            url: url,
+            //data:params,
+            method: "GET",
+            contentType: 'application/json',
+            success: function (response) {
+                var result = $(response).find('#htmlTable_Users').html();
+                document.getElementById('htmlTable_Users').innerHTML = result;
+
+            },
+            error: function (xhr, textStatus, errorThrown) {
+                document.body.innerHTML = '<h4>INVALID HTTP REQUEST</h4>' + '<br>' + xhr.responseText;
+            }
+        });
+    }
+
+
+    // I JUST CALLING THE SearchEvent(search)
+    var Search = document.getElementById('Search');
+    Search.addEventListener('keyup', function (e) {
+        var search = document.getElementById(e.target.id).value;
+        SearchEvent(search);
+
+    });
+
+
+</script>

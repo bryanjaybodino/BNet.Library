@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+	<PropertyGroup>
+		<TargetFrameworks>net5.0;net6.0;net7.0;net8.0;netcoreapp3.0;netcoreapp3.1</TargetFrameworks>
+		<LangVersion>8.0</LangVersion>
+		<Nullable>enable</Nullable>
+		<IncludeLicenseFile>false</IncludeLicenseFile>
+		<OutputType>Library</OutputType>
+		<Authors>Bryan Jay Bodino</Authors>
+		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+		<Title>BNet.ASP.MVC.Pagination</Title>
+		<Version>1.0.0</Version>
+		<Description>Easy Backend Pagination for ASP.NET MVC with Customizable Properties
+
+This library is based on the WebForms GridView.</Description>
+	</PropertyGroup>
+</Project>
