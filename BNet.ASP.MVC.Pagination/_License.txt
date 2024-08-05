@@ -1,0 +1,5 @@
+Created By : https://bryanjaybodino.com
+Date Created : 2024-08-05
+
+https://dotnet.microsoft.com/en-us/download/visual-studio-sdks
+C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework

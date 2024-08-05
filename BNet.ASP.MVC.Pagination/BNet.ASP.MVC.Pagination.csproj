@@ -7,10 +7,40 @@
 		<OutputType>Library</OutputType>
 		<Authors>Bryan Jay Bodino</Authors>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+		<PackageOutputPath>$(OutputPath)</PackageOutputPath>
+		<IsPackable>true</IsPackable>
 		<Title>BNet.ASP.MVC.Pagination</Title>
 		<Version>1.0.0</Version>
-		<Description>Easy Backend Pagination for ASP.NET MVC with Customizable Properties
-
+		<Description>Easy Backend Pagination for ASP.NET MVC with Customizable Properties.
 This library is based on the WebForms GridView.</Description>
+		<PackageProjectUrl>https://github.com/bryanjaybodino/BNet.Library</PackageProjectUrl>
+		<PackageReadmeFile>_README.md</PackageReadmeFile>
+		<PackageLicenseFile>_License.txt</PackageLicenseFile>
 	</PropertyGroup>
+	<PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net8.0|AnyCPU'">
+	  <WarningLevel>4</WarningLevel>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Release|net8.0|AnyCPU'">
+	  <WarningLevel>4</WarningLevel>
+	</PropertyGroup>
+	<ItemGroup>
+	  <None Include="..\..\Users\admin\Music\BNet.ASP.MVC.Pagination\_License.txt">
+	    <Pack>True</Pack>
+	    <PackagePath>\</PackagePath>
+	  </None>
+	  <None Include="..\..\Users\admin\Music\BNet.ASP.MVC.Pagination\_README.md">
+	    <Pack>True</Pack>
+	    <PackagePath>\</PackagePath>
+	  </None>
+	</ItemGroup>
+	<ItemGroup>
+	  <None Update="_License.txt">
+	    <Pack>True</Pack>
+	    <PackagePath>\</PackagePath>
+	  </None>
+	  <None Update="_README.md">
+	    <Pack>True</Pack>
+	    <PackagePath>\</PackagePath>
+	  </None>
+	</ItemGroup>
 </Project>
