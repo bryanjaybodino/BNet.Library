@@ -3,7 +3,7 @@ This library is based on the WebForms GridView.
 
 This Library Helps you to create a pagination on the backend.
 
-Notes : You Muse know how to use Entity Framework for Binding the Models to the Object
+Notes : You Must know how to use Entity Framework for Binding the Models to the Object
 
 
 <div class="richText-editor" id="richText-8wgh5" contenteditable="true" style="height: auto;"><div>&nbsp;</div><div><b><br>Version : .<font color="#ff0000">Net 5 or Higher</font></b><br></div><div><b>Features :</b><ul><li>First And Last Page Buttons</li><li>Page Entry Information</li><li>Customize Pagination using CSS</li><li>Customizable RowSize and PageSize<br></li></ul><h2>
