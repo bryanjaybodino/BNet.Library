@@ -5,11 +5,11 @@
 <div class="row">
     <div class="col-lg-4">
         <b>Search</b>
-        <input id="Search" class="form-control form-control-sm" />
+        <input id="Search" onkeyup="SearchEvent()" class="form-control form-control-sm" />
     </div>
 </div>
 <div class="table-responsive pt-4">
-    <table class="table table-sm" id="htmlTable_Users">
+    <table class="table table-sm" id="htmlTableUsers">
         <thead>
             <tr>
                 <th>Id</th>
@@ -53,34 +53,13 @@
     </table>
 </div>
 <script>
-
-    // FOR THE START UP USE GET METHOD
-    function SearchEvent(search) {
-        var url = document.location.origin + '/Home?data=' + search;
-        $.ajax({
-            url: url,
-            //data:params,
-            method: "GET",
-            contentType: 'application/json',
-            success: function (response) {
-                var result = $(response).find('#htmlTable_Users').html();
-                document.getElementById('htmlTable_Users').innerHTML = result;
-
-            },
-            error: function (xhr, textStatus, errorThrown) {
-                document.body.innerHTML = '<h4>INVALID HTTP REQUEST</h4>' + '<br>' + xhr.responseText;
-            }
+    //// VERSION 1.0.1
+    function SearchEvent() 
+    {
+        var val = document.getElementById('Search').value;
+        htmlTableUsers_SearchEvent({
+            search: val, // search this is the parameter from your controller IndexAsync(string search,string test)
+            test: "Add more filter"
         });
     }
-
-
-    // I JUST CALLING THE SearchEvent(search)
-    var Search = document.getElementById('Search');
-    Search.addEventListener('keyup', function (e) {
-        var search = document.getElementById(e.target.id).value;
-        SearchEvent(search);
-
-    });
-
-
 </script>

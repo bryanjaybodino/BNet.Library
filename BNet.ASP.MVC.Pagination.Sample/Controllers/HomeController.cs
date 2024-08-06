@@ -1,6 +1,7 @@
 using BNet.ASP.MVC.Pagination.Sample.Models;
 using BNet.ASP.MVC.Pagination.Sample.Repositories;
 using Microsoft.AspNetCore.Mvc;
+using static BNet.ASP.MVC.Pagination.GridView;
 
 namespace BNet.ASP.MVC.Pagination.Sample.Controllers
 {
@@ -14,40 +15,35 @@ namespace BNet.ASP.MVC.Pagination.Sample.Controllers
             this.usersServices = usersServices;
         }
 
-
-        #region THIS IS THE DEFAULT PATTERN
         BNet.ASP.MVC.Pagination.GridView gridView = new GridView();
-        private void setPagination(List<users_table.dataDTO> users_table, string NewPageIndex = "0")
+        public async Task<IActionResult> IndexAsync(string? search,string? test)
         {
-            //htmlTable_Users <<--- THIS IS THE ID OF YOUR HTML TABLE IN YOUR VIEW
+            search = search ?? string.Empty;
+            HttpContext.Session.SetString("Search", search); // CALL THE 
+            List<users_table.dataDTO> users_table = await usersServices.GetAllAsync(search);
+
             gridView.FirstAndLast = true; //OPTIONAL
-            gridView.SetGriView(users_table, "Home/Pagination", "htmlTable_Users", 5, 5, NewPageIndex);
-            gridView.PaginationChanged += GridView_PaginationChanged;
-        }
-
-        //YOU CAN MODIFY THE ROUTE NAME
-        [Route("Home/Pagination")] //THIS IS THE ROUTE NAME -> PUT THIS TO YOUR SetGridView() 
-        [HttpPost]
-        public async Task<IActionResult> GridView_PaginationChanged(string NewPageIndex)
-        {
-            // IN MY EXAMPLE I HAVE 1 SEARCH FILTER. YOU CAN ADD MORE ARGUMENTS IN YOUR SERVICES
-            string Search = HttpContext.Session.GetString("Search"); // YOU MUST USE SESSION FOR SEARCH 
-            List<users_table.dataDTO> users_table = await usersServices.GetAllAsync(Search);
-            setPagination(users_table, NewPageIndex);
-            return PartialView("~/Views/Home/Index.cshtml", gridView);
-        }
-        #endregion
-
-
-
-        #region YOUR INDEX MUST LOOK LIKE THIS
-        public async Task<IActionResult> IndexAsync(string? data = "")
-        {
-            HttpContext.Session.SetString("Search", data); // CALL THE 
-            List<users_table.dataDTO> users_table = await usersServices.GetAllAsync(data);
-            setPagination(users_table);
+            gridView.SetGridView(this.HttpContext, users_table, "Home/Pagination", "htmlTableUsers", 8, 5);
+            gridView.PaginationChanged += GridView_PaginationChanged; 
             return View("~/Views/Home/Index.cshtml", gridView);
         }
-        #endregion
+
+        //You can modify the route name but make sure it is similar to your SetGridView()
+        [Route("Home/Pagination")] //THIS IS THE ROUTE NAME -> PUT THIS TO YOUR SetGridView() 
+        [HttpPost]//POST REQUIRED
+        public async Task<IActionResult> GridView_PaginationChanged(PaginationChangedEventArgs e)
+        {
+            string Search = HttpContext.Session.GetString("Search"); // You must use session here to maintain your search filter while paginated
+            List<users_table.dataDTO> users_table = await usersServices.GetAllAsync(Search); // Call again your services here
+            gridView.NewPagination(this.HttpContext, users_table, e);
+            return PartialView("~/Views/Home/Index.cshtml", gridView);
+        }
     }
 }
+
+
+// FOR Version 1.0.1 
+//call this codes to your View.cshtml For SEARCH FILTER
+//htmlTableUsers_SearchEvent({parameterName:'your filter'});
+
+//htmlTableUsers <<--- This is the id of your HTML Tabe in your view.cshtml
