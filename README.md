@@ -6,7 +6,7 @@ This Library Helps you to create a pagination on the backend.
 Notes : You Muse know how to use Entity Framework for Binding the Models to the Object
 
 
-<div class="richText-editor" id="richText-8wgh5" contenteditable="true" style="height: auto;"><div>BNET Pagination Library for ASP.Net Core MVC&nbsp;</div><div><b><br>Version : .<font color="#ff0000">Net 5 or Higher</font></b><br></div><div><b>Features :</b><ul><li>First And Last Page Buttons</li><li>Page Entry Information</li><li>Customize Pagination using CSS</li><li>Customizable RowSize and PageSize<br></li></ul><h2>
+<div class="richText-editor" id="richText-8wgh5" contenteditable="true" style="height: auto;"><div>&nbsp;</div><div><b><br>Version : .<font color="#ff0000">Net 5 or Higher</font></b><br></div><div><b>Features :</b><ul><li>First And Last Page Buttons</li><li>Page Entry Information</li><li>Customize Pagination using CSS</li><li>Customizable RowSize and PageSize<br></li></ul><h2>
 Documentations<font color="#4f81bd"><br></font></h2><h4><font color="#4f81bd">GridView</font> gridView = new <font color="#4f81bd">GridView</font>();</h4><h4><table class="MsoNormalTable" border="1" cellspacing="0" cellpadding="0" width="1147" style="width: 573.3pt; background-image: initial; background-position: initial; background-size: initial; background-repeat: initial; background-attachment: initial; background-origin: initial; background-clip: initial; border-collapse: collapse; border: none;">
 <tbody><tr>
 <td style="border-width: 1pt; padding: 7.5pt;">
