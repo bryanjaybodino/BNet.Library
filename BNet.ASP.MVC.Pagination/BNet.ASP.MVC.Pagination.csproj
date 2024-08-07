@@ -10,7 +10,7 @@
 		<PackageOutputPath>$(OutputPath)</PackageOutputPath>
 		<IsPackable>true</IsPackable>
 		<Title>BNet.ASP.MVC.Pagination</Title>
-		<Version>1.0.0</Version>
+		<Version>1.0.2</Version>
 		<Description>Easy Backend Pagination for ASP.NET MVC with Customizable Properties.
 This library is based on the WebForms GridView.</Description>
 		<PackageProjectUrl>https://github.com/bryanjaybodino/BNet.Library</PackageProjectUrl>
