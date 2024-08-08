@@ -1,4 +1,5 @@
-﻿using System.Collections.Concurrent;
+﻿using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Security;
@@ -8,14 +9,15 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using static System.Net.Mime.MediaTypeNames;
 
 
 namespace BNet.WebSocket.Server
 {
-    public class Connection
+    public class Connection : EventHandlers
     {
-        private EventHandlers _eventHandlers = new EventHandlers();
-        public EventHandlers EventHandlers => _eventHandlers; // Expose the event handlers
+        ////private EventHandlers _eventHandlers = new EventHandlers();
+        ////public EventHandlers EventHandlers => _eventHandlers; // Expose the event handlers
 
 
         #region Constructors
@@ -24,6 +26,14 @@ namespace BNet.WebSocket.Server
             _listener = new TcpListener(IPAddress.Any, port);
         }
         #endregion
+
+        #region Setup
+        public void Setup(int port)
+        {
+            _listener = new TcpListener(IPAddress.Any, port);
+        }
+        #endregion
+
 
         #region Private Components
         private ConcurrentDictionary<TcpClient, Task> _clients = new ConcurrentDictionary<TcpClient, Task>();
@@ -42,13 +52,11 @@ namespace BNet.WebSocket.Server
         public void LoadCertificate(string path, string password)
         {
             ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
-            //System.Net.ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12 | SecurityProtocolType.Ssl3;
             _serverCertificate = new X509Certificate2(path, password);
         }
         public void LoadCertificate(byte[] rawData, string password)
         {
             ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
-            //System.Net.ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12 | SecurityProtocolType.Ssl3;
             _serverCertificate = new X509Certificate2(rawData, password);
         }
         #endregion
@@ -79,8 +87,7 @@ namespace BNet.WebSocket.Server
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"StartAsync: {ex.Message}");
-                        // You might want to log exceptions and continue accepting new clients
+                        SetOnError($"StartAsync : {ex.Message}");
                     }
                 }
             }
@@ -116,13 +123,12 @@ namespace BNet.WebSocket.Server
                 }
                 catch (OperationCanceledException ex)
                 {
-                    Console.WriteLine($"StopAsync : {ex.Message}");
+                    SetOnError($"StopAsync : {ex.Message}");
                 }
-                Console.WriteLine("Server stopped.");
             }
-            catch (Exception ex) {
-
-                Console.WriteLine($"StopAsync : {ex.Message}");
+            catch (Exception ex)
+            {
+                SetOnError($"StopAsync : {ex.Message}");
             }
         }
 
@@ -144,7 +150,7 @@ namespace BNet.WebSocket.Server
         private async Task HandleClientAsync(TcpClient client)
         {
             try
-            {        
+            {
                 NetworkStream stream = client.GetStream();
                 Stream NewStream = await HandleSecurityAsync(stream);
 
@@ -158,7 +164,7 @@ namespace BNet.WebSocket.Server
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"HandleClientAsync : {ex.Message}");
+                SetOnError($"HandleClientAsync : {ex.Message}");
             }
             finally
             {
@@ -169,21 +175,24 @@ namespace BNet.WebSocket.Server
         private async Task HandleStartupAsync(TcpClient client, Stream stream)
         {
             // Perform the WebSocket handshake
-            string handshakeRequest = await ReadRequestAsync(stream);
+            string handshakeRequest = await ReadRequestAsync(client, stream);
             if (IsWebSocketHandshake(handshakeRequest, out string key))
             {
                 await SendHandshakeResponseAsync(stream, key);
-                _eventHandlers.OnConnectedClient(_clients.Count);
+                SetOnConnectedClient(_clients.Count);
+
+
 
 
                 // Enter WebSocket communication loop
                 while (client.Connected)
                 {
-                    string message = await ReadMessageAsync(stream);
+                    string message = await ReadMessageAsync(client, stream);
                     if (message != null)
                     {
-                        _eventHandlers.OnReceived(message);
-                        await SendMessageAsync(stream, message); // Echo back
+                        SetOnReceived(message); 
+                        //SEND TO ALL CLIENT
+                        await SendMessageAsync(message);
                     }
                 }
             }
@@ -191,9 +200,9 @@ namespace BNet.WebSocket.Server
 
 
 
-        private async Task<string> ReadRequestAsync(Stream stream)
+        private async Task<string> ReadRequestAsync(TcpClient client, Stream stream)
         {
-            byte[] buffer = new byte[1024];
+            byte[] buffer = new byte[client.ReceiveBufferSize];
             int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
             return Encoding.UTF8.GetString(buffer, 0, bytesRead);
         }
@@ -234,14 +243,14 @@ namespace BNet.WebSocket.Server
             responseBuilder.AppendLine("Upgrade: websocket");
             responseBuilder.AppendLine("Connection: Upgrade");
             responseBuilder.AppendLine($"Sec-WebSocket-Accept: {CalculateWebSocketAcceptKey(key)}");
-            responseBuilder.AppendLine(); // Adds the \r\n\r\n at the end of the response
+            responseBuilder.AppendLine(); // Adds the \r\n\rn at the end of the response
             byte[] responseBytes = Encoding.UTF8.GetBytes(responseBuilder.ToString());
             await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
         }
 
-        private async Task<string> ReadMessageAsync(Stream stream)
+        private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
         {
-            byte[] buffer = new byte[1024];
+            byte[] buffer = new byte[client.ReceiveBufferSize];
             int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
 
             if (bytesRead == 0) return null;
@@ -264,7 +273,7 @@ namespace BNet.WebSocket.Server
             }
             else if (payloadLength == 127)
             {
-                // Handle extended payload length if needed
+                throw new NotImplementedException("Payload length 127 (64-bit length) is not supported.");
             }
 
             // Masking key
@@ -321,26 +330,24 @@ namespace BNet.WebSocket.Server
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"SendMessageAsync : {ex.Message}");
+                    SetOnError($"SendMessageAsync : {ex.Message}");
                 }
             }
         }
 
-
-
         private void dictionaryTCPClientRemove(TcpClient client)
         {
-            for(int i =0; i < _clients.Keys.Count; i++)
+            for (int i = 0; i < _clients.Keys.Count; i++)
             {
                 if (_clients.Keys.ElementAt(i) == client)
                 {
-                   var stream = _streams.ElementAt(i).Key;
+                    var stream = _streams.ElementAt(i).Key;
                     _streams.TryRemove(stream, out _);
                     break;
                 }
             }
             _clients.TryRemove(client, out _);
-            _eventHandlers.OnDisconnectedClient(_clients.Count);
+            SetOnDisconnectedClient(_clients.Count);
         }
     }
 }

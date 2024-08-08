@@ -12,10 +12,10 @@ namespace BNet.WebSocket.Server
         }
 
         public delegate void ReceivedEventHandler(ReceivedEventArgs e);
-        public event ReceivedEventHandler Received;
-        public void OnReceived(string message)
+        public event ReceivedEventHandler OnReceived;
+        public void SetOnReceived(string message)
         {
-            Received?.Invoke(new ReceivedEventArgs { Message = message });
+            OnReceived?.Invoke(new ReceivedEventArgs { Message = message });
         }
         #endregion
 
@@ -26,10 +26,10 @@ namespace BNet.WebSocket.Server
         }
 
         public delegate void ConnectedClientEventHandler(ConnectedClientEventArgs e);
-        public event ConnectedClientEventHandler ConnectedClient;
-        public void OnConnectedClient(int count)
+        public event ConnectedClientEventHandler OnConnectedClient;
+        public void SetOnConnectedClient(int count)
         {
-            ConnectedClient?.Invoke(new ConnectedClientEventArgs { Count = count });
+            OnConnectedClient?.Invoke(new ConnectedClientEventArgs { Count = count });
         }
         #endregion
 
@@ -40,10 +40,24 @@ namespace BNet.WebSocket.Server
         }
 
         public delegate void DisconnectedClientEventHandler(DisconnectedClientEventArgs e);
-        public event DisconnectedClientEventHandler DisconnectedClient;
-        public void OnDisconnectedClient(int count)
+        public event DisconnectedClientEventHandler OnDisconnectedClient;
+        public void SetOnDisconnectedClient(int count)
         {
-            DisconnectedClient?.Invoke(new DisconnectedClientEventArgs { Count = count });
+            OnDisconnectedClient?.Invoke(new DisconnectedClientEventArgs { Count = count });
+        }
+        #endregion
+
+        #region OnError
+        public class ErrorEventArgs : EventArgs
+        {
+            public string Message { get; set; }
+        }
+
+        public delegate void ErrorEventHandler(ErrorEventArgs e);
+        public event ErrorEventHandler OnError;
+        public void SetOnError(string message)
+        {
+            OnError?.Invoke(new ErrorEventArgs { Message = message });
         }
         #endregion
     }
