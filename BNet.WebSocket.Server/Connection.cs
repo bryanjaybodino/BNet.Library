@@ -252,71 +252,97 @@ namespace BNet.WebSocket.Server
             var messageBuilder = new List<byte>();
             bool isFinalFragment = false;
 
-            while (!isFinalFragment)
+            // You can adjust the buffer size based on your requirements
+            int bufferSize = client.ReceiveBufferSize;
+
+            try
             {
-                byte[] buffer = new byte[client.ReceiveBufferSize];
-                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-
-                if (bytesRead == 0)
+                while (!isFinalFragment)
                 {
-                    // Connection closed
-                    return null;
+                    var buffer = new byte[bufferSize];
+                    var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+
+                    if (bytesRead == 0)
+                    {
+                        // Connection closed
+                        return null;
+                    }
+
+                    // Process WebSocket frame header
+                    var b0 = buffer[0];
+                    isFinalFragment = (b0 & 0x80) != 0;
+                    var isTextFrame = (b0 & 0x0F) == 1;
+
+                    if (!isTextFrame)
+                    {
+                        throw new NotImplementedException("Only text frames are supported.");
+                    }
+
+                    // Determine payload length
+                    int payloadLength = buffer[1] & 0x7F;
+                    int headerSize = 2;
+
+                    if (payloadLength == 126)
+                    {
+                        payloadLength = (buffer[2] << 8) | buffer[3];
+                        headerSize += 2;
+                    }
+                    else if (payloadLength == 127)
+                    {
+                        payloadLength = (int)(
+                            ((long)buffer[2] << 56) |
+                            ((long)buffer[3] << 48) |
+                            ((long)buffer[4] << 40) |
+                            ((long)buffer[5] << 32) |
+                            ((long)buffer[6] << 24) |
+                            ((long)buffer[7] << 16) |
+                            ((long)buffer[8] << 8) |
+                            ((long)buffer[9])
+                        );
+                        headerSize += 8;
+                    }
+
+                    if (headerSize + 4 > bytesRead)
+                    {
+                        throw new InvalidOperationException("Header size exceeds bytes read.");
+                    }
+
+                    var maskingKey = new byte[4];
+                    Array.Copy(buffer, headerSize, maskingKey, 0, 4);
+
+                    var payloadOffset = headerSize + 4;
+                    var payloadSize = bytesRead - payloadOffset;
+
+                    if (payloadSize < 0)
+                    {
+                        throw new InvalidOperationException("Payload size calculation error.");
+                    }
+
+                    var payload = new byte[payloadSize];
+                    Array.Copy(buffer, payloadOffset, payload, 0, payloadSize);
+
+                    // Unmask the payload
+                    for (var i = 0; i < payload.Length; i++)
+                    {
+                        payload[i] ^= maskingKey[i % 4];
+                    }
+
+                    messageBuilder.AddRange(payload);
+
+                    if (isFinalFragment)
+                    {
+                        break;
+                    }
                 }
 
-                byte b0 = buffer[0];
-                isFinalFragment = (b0 & 0x80) != 0;
-                bool isTextFrame = (b0 & 0x0F) == 1;
-
-                if (!isTextFrame)
-                {
-                    throw new NotImplementedException("Only text frames are supported.");
-                }
-
-                int payloadLength = buffer[1] & 0x7F;
-                int headerSize = 2;
-
-                if (payloadLength == 126)
-                {
-                    payloadLength = (buffer[2] << 8) | buffer[3];
-                    headerSize += 2;
-                }
-                else if (payloadLength == 127)
-                {
-                    payloadLength = (int)(
-                        ((long)buffer[2] << 56) |
-                        ((long)buffer[3] << 48) |
-                        ((long)buffer[4] << 40) |
-                        ((long)buffer[5] << 32) |
-                        ((long)buffer[6] << 24) |
-                        ((long)buffer[7] << 16) |
-                        ((long)buffer[8] << 8) |
-                        ((long)buffer[9])
-                    );
-                    headerSize += 8;
-                }
-
-                byte[] maskingKey = new byte[4];
-                Array.Copy(buffer, headerSize, maskingKey, 0, 4);
-
-                int payloadOffset = headerSize + 4;
-                int payloadSize = bytesRead - payloadOffset;
-                byte[] payload = new byte[payloadSize];
-                Array.Copy(buffer, payloadOffset, payload, 0, payloadSize);
-
-                for (int i = 0; i < payload.Length; i++)
-                {
-                    payload[i] ^= maskingKey[i % 4];
-                }
-
-                messageBuilder.AddRange(payload);
-
-                if (isFinalFragment)
-                {
-                    break;
-                }
+                return Encoding.UTF8.GetString(messageBuilder.ToArray());
             }
-
-            return Encoding.UTF8.GetString(messageBuilder.ToArray());
+            catch (Exception ex)
+            {
+                Console.WriteLine($"ReadMessageAsync error: {ex.Message}");
+                // Optionally, handle specific exceptions or log details
+                return null;
+            }
         }
 
         private async Task WriteMessageAsync(Stream stream, string message)
