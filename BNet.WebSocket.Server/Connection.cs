@@ -1,46 +1,67 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Reflection.Metadata;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
+using static System.Net.Mime.MediaTypeNames;
+
 
 namespace BNet.WebSocket.Server
 {
     public class Connection : EventHandlers
     {
-        private ConcurrentDictionary<TcpClient, Task> _clients = new ConcurrentDictionary<TcpClient, Task>();
-        private ConcurrentDictionary<Stream, TcpClient> _streams = new ConcurrentDictionary<Stream, TcpClient>();
-        private readonly ConcurrentDictionary<Task, CancellationTokenSource> _clientCancellationTokens = new ConcurrentDictionary<Task, CancellationTokenSource>();
-        private TcpListener _listener { get; set; }
-        public Dictionary<string, string> UserCredentials = new Dictionary<string, string>();
-        public bool isRunning { get; private set; }
-        private X509Certificate2 _serverCertificate { get; set; }
+        ////private EventHandlers _eventHandlers = new EventHandlers();
+        ////public EventHandlers EventHandlers => _eventHandlers; // Expose the event handlers
 
+
+        #region Constructors
         public Connection(int port)
         {
             _listener = new TcpListener(IPAddress.Any, port);
         }
+        #endregion
 
+        #region Setup
+        public void Setup(int port)
+        {
+            _listener = new TcpListener(IPAddress.Any, port);
+        }
+        #endregion
+
+
+        #region Private Components
+        private ConcurrentDictionary<TcpClient, Task> _clients = new ConcurrentDictionary<TcpClient, Task>();
+        private ConcurrentDictionary<Stream, Task> _streams = new ConcurrentDictionary<Stream, Task>();
+        private readonly ConcurrentDictionary<Task, CancellationTokenSource> _clientCancellationTokens = new ConcurrentDictionary<Task, CancellationTokenSource>();
+        private TcpListener _listener { get; set; }
+        #endregion
+
+        #region Public Components
+        public Dictionary<string, string> UserCredentials = new Dictionary<string, string>();
+        public bool isRunning { get; private set; }
+        #endregion
+
+        #region Certificates
+        private X509Certificate2 _serverCertificate { get; set; }
         public void LoadCertificate(string path, string password)
         {
             ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
             _serverCertificate = new X509Certificate2(path, password);
         }
-
         public void LoadCertificate(byte[] rawData, string password)
         {
             ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
             _serverCertificate = new X509Certificate2(rawData, password);
         }
+        #endregion
 
+        #region StartAsync
         public async Task StartAsync()
         {
             try
@@ -53,12 +74,16 @@ namespace BNet.WebSocket.Server
                 {
                     try
                     {
+                        // Accept a new client
                         var client = await _listener.AcceptTcpClientAsync();
+
                         var clientCancellationTokenSource = new CancellationTokenSource();
+                        // Handle the new client connection
                         var clientTask = Task.Run(() => HandleClientAsync(client), clientCancellationTokenSource.Token);
 
+
+                        // Store the task in the dictionary
                         _clients[client] = clientTask;
-                        _clientCancellationTokens[clientTask] = clientCancellationTokenSource;
                     }
                     catch (Exception ex)
                     {
@@ -66,12 +91,11 @@ namespace BNet.WebSocket.Server
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                SetOnError($"StartAsync : {ex.Message}");
-            }
+            catch { }
         }
+        #endregion
 
+        #region StopAsync
         public async Task StopAsync()
         {
             try
@@ -79,23 +103,27 @@ namespace BNet.WebSocket.Server
                 isRunning = false;
                 _listener.Stop();
 
-                foreach (var tokenSource in _clientCancellationTokens.Values)
+                // Cancel all client tasks and await their completion
+                var cancellationTasks = new List<Task>();
+                foreach (var cancellationTokenSource in _clientCancellationTokens.Values)
                 {
-                    tokenSource.Cancel();
+                    cancellationTokenSource.Cancel();
                 }
-
                 foreach (var clientTask in _clients.Values)
                 {
-                    try
-                    {
-                        await clientTask;
-                    }
-                    catch (OperationCanceledException) { }
+                    cancellationTasks.Add(clientTask);
                 }
-
-                foreach (var stream in _streams.Keys)
+                foreach (var streamTask in _streams.Values)
                 {
-                    stream.Close();
+                    cancellationTasks.Add(streamTask);
+                }
+                try
+                {
+                    await Task.WhenAll(cancellationTasks);
+                }
+                catch (OperationCanceledException ex)
+                {
+                    SetOnError($"StopAsync : {ex.Message}");
                 }
             }
             catch (Exception ex)
@@ -104,28 +132,34 @@ namespace BNet.WebSocket.Server
             }
         }
 
+        #endregion
         private async Task<Stream> HandleSecurityAsync(Stream stream)
         {
-            if (_serverCertificate != null)
+            bool isSecure = _serverCertificate != null;
+            if (isSecure)
             {
-                var sslStream = new SslStream(stream, false);
+                SslStream sslStream = new SslStream(stream, false);
                 await sslStream.AuthenticateAsServerAsync(_serverCertificate);
                 return sslStream;
             }
-            return stream;
+            else
+            {
+                return stream;
+            }
         }
-
         private async Task HandleClientAsync(TcpClient client)
         {
             NetworkStream stream = client.GetStream();
-            Stream secureStream = await HandleSecurityAsync(stream);
-
+            Stream NewStream = await HandleSecurityAsync(stream);
+            //SAVE STREAM TO LIST TO SEND SERVER INFORMATION TO ALL CLIENTS
             var clientCancellationTokenSource = new CancellationTokenSource();
             var streamTask = Task.Run(() => clientCancellationTokenSource.Token);
-            _streams[secureStream] = client;
+            _streams[NewStream] = streamTask;
+
             try
             {
-                await HandleStartupAsync(client, secureStream);
+                //START WEBSOCKET
+                await HandleStartupAsync(client, NewStream);
             }
             catch (Exception ex)
             {
@@ -136,30 +170,34 @@ namespace BNet.WebSocket.Server
                 if (client.Connected)
                 {
                     client.Close();
+                    dictionaryTCPClientRemove(client);
                 }
-                dictionaryTCPClientRemove(client);
             }
         }
-
         private async Task HandleStartupAsync(TcpClient client, Stream stream)
         {
+            // Perform the WebSocket handshake
             string handshakeRequest = await ReadRequestAsync(client, stream);
             if (IsWebSocketHandshake(handshakeRequest, out string key))
             {
                 await SendHandshakeResponseAsync(stream, key);
                 SetOnConnectedClient(_streams.Count);
 
+                // Enter WebSocket communication loop
                 while (client.Connected)
                 {
                     string message = await ReadMessageAsync(client, stream);
                     if (message != null)
                     {
                         SetOnReceived(message);
+                        //SEND TO ALL CLIENT
                         await SendMessageAsync(message);
                     }
                 }
             }
         }
+
+
 
         private async Task<string> ReadRequestAsync(TcpClient client, Stream stream)
         {
@@ -173,6 +211,7 @@ namespace BNet.WebSocket.Server
             key = null;
             if (request.Contains("Upgrade: websocket") && request.Contains("Connection: Upgrade"))
             {
+                // Extract Sec-WebSocket-Key
                 var lines = request.Split("\r\n");
                 foreach (var line in lines)
                 {
@@ -191,7 +230,7 @@ namespace BNet.WebSocket.Server
             string CalculateWebSocketAcceptKey(string key)
             {
                 var magicGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-                using (var sha1 = SHA1.Create())
+                using (var sha1 = System.Security.Cryptography.SHA1.Create())
                 {
                     var keyBytes = Encoding.UTF8.GetBytes(key + magicGuid);
                     var hashBytes = sha1.ComputeHash(keyBytes);
@@ -203,7 +242,7 @@ namespace BNet.WebSocket.Server
             responseBuilder.AppendLine("Upgrade: websocket");
             responseBuilder.AppendLine("Connection: Upgrade");
             responseBuilder.AppendLine($"Sec-WebSocket-Accept: {CalculateWebSocketAcceptKey(key)}");
-            responseBuilder.AppendLine();
+            responseBuilder.AppendLine(); // Adds the \r\n\rn at the end of the response
             byte[] responseBytes = Encoding.UTF8.GetBytes(responseBuilder.ToString());
             await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
         }
@@ -213,6 +252,7 @@ namespace BNet.WebSocket.Server
             var messageBuilder = new List<byte>();
             bool isFinalFragment = false;
 
+            // You can adjust the buffer size based on your requirements
             int bufferSize = client.ReceiveBufferSize;
 
             try
@@ -224,9 +264,11 @@ namespace BNet.WebSocket.Server
 
                     if (bytesRead == 0)
                     {
+                        // Connection closed
                         return null;
                     }
 
+                    // Process WebSocket frame header
                     var b0 = buffer[0];
                     isFinalFragment = (b0 & 0x80) != 0;
                     var isTextFrame = (b0 & 0x0F) == 1;
@@ -236,6 +278,7 @@ namespace BNet.WebSocket.Server
                         throw new NotImplementedException("Only text frames are supported.");
                     }
 
+                    // Determine payload length
                     int payloadLength = buffer[1] & 0x7F;
                     int headerSize = 2;
 
@@ -278,6 +321,7 @@ namespace BNet.WebSocket.Server
                     var payload = new byte[payloadSize];
                     Array.Copy(buffer, payloadOffset, payload, 0, payloadSize);
 
+                    // Unmask the payload
                     for (var i = 0; i < payload.Length; i++)
                     {
                         payload[i] ^= maskingKey[i % 4];
@@ -295,7 +339,8 @@ namespace BNet.WebSocket.Server
             }
             catch (Exception ex)
             {
-                SetOnError($"ReadMessageAsync : {ex.Message}");
+                Console.WriteLine($"ReadMessageAsync error: {ex.Message}");
+                // Optionally, handle specific exceptions or log details
                 return null;
             }
         }
@@ -333,7 +378,7 @@ namespace BNet.WebSocket.Server
                 frame[9] = (byte)payloadLength;
             }
 
-            frame[0] = 0x81;
+            frame[0] = 0x81; // Final fragment + text frame opcode
             Array.Copy(payload, 0, frame, frame.Length - payloadLength, payloadLength);
 
             try
@@ -342,30 +387,52 @@ namespace BNet.WebSocket.Server
             }
             catch (Exception ex)
             {
-                SetOnError($"WriteMessageAsync : {ex.Message}");
-                throw;
+                Console.WriteLine($"SendMessageAsync : The write operation failed, see inner exception. Exception: {ex}");
+                throw; // Re-throw the exception to maintain the original error context
             }
         }
+
+
+
+
+
 
         public async Task SendMessageAsync(string message)
         {
-            var tasks = _streams.Keys.Select(stream => WriteMessageAsync(stream, message));
-            await Task.WhenAll(tasks);
+            foreach (var stream in _streams.Keys.ToList())
+            {
+                try
+                {
+                    await WriteMessageAsync(stream, message);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"SendMessageAsync : {ex.Message}");
+                }
+            }
         }
+
 
         private void dictionaryTCPClientRemove(TcpClient client)
         {
-            if (_clients.TryRemove(client, out var clientTask))
-            {
-                _clientCancellationTokens.TryRemove(clientTask, out var tokenSource);
-                tokenSource?.Cancel();
 
-                if (_streams.TryRemove(_streams.FirstOrDefault(pair => pair.Value == client).Key, out _))
+
+            for (int i = 0; i < _clients.Keys.Count; i++)
+            {
+                if (_clients.Keys.ElementAt(i) == client)
                 {
-                    _streams.Values.FirstOrDefault(value => value == client)?.Close();
+                    var stream = _streams.ElementAt(i).Key;
+
+                    if (stream != null && stream.CanRead)
+                    {
+                        _streams.TryRemove(stream, out _);
+                        stream.Close();
+                    }
+                    break;
                 }
-                SetOnDisconnectedClient(_streams.Count);
             }
+            _clients.TryRemove(client, out _);
+            SetOnDisconnectedClient(_streams.Count);
         }
     }
 }
