@@ -34,7 +34,7 @@ class Program
 
     private static void Connection_OnError(EventHandlers.ErrorEventArgs e)
     {
-        Console.WriteLine("Total Clients : " + e.Message);
+        Console.WriteLine(e.Message);
     }
 
     private static void Connection_OnDisconnectedClient(EventHandlers.DisconnectedClientEventArgs e)
@@ -61,8 +61,7 @@ class Program
         {
             var keyInfo = Console.ReadKey(intercept: true); // Read the key without displaying it
             Console.WriteLine($"Key Pressed: {keyInfo.KeyChar}");
-
-            await connection.SendMessageAsync("Hellooooooo");
+            //await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
 
         }
     }

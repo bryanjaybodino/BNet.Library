@@ -171,6 +171,8 @@ namespace BNet.WebSocket.Server
             if (IsWebSocketHandshake(handshakeRequest, out string key))
             {
                 await SendHandshakeResponseAsync(stream, key);
+
+                string roomId = ExtractRoomIdFromRequest(handshakeRequest);
                 SetOnConnectedClient(_clients.Count);
 
                 while (client.Connected)
@@ -234,6 +236,63 @@ namespace BNet.WebSocket.Server
             byte[] responseBytes = Encoding.UTF8.GetBytes(response);
             await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
         }
+
+        private string ExtractRoomIdFromRequest(string request)
+        {
+            // Split request into lines
+            var lines = request.Split("\r\n");
+
+            // Extract Host header
+            string hostHeader = lines.FirstOrDefault(line => line.StartsWith("Host:"));
+            if (hostHeader != null)
+            {
+                var hostParts = hostHeader.Substring("Host:".Length).Trim().Split(':');
+                string hostname = hostParts[0];
+                int port = 80; // Default HTTP port
+
+                if (hostParts.Length > 1 && int.TryParse(hostParts[1], out int parsedPort))
+                {
+                    port = parsedPort;
+                }
+
+                // Extract the request line
+                var requestLine = lines.FirstOrDefault();
+                if (requestLine != null)
+                {
+                    // Split the request line into components
+                    var requestParts = requestLine.Split(' ');
+
+                    if (requestParts.Length > 1)
+                    {
+                        // The URL is the second part of the request line
+                        var url = requestParts[1];
+
+                        // Create a full URI with the hostname and port
+                        var uri = new Uri($"http://{hostname}:{port}{url}");
+                        var query = uri.Query;
+
+                        if (!string.IsNullOrEmpty(query))
+                        {
+                            // Parse query parameters
+                            var queryParams = query.TrimStart('?').Split('&');
+                            foreach (var param in queryParams)
+                            {
+                                var keyValue = param.Split('=');
+                                if (keyValue.Length == 2 && keyValue[0] == "room")
+                                {
+                                    return keyValue[1];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return null;
+        }
+
+
+
 
         private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
         {
