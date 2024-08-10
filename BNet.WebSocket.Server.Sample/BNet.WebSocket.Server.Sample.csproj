@@ -79,11 +79,5 @@
   <ItemGroup>
     <None Include="App.config" />
   </ItemGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\BNet.WebSocket.Server\BNet.WebSocket.Server.csproj">
-      <Project>{4b55a5c3-968c-4846-b3c2-e7ee10589893}</Project>
-      <Name>BNet.WebSocket.Server</Name>
-    </ProjectReference>
-  </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
