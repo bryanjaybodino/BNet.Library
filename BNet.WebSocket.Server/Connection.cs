@@ -17,8 +17,8 @@ namespace BNet.WebSocket.Server
     public class Connection : EventHandlers
     {
         private TcpListener _listener;
-        private ConcurrentDictionary<TcpClient, Task> _clients = new ConcurrentDictionary<TcpClient, Task>();
-        private ConcurrentDictionary<Stream, Task> _streams = new ConcurrentDictionary<Stream, Task>();
+        private ConcurrentDictionary<TcpClient, Stream> _clients = new ConcurrentDictionary<TcpClient, Stream>();
+
         private ConcurrentDictionary<Task, CancellationTokenSource> _clientCancellationTokens = new ConcurrentDictionary<Task, CancellationTokenSource>();
 
         public Dictionary<string, string> UserCredentials { get; } = new Dictionary<string, string>();
@@ -56,10 +56,19 @@ namespace BNet.WebSocket.Server
                     try
                     {
                         var client = await _listener.AcceptTcpClientAsync();
+                        // Use a lock to ensure single client handling
+                        lock (_clients)
+                        {
+                            if (_clients.ContainsKey(client))
+                            {
+                                RemoveClient(client);
+                                continue;
+                            }
+                        }
+
                         var clientCancellationTokenSource = new CancellationTokenSource();
                         var clientTask = Task.Run(() => HandleClientAsync(client, clientCancellationTokenSource.Token), clientCancellationTokenSource.Token);
-
-                        _clients[client] = clientTask;
+                        // Track the task and cancellation token if needed
                         _clientCancellationTokens[clientTask] = clientCancellationTokenSource;
                     }
                     catch (Exception ex)
@@ -81,26 +90,28 @@ namespace BNet.WebSocket.Server
                 IsRunning = false;
                 _listener.Stop();
 
-                var cancellationTasks = new List<Task>();
+                var tasks = new List<Task>();
+                foreach (var client in _clients.Keys.ToList()) // ToList to avoid modification during iteration
+                {
+                    RemoveClient(client);
+                }
+
+                // If you have ongoing operations/tasks, cancel them
                 foreach (var cts in _clientCancellationTokens.Values)
                 {
                     cts.Cancel();
                 }
-                foreach (var clientTask in _clients.Values)
-                {
-                    cancellationTasks.Add(clientTask);
-                }
-                foreach (var streamTask in _streams.Values)
-                {
-                    cancellationTasks.Add(streamTask);
-                }
-                await Task.WhenAll(cancellationTasks);
+
+                // Await tasks if you have asynchronous operations to wait on
+                await Task.WhenAll(tasks);
             }
             catch (Exception ex)
             {
                 SetOnError($"StopAsync: {ex.Message}");
             }
         }
+
+
 
         private async Task<Stream> HandleSecurityAsync(Stream stream)
         {
@@ -116,15 +127,30 @@ namespace BNet.WebSocket.Server
 
         private async Task HandleClientAsync(TcpClient client, CancellationToken token)
         {
-            NetworkStream networkStream = client.GetStream();
-            Stream secureStream = await HandleSecurityAsync(networkStream);
-            var clientCancellationTokenSource = new CancellationTokenSource();
-            var streamTask = Task.Run(() => clientCancellationTokenSource.Token);
-
-            _streams[secureStream] = streamTask;
-
             try
             {
+                NetworkStream networkStream = client.GetStream();
+                Stream secureStream = await HandleSecurityAsync(networkStream);
+
+                // Check and handle existing connections
+                if (_clients.ContainsKey(client))
+                {
+                    Console.WriteLine($"Client {client.Client.RemoteEndPoint} already connected.");
+                    RemoveClient(client);
+                    return;
+                }
+
+                // Try adding the client to the dictionary
+                if (!_clients.TryAdd(client, secureStream))
+                {
+                    // Failed to add client, likely a duplicate
+                    Console.WriteLine($"Failed to add client {client.Client.RemoteEndPoint}. Removing existing client.");
+                    RemoveClient(client);
+                    return;
+                }
+
+                Console.WriteLine($"Client {client.Client.RemoteEndPoint} connected.");
+
                 await HandleStartupAsync(client, secureStream);
             }
             catch (Exception ex)
@@ -133,13 +159,11 @@ namespace BNet.WebSocket.Server
             }
             finally
             {
-                if (client.Connected)
-                {
-                    client.Close();
-                    RemoveClient(client);
-                }
+                Console.WriteLine($"Client {client.Client.RemoteEndPoint} disconnected.");
+                RemoveClient(client);
             }
         }
+
 
         private async Task HandleStartupAsync(TcpClient client, Stream stream)
         {
@@ -147,7 +171,7 @@ namespace BNet.WebSocket.Server
             if (IsWebSocketHandshake(handshakeRequest, out string key))
             {
                 await SendHandshakeResponseAsync(stream, key);
-                SetOnConnectedClient(_streams.Count);
+                SetOnConnectedClient(_clients.Count);
 
                 while (client.Connected)
                 {
@@ -213,102 +237,62 @@ namespace BNet.WebSocket.Server
 
         private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
         {
-            var messageBuilder = new List<byte>();
-            bool isFinalFragment = false;
-            int bufferSize = client.ReceiveBufferSize;
+            byte[] buffer = new byte[client.ReceiveBufferSize];
+            int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+            if (bytesRead == 0) return null;
 
-            try
+            // Frame header
+            byte b0 = buffer[0];
+            bool isFinalFragment = (b0 & 0x80) != 0;
+            bool isTextFrame = (b0 & 0x0F) == 1;
+
+            if (!isFinalFragment || !isTextFrame)
             {
-                while (!isFinalFragment)
-                {
-                    var buffer = new byte[bufferSize];
-                    var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-
-                    if (bytesRead == 0)
-                    {
-                        return null;
-                    }
-
-                    var b0 = buffer[0];
-                    isFinalFragment = (b0 & 0x80) != 0;
-                    var isTextFrame = (b0 & 0x0F) == 1;
-
-                    if (!isTextFrame)
-                    {
-                        throw new NotImplementedException("Only text frames are supported.");
-                    }
-
-                    int payloadLength = buffer[1] & 0x7F;
-                    int headerSize = 2;
-
-                    if (payloadLength == 126)
-                    {
-                        payloadLength = (buffer[2] << 8) | buffer[3];
-                        headerSize += 2;
-                    }
-                    else if (payloadLength == 127)
-                    {
-                        payloadLength = (int)(
-                            ((long)buffer[2] << 56) |
-                            ((long)buffer[3] << 48) |
-                            ((long)buffer[4] << 40) |
-                            ((long)buffer[5] << 32) |
-                            ((long)buffer[6] << 24) |
-                            ((long)buffer[7] << 16) |
-                            ((long)buffer[8] << 8) |
-                            ((long)buffer[9])
-                        );
-                        headerSize += 8;
-                    }
-
-                    if (headerSize + 4 > bytesRead)
-                    {
-                        throw new InvalidOperationException("Header size exceeds bytes read.");
-                    }
-
-                    var maskingKey = new byte[4];
-                    Array.Copy(buffer, headerSize, maskingKey, 0, 4);
-
-                    var payloadOffset = headerSize + 4;
-                    var payloadSize = bytesRead - payloadOffset;
-
-                    if (payloadSize < 0)
-                    {
-                        throw new InvalidOperationException("Payload size calculation error.");
-                    }
-
-                    var payload = new byte[payloadSize];
-                    Array.Copy(buffer, payloadOffset, payload, 0, payloadSize);
-
-                    for (var i = 0; i < payload.Length; i++)
-                    {
-                        payload[i] ^= maskingKey[i % 4];
-                    }
-
-                    messageBuilder.AddRange(payload);
-
-                    if (isFinalFragment)
-                    {
-                        break;
-                    }
-                }
-
-                return Encoding.UTF8.GetString(messageBuilder.ToArray());
+                throw new NotImplementedException("Only final text frames are supported.");
             }
-            catch (Exception ex)
+
+            // Payload length
+            int payloadLength = buffer[1] & 0x7F;
+            int offset = 2;
+
+            if (payloadLength == 126)
             {
-                RemoveClient(client);
-                Console.WriteLine($"ReadMessageAsync error: {ex.Message}");
-                return null;
+                // 16-bit length
+                payloadLength = (buffer[2] << 8) | buffer[3];
+                offset += 2;
             }
+            else if (payloadLength == 127)
+            {
+                // 64-bit length (not supported)
+                throw new NotImplementedException("Payload length 127 (64-bit length) is not supported.");
+            }
+
+            // Masking key
+            byte[] maskingKey = new byte[4];
+            Array.Copy(buffer, offset, maskingKey, 0, 4);
+            offset += 4;
+
+            // Extract payload
+            byte[] payload = new byte[payloadLength];
+            Array.Copy(buffer, offset, payload, 0, payloadLength);
+
+            // Unmask payload
+            for (int i = 0; i < payload.Length; i++)
+            {
+                payload[i] ^= maskingKey[i % 4];
+            }
+
+            return Encoding.UTF8.GetString(payload);
         }
+
+
+
         private async Task WriteMessageAsync(Stream stream, string message)
         {
             byte[] payload = Encoding.UTF8.GetBytes(message);
             int payloadLength = payload.Length;
             byte[] frame;
 
-            Console.WriteLine($"Payload length: {payloadLength}");
 
             // Determine the length of the frame
             if (payloadLength <= 125)
@@ -343,8 +327,6 @@ namespace BNet.WebSocket.Server
             // Copy the payload to the frame
             Array.Copy(payload, 0, frame, frame.Length - payloadLength, payloadLength);
 
-            Console.WriteLine($"Frame length: {frame.Length}");
-            Console.WriteLine($"Frame content: {BitConverter.ToString(frame)}");
 
             try
             {
@@ -362,7 +344,7 @@ namespace BNet.WebSocket.Server
 
         public async Task SendMessageAsync(string message)
         {
-            var streamTasks = _streams.Keys.ToList();
+            var streamTasks = _clients.Values.ToList();
             foreach (var stream in streamTasks)
             {
                 try
@@ -371,27 +353,77 @@ namespace BNet.WebSocket.Server
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"SendMessageAsync: {ex.Message}");
+                    SetOnError($"SendMessageAsync: {ex.Message}");
                 }
             }
         }
-
-        private void RemoveClient(TcpClient client)
+        private async void RemoveClient(TcpClient client, string closeReason = null)
         {
-            if (_clients.TryRemove(client, out var task))
+            if (_clients.TryRemove(client, out Stream stream))
             {
-                _clientCancellationTokens.TryRemove(task, out var cts);
-                cts?.Dispose();
-            }
+                try
+                {
+                    // Send a close frame to the client
+                    await SendCloseFrameAsync(stream, reason: closeReason);
+                }
+                catch (Exception ex)
+                {
+                    SetOnError($"RemoveClient: Error sending close frame. {ex.Message}");
+                }
 
-            var stream = _streams.Keys.FirstOrDefault(s => s != null && s.CanRead && s.CanWrite);
-            if (stream != null)
-            {
-                _streams.TryRemove(stream, out _);
-                stream.Close();
-            }
+                try
+                {
+                    // Close and dispose of the stream
+                    stream.Close();
+                    stream.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    SetOnError($"RemoveClient: {ex.Message} while closing stream.");
+                }
 
-            SetOnDisconnectedClient(_streams.Count);
+                try
+                {
+                    // Close the TcpClient
+                    client.Close();
+                }
+                catch (Exception ex)
+                {
+                    SetOnError($"RemoveClient: {ex.Message} while closing TcpClient.");
+                }
+
+                // Log or update the state
+                SetOnDisconnectedClient(_clients.Count);
+            }
         }
+
+
+        private async Task SendCloseFrameAsync(Stream stream, ushort closeCode = 1000, string reason = null)
+        {
+            var reasonBytes = string.IsNullOrEmpty(reason) ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(reason);
+            var closeFrameLength = 2 + reasonBytes.Length;
+            var closeFrame = new byte[closeFrameLength + 2]; // 2 bytes for the frame header
+
+            closeFrame[0] = 0x88; // Final frame + Close frame opcode
+            closeFrame[1] = (byte)closeFrameLength; // Payload length
+
+            // Write the close code
+            closeFrame[2] = (byte)(closeCode >> 8);
+            closeFrame[3] = (byte)closeCode;
+
+            // Write the reason (if any)
+            Array.Copy(reasonBytes, 0, closeFrame, 4, reasonBytes.Length);
+
+            try
+            {
+                await stream.WriteAsync(closeFrame, 0, closeFrame.Length);
+                await stream.FlushAsync(); // Ensure the frame is sent immediately
+            }
+            catch (Exception ex)
+            {
+                SetOnError($"SendCloseFrameAsync: {ex.Message}");
+            }
+        }
+
     }
 }
