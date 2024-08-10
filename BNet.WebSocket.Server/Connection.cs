@@ -244,9 +244,18 @@ namespace BNet.WebSocket.Server
 
         private async Task<string> ReadRequestAsync(TcpClient client, Stream stream)
         {
-            byte[] buffer = new byte[client.ReceiveBufferSize];
-            int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-            return Encoding.UTF8.GetString(buffer, 0, bytesRead);
+            var requestBuilder = new StringBuilder();
+            var buffer = new byte[client.ReceiveBufferSize];
+            int bytesRead;
+
+            do
+            {
+                bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                requestBuilder.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));
+            }
+            while (bytesRead > 0 && !requestBuilder.ToString().EndsWith("\r\n\r\n"));
+
+            return requestBuilder.ToString();
         }
 
         private bool IsWebSocketHandshake(string request, out string key)
