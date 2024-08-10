@@ -333,7 +333,7 @@ namespace BNet.WebSocket.Server
                             foreach (var param in queryParams)
                             {
                                 var keyValue = param.Split('=');
-                                if (keyValue.Length == 2 && keyValue[0] == "room")
+                                if (keyValue.Length == 2 && keyValue[0].ToLower() == "room")
                                 {
                                     return keyValue[1];
                                 }

@@ -16,8 +16,8 @@ class Program
     {
         // Start the TCP connection
         //connection.Setup(8080);
-        connection.LoadCertificate("C:\\MobileFTp.pfx", "123123");
-        connection.OnReceived += Connection_OnReceived; ;
+        //connection.LoadCertificate("C:\\cert.pfx", "123123");
+        connection.OnReceived += Connection_OnReceived;
         connection.OnConnectedClient += Connection_OnConnectedClient;
         connection.OnDisconnectedClient += Connection_OnDisconnectedClient;
         connection.OnError += Connection_OnError;
@@ -32,38 +32,33 @@ class Program
         await Task.WhenAll(serverTask, keyPressTask);
 
 
-
-
         //Send Message to all connected clients
         await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
 
         //Send Message to Specific Client Room 
         await connection.SendMessageToRoomAsync("Room1", "Hello Room1");
         //ws://localhost:8080?room=Room1
-
     }
 
-    private static void Connection_OnError(EventHandlers.ErrorEventArgs e)
+    private static void Connection_OnError(object sender, EventHandlers.ErrorEventArgs e)
     {
         Console.WriteLine(e.Message);
     }
 
-    private static void Connection_OnDisconnectedClient(EventHandlers.DisconnectedClientEventArgs e)
+    private static void Connection_OnDisconnectedClient(object sender, EventHandlers.DisconnectedClientEventArgs e)
     {
         Console.WriteLine("Total Clients : " + e.Count.ToString());
     }
 
-    private static void Connection_OnConnectedClient(EventHandlers.ConnectedClientEventArgs e)
+    private static void Connection_OnConnectedClient(object sender, EventHandlers.ConnectedClientEventArgs e)
     {
         Console.WriteLine("Total Clients : " + e.Count.ToString());
     }
 
-    private static void Connection_OnReceived(EventHandlers.ReceivedEventArgs e)
+    private static void Connection_OnReceived(object sender, EventHandlers.ReceivedEventArgs e)
     {
         Console.WriteLine("Received Message: " + e.Message);
     }
-
-
 
 
     private static async void ListenForKeyPress()
@@ -72,7 +67,7 @@ class Program
         {
             var keyInfo = Console.ReadKey(intercept: true); // Read the key without displaying it
             Console.WriteLine($"Key Pressed: {keyInfo.KeyChar}");
-            await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");       
+            await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
         }
     }
 

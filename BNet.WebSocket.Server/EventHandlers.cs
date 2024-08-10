@@ -4,18 +4,16 @@ namespace BNet.WebSocket.Server
 {
     public class EventHandlers
     {
-
         #region OnReceived
         public class ReceivedEventArgs : EventArgs
         {
             public string Message { get; set; }
         }
 
-        public delegate void ReceivedEventHandler(ReceivedEventArgs e);
-        public event ReceivedEventHandler OnReceived;
+        public event EventHandler<ReceivedEventArgs> OnReceived;
         public void SetOnReceived(string message)
         {
-            OnReceived?.Invoke(new ReceivedEventArgs { Message = message });
+            OnReceived?.Invoke(this, new ReceivedEventArgs { Message = message });
         }
         #endregion
 
@@ -25,11 +23,10 @@ namespace BNet.WebSocket.Server
             public int Count { get; set; }
         }
 
-        public delegate void ConnectedClientEventHandler(ConnectedClientEventArgs e);
-        public event ConnectedClientEventHandler OnConnectedClient;
+        public event EventHandler<ConnectedClientEventArgs> OnConnectedClient;
         public void SetOnConnectedClient(int count)
         {
-            OnConnectedClient?.Invoke(new ConnectedClientEventArgs { Count = count });
+            OnConnectedClient?.Invoke(this, new ConnectedClientEventArgs { Count = count });
         }
         #endregion
 
@@ -39,11 +36,10 @@ namespace BNet.WebSocket.Server
             public int Count { get; set; }
         }
 
-        public delegate void DisconnectedClientEventHandler(DisconnectedClientEventArgs e);
-        public event DisconnectedClientEventHandler OnDisconnectedClient;
+        public event EventHandler<DisconnectedClientEventArgs> OnDisconnectedClient;
         public void SetOnDisconnectedClient(int count)
         {
-            OnDisconnectedClient?.Invoke(new DisconnectedClientEventArgs { Count = count });
+            OnDisconnectedClient?.Invoke(this, new DisconnectedClientEventArgs { Count = count });
         }
         #endregion
 
@@ -53,11 +49,10 @@ namespace BNet.WebSocket.Server
             public string Message { get; set; }
         }
 
-        public delegate void ErrorEventHandler(ErrorEventArgs e);
-        public event ErrorEventHandler OnError;
+        public event EventHandler<ErrorEventArgs> OnError;
         public void SetOnError(string message)
         {
-            OnError?.Invoke(new ErrorEventArgs { Message = message });
+            OnError?.Invoke(this, new ErrorEventArgs { Message = message });
         }
         #endregion
     }
