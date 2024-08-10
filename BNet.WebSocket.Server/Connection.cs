@@ -20,7 +20,7 @@ namespace BNet.WebSocket.Server
         private ConcurrentDictionary<TcpClient, Stream> _clients = new ConcurrentDictionary<TcpClient, Stream>();
 
         private ConcurrentDictionary<Task, CancellationTokenSource> _clientCancellationTokens = new ConcurrentDictionary<Task, CancellationTokenSource>();
-
+        private ConcurrentDictionary<string, HashSet<TcpClient>> _rooms = new ConcurrentDictionary<string, HashSet<TcpClient>>();
         public Dictionary<string, string> UserCredentials { get; } = new Dictionary<string, string>();
         public bool IsRunning { get; private set; }
 
@@ -42,7 +42,6 @@ namespace BNet.WebSocket.Server
             ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
             _serverCertificate = new X509Certificate2(rawData, password);
         }
-
         public async Task StartAsync()
         {
             try
@@ -80,6 +79,32 @@ namespace BNet.WebSocket.Server
             catch (Exception ex)
             {
                 SetOnError($"StartAsync: {ex.Message}");
+            }
+        }
+
+        public async Task SendMessageToRoomAsync(string roomId, string message)
+        {
+            if (_rooms.TryGetValue(roomId, out var clientsInRoom))
+            {
+                var tasks = new List<Task>();
+
+                foreach (var client in clientsInRoom)
+                {
+                    if (_clients.TryGetValue(client, out var stream))
+                    {
+                        tasks.Add(WriteMessageAsync(stream, message));
+                    }
+                }
+
+                await Task.WhenAll(tasks);
+            }
+        }
+        private void JoinRoom(string roomId, TcpClient client)
+        {
+            var clientsInRoom = _rooms.GetOrAdd(roomId, _ => new HashSet<TcpClient>());
+            lock (clientsInRoom)
+            {
+                clientsInRoom.Add(client);
             }
         }
 
@@ -173,6 +198,11 @@ namespace BNet.WebSocket.Server
                 await SendHandshakeResponseAsync(stream, key);
 
                 string roomId = ExtractRoomIdFromRequest(handshakeRequest);
+                if (!string.IsNullOrEmpty(roomId))
+                {
+                    JoinRoom(roomId, client);
+                }
+
                 SetOnConnectedClient(_clients.Count);
 
                 while (client.Connected)
@@ -181,7 +211,15 @@ namespace BNet.WebSocket.Server
                     if (message != null)
                     {
                         SetOnReceived(message);
-                        await SendMessageAsync(message);
+                        if (roomId == null)
+                        {
+                            await SendMessageAsync(message);
+                        }
+                        else
+                        {
+                            await SendMessageToRoomAsync(roomId, message); // Send message to the room
+                        }
+
                     }
                 }
             }
@@ -416,6 +454,7 @@ namespace BNet.WebSocket.Server
                 }
             }
         }
+
         private async void RemoveClient(TcpClient client, string closeReason = null)
         {
             if (_clients.TryRemove(client, out Stream stream))
@@ -456,7 +495,6 @@ namespace BNet.WebSocket.Server
             }
         }
 
-
         private async Task SendCloseFrameAsync(Stream stream, ushort closeCode = 1000, string reason = null)
         {
             var reasonBytes = string.IsNullOrEmpty(reason) ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(reason);
@@ -483,6 +521,5 @@ namespace BNet.WebSocket.Server
                 SetOnError($"SendCloseFrameAsync: {ex.Message}");
             }
         }
-
     }
 }

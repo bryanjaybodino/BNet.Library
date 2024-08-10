@@ -61,8 +61,8 @@ class Program
         {
             var keyInfo = Console.ReadKey(intercept: true); // Read the key without displaying it
             Console.WriteLine($"Key Pressed: {keyInfo.KeyChar}");
-            //await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
-
+            await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
+            
         }
     }
 
