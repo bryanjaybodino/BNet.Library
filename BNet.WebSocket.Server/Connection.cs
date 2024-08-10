@@ -236,7 +236,7 @@ namespace BNet.WebSocket.Server
             key = null;
             if (request.Contains("Upgrade: websocket") && request.Contains("Connection: Upgrade"))
             {
-                var lines = request.Split("\r\n");
+                var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
                 foreach (var line in lines)
                 {
                     if (line.StartsWith("Sec-WebSocket-Key:"))
@@ -277,7 +277,7 @@ namespace BNet.WebSocket.Server
         private string ExtractRoomIdFromRequest(string request)
         {
             // Split request into lines
-            var lines = request.Split("\r\n");
+            var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
 
             // Extract Host header
             string hostHeader = lines.FirstOrDefault(line => line.StartsWith("Host:"));
@@ -499,7 +499,7 @@ namespace BNet.WebSocket.Server
 
         private async Task SendCloseFrameAsync(Stream stream, ushort closeCode = 1000, string reason = null)
         {
-            var reasonBytes = string.IsNullOrEmpty(reason) ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(reason);
+            var reasonBytes = string.IsNullOrEmpty(reason) ? new byte[0] : Encoding.UTF8.GetBytes(reason);
             var closeFrameLength = 2 + reasonBytes.Length;
             var closeFrame = new byte[closeFrameLength + 2]; // 2 bytes for the frame header
 
