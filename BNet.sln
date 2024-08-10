@@ -11,6 +11,10 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "BNet.WebSocket.Server", "BN
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BNet.WebSocket.Server.Sample", "BNet.WebSocket.Server.Sample\BNet.WebSocket.Server.Sample.csproj", "{51AE7DE2-F942-4B08-AD16-F0E7B33DB4DA}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BNet.FTPServer", "BNet.FTPServer\BNet.FTPServer.csproj", "{2E06FFC6-0CC0-4E71-9051-D812F8935566}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BNet.FTPServer.Sample", "BNet.FTPServer.Sample\BNet.FTPServer.Sample.csproj", "{6A2F72AA-BF66-4114-A204-4C48DAC4D835}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -33,6 +37,14 @@ Global
 		{51AE7DE2-F942-4B08-AD16-F0E7B33DB4DA}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{51AE7DE2-F942-4B08-AD16-F0E7B33DB4DA}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{51AE7DE2-F942-4B08-AD16-F0E7B33DB4DA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2E06FFC6-0CC0-4E71-9051-D812F8935566}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2E06FFC6-0CC0-4E71-9051-D812F8935566}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2E06FFC6-0CC0-4E71-9051-D812F8935566}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2E06FFC6-0CC0-4E71-9051-D812F8935566}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6A2F72AA-BF66-4114-A204-4C48DAC4D835}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6A2F72AA-BF66-4114-A204-4C48DAC4D835}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6A2F72AA-BF66-4114-A204-4C48DAC4D835}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6A2F72AA-BF66-4114-A204-4C48DAC4D835}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
