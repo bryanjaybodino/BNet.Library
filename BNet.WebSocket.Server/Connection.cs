@@ -137,7 +137,6 @@ namespace BNet.WebSocket.Server
         }
 
 
-
         private async Task<Stream> HandleSecurityAsync(Stream stream)
         {
             if (_serverCertificate == null)
@@ -146,18 +145,36 @@ namespace BNet.WebSocket.Server
             }
 
             var sslStream = new SslStream(stream, false);
-            await sslStream.AuthenticateAsServerAsync(_serverCertificate);
-            return sslStream;
+            try
+            {
+                await sslStream.AuthenticateAsServerAsync(_serverCertificate);
+                return sslStream;
+            }
+            catch (Exception ex)
+            {
+                sslStream.Dispose();
+                Console.WriteLine($"Authentication failed: {ex.Message}");
+                throw; // Ensure the caller is aware of the failure
+            }
         }
 
         private async Task HandleClientAsync(TcpClient client, CancellationToken token)
         {
+            NetworkStream networkStream = null;
+            Stream secureStream = null;
+
             try
             {
-                NetworkStream networkStream = client.GetStream();
-                Stream secureStream = await HandleSecurityAsync(networkStream);
+                networkStream = client.GetStream();
+                secureStream = await HandleSecurityAsync(networkStream);
 
-                // Check and handle existing connections
+                if (secureStream == null)
+                {
+                    Console.WriteLine($"Failed to secure the stream for client {client.Client.RemoteEndPoint}. Disconnecting.");
+                    RemoveClient(client);
+                    return;
+                }
+
                 if (_clients.ContainsKey(client))
                 {
                     Console.WriteLine($"Client {client.Client.RemoteEndPoint} already connected.");
@@ -165,29 +182,30 @@ namespace BNet.WebSocket.Server
                     return;
                 }
 
-                // Try adding the client to the dictionary
                 if (!_clients.TryAdd(client, secureStream))
                 {
-                    // Failed to add client, likely a duplicate
                     Console.WriteLine($"Failed to add client {client.Client.RemoteEndPoint}. Removing existing client.");
                     RemoveClient(client);
                     return;
                 }
-                //Console.WriteLine($"Client {client.Client.RemoteEndPoint} connected.");
 
                 await HandleStartupAsync(client, secureStream);
             }
             catch (Exception ex)
             {
-                SetOnError($"HandleClientAsync: {ex.Message}");
+                if (!ex.Message.Contains("disposed object"))
+                {
+                    SetOnError($"HandleClientAsync: {ex.Message}");
+                } 
             }
             finally
             {
-                //Console.WriteLine($"Client {client.Client.RemoteEndPoint} disconnected.");
+                // Ensure the client is removed from the dictionary and streams are properly disposed of
                 RemoveClient(client);
+                networkStream?.Dispose(); // Dispose of the network stream if necessary
+                secureStream?.Dispose(); // Dispose of the secure stream if necessary
             }
         }
-
 
         private async Task HandleStartupAsync(TcpClient client, Stream stream)
         {
