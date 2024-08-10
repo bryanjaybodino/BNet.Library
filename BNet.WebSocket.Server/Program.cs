@@ -30,6 +30,17 @@ class Program
 
         // Await both tasks
         await Task.WhenAll(serverTask, keyPressTask);
+
+
+
+
+        //Send Message to all connected clients
+        await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
+
+        //Send Message to Specific Client Room 
+        await connection.SendMessageToRoomAsync("Room1", "Hello Room1");
+        //ws://localhost:8080?room=Room1
+
     }
 
     private static void Connection_OnError(EventHandlers.ErrorEventArgs e)
@@ -61,8 +72,7 @@ class Program
         {
             var keyInfo = Console.ReadKey(intercept: true); // Read the key without displaying it
             Console.WriteLine($"Key Pressed: {keyInfo.KeyChar}");
-            await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
-            
+            await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");       
         }
     }
 

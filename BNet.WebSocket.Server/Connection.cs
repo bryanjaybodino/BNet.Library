@@ -173,8 +173,7 @@ namespace BNet.WebSocket.Server
                     RemoveClient(client);
                     return;
                 }
-
-                Console.WriteLine($"Client {client.Client.RemoteEndPoint} connected.");
+                //Console.WriteLine($"Client {client.Client.RemoteEndPoint} connected.");
 
                 await HandleStartupAsync(client, secureStream);
             }
@@ -184,7 +183,7 @@ namespace BNet.WebSocket.Server
             }
             finally
             {
-                Console.WriteLine($"Client {client.Client.RemoteEndPoint} disconnected.");
+                //Console.WriteLine($"Client {client.Client.RemoteEndPoint} disconnected.");
                 RemoveClient(client);
             }
         }
@@ -345,7 +344,10 @@ namespace BNet.WebSocket.Server
 
             if (!isFinalFragment || !isTextFrame)
             {
-                throw new NotImplementedException("Only final text frames are supported.");
+
+                RemoveClient(client, "Disconnected");
+                return null;
+                //throw new NotImplementedException("Only final text frames are supported.");
             }
 
             // Payload length
