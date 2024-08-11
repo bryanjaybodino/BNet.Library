@@ -278,7 +278,7 @@ namespace BNet.WebSocket.Server
 
         private async Task SendHandshakeResponseAsync(Stream stream, string key)
         {
-            string CalculateWebSocketAcceptKey(string key)
+            string CalculateWebSocketAcceptKey()
             {
                 var magicGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
                 using (var sha1 = SHA1.Create())
@@ -289,13 +289,13 @@ namespace BNet.WebSocket.Server
                 }
             }
 
-            var response = new StringBuilder()
-                .AppendLine("HTTP/1.1 101 Switching Protocols")
-                .AppendLine("Upgrade: websocket")
-                .AppendLine("Connection: Upgrade")
-                .AppendLine($"Sec-WebSocket-Accept: {CalculateWebSocketAcceptKey(key)}")
-                .AppendLine()
-                .ToString();
+            // Construct the response with correct CRLF line endings
+            string response =
+                "HTTP/1.1 101 Switching Protocols\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                $"Sec-WebSocket-Accept: {CalculateWebSocketAcceptKey()}\r\n" +
+                "\r\n";  // End the headers with an extra CRLF
 
             byte[] responseBytes = Encoding.UTF8.GetBytes(response);
             await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
