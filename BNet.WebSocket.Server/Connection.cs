@@ -21,7 +21,6 @@ namespace BNet.WebSocket.Server
 
         private ConcurrentDictionary<Task, CancellationTokenSource> _clientCancellationTokens = new ConcurrentDictionary<Task, CancellationTokenSource>();
         private ConcurrentDictionary<string, HashSet<TcpClient>> _rooms = new ConcurrentDictionary<string, HashSet<TcpClient>>();
-        public Dictionary<string, string> UserCredentials { get; } = new Dictionary<string, string>();
         public bool IsRunning { get; private set; }
 
         private X509Certificate2 _serverCertificate;
@@ -499,14 +498,8 @@ namespace BNet.WebSocket.Server
             if (_clients.TryRemove(client, out var stream))
             {
                 stream?.Dispose();
-         
-             
                 SetOnDisconnectedClient(_clients.Count);
             }
-
-
         }
-
-
     }
 }
