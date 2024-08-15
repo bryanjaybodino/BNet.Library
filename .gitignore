@@ -262,7 +262,8 @@ ServiceFabricBackup/
 *.rptproj.bak
 
 # SQL Server files
-
+*.mdf
+*.ldf
 
 # Business Intelligence projects
 *.rdl.data
@@ -359,3 +360,7 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+/BNet.ASP.MVC.Pagination.Sample/AccountDB.mdf
+/BNet.ASP.MVC.Pagination.Sample/AccountDB_log.ldf
+/BNet.ASP.MVC.Pagination.Sample/AccountDB_log.ldf
+/BNet.ASP.MVC.Pagination.Sample/AccountDB.mdf
