@@ -18,7 +18,7 @@ namespace BNet.WebSocket.Server
     {
         private TcpListener _listener;
         private ConcurrentDictionary<TcpClient, Stream> _clients = new ConcurrentDictionary<TcpClient, Stream>();
-
+        private readonly TaskFactory _taskFactory = new TaskFactory(TaskScheduler.Default);
 
         private ConcurrentDictionary<string, HashSet<TcpClient>> _rooms = new ConcurrentDictionary<string, HashSet<TcpClient>>();
         public bool IsRunning { get; private set; }
@@ -54,24 +54,9 @@ namespace BNet.WebSocket.Server
                     try
                     {
                         var client = await _listener.AcceptTcpClientAsync();
-                        // Use a lock to ensure single client handling
-                        lock (_clients)
-                        {
-                            if (_clients.ContainsKey(client))
-                            {
-                                RemoveClient(client);
-                                continue;
-                            }
-                            else
-                            {
-                                HandleClientAsync(client);
-                               
-                            }
-                        }
 
-
-
-
+                        // Use TaskFactory to handle the client
+                        await _taskFactory.StartNew(() => HandleClientAsync(client), CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
                     }
                     catch (Exception ex)
                     {
@@ -85,6 +70,7 @@ namespace BNet.WebSocket.Server
             }
         }
 
+
         public async Task SendMessageToRoomAsync(string roomId, string message)
         {
             if (_rooms.TryGetValue(roomId, out var clientsInRoom))
@@ -95,13 +81,14 @@ namespace BNet.WebSocket.Server
                 {
                     if (_clients.TryGetValue(client, out var stream))
                     {
-                        tasks.Add(WriteMessageAsync(stream, message));
+                        tasks.Add(_taskFactory.StartNew(() => WriteMessageAsync(stream, message), CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default));
                     }
                 }
 
                 await Task.WhenAll(tasks);
             }
         }
+
         private void JoinRoom(string roomId, TcpClient client)
         {
             var clientsInRoom = _rooms.GetOrAdd(roomId, _ => new HashSet<TcpClient>());
@@ -154,63 +141,60 @@ namespace BNet.WebSocket.Server
             }
         }
 
-        private async void HandleClientAsync(TcpClient client)
+        private void HandleClientAsync(TcpClient client)
         {
-            NetworkStream networkStream = null;
-            Stream secureStream = null;
-
-            try
+            _taskFactory.StartNew(async () =>
             {
-                networkStream = client.GetStream();
-                secureStream = await HandleSecurityAsync(networkStream);
+                NetworkStream networkStream = null;
+                Stream secureStream = null;
 
-                if (secureStream == null)
+                try
                 {
-                    Console.WriteLine($"Failed to secure the stream for client {client.Client.RemoteEndPoint}. Disconnecting.");
+                    networkStream = client.GetStream();
+                    secureStream = await HandleSecurityAsync(networkStream);
+
+                    if (secureStream == null)
+                    {
+                        Console.WriteLine($"Failed to secure the stream for client {client.Client.RemoteEndPoint}. Disconnecting.");
+                        RemoveClient(client);
+                        return;
+                    }
+
+                    if (_clients.ContainsKey(client))
+                    {
+                        Console.WriteLine($"Client {client.Client.RemoteEndPoint} already connected.");
+                        RemoveClient(client);
+                        return;
+                    }
+
+                    if (!_clients.TryAdd(client, secureStream))
+                    {
+                        Console.WriteLine($"Failed to add client {client.Client.RemoteEndPoint}. Removing existing client.");
+                        RemoveClient(client);
+                        return;
+                    }
+
+                    await HandleStartupAsync(client, secureStream);
+                }
+                catch (Exception ex)
+                {
+                    if (!ex.Message.Contains("disposed object"))
+                    {
+                        SetOnError($"HandleClientAsync: {ex.Message}");
+                    }
+                }
+                finally
+                {
+                    if (client.Connected)
+                    {
+                        client.Close(); // Ensures proper closing of the connection
+                    }
+                    // Dispose streams only if they are not already disposed
+                    networkStream?.Dispose();
+                    secureStream?.Dispose();
                     RemoveClient(client);
-                    return;
                 }
-
-                if (_clients.ContainsKey(client))
-                {
-                    Console.WriteLine($"Client {client.Client.RemoteEndPoint} already connected.");
-                    RemoveClient(client);
-                    return;
-                }
-
-                if (!_clients.TryAdd(client, secureStream))
-                {
-                    Console.WriteLine($"Failed to add client {client.Client.RemoteEndPoint}. Removing existing client.");
-                    RemoveClient(client);
-                    return;
-                }
-
-                await HandleStartupAsync(client, secureStream);
-            }
-            catch (Exception ex)
-            {
-                if (!ex.Message.Contains("disposed object"))
-                {
-                    SetOnError($"HandleClientAsync: {ex.Message}");
-                }
-            }
-            finally
-            {
-                if (client.Connected)
-                {
-                    client.Close(); // Ensures proper closing of the connection
-                }
-                // Dispose streams only if they are not already disposed
-                if (networkStream != null && networkStream.CanRead)
-                {
-                    networkStream.Dispose();
-                }
-                if (secureStream != null && secureStream is SslStream sslStream && sslStream.CanRead)
-                {
-                    sslStream.Dispose();
-                }
-                RemoveClient(client);
-            }
+            }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
         }
 
         private async Task HandleStartupAsync(TcpClient client, Stream stream)
@@ -474,21 +458,31 @@ namespace BNet.WebSocket.Server
 
 
 
-        public async Task SendMessageAsync(string message)
+        public Task SendMessageAsync(string message)
         {
             var streamTasks = _clients.Values.ToList();
+            var tasks = new List<Task>();
+
             foreach (var stream in streamTasks)
             {
-                try
+                var task = _taskFactory.StartNew(async () =>
                 {
-                    await WriteMessageAsync(stream, message);
-                }
-                catch (Exception ex)
-                {
-                    SetOnError($"SendMessageAsync: {ex.Message}");
-                }
+                    try
+                    {
+                        await WriteMessageAsync(stream, message);
+                    }
+                    catch (Exception ex)
+                    {
+                        SetOnError($"SendMessageAsync: {ex.Message}");
+                    }
+                }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default).Unwrap();
+
+                tasks.Add(task);
             }
+
+            return Task.WhenAll(tasks);
         }
+
 
         private void RemoveClient(TcpClient client, string closeReason = null)
         {
