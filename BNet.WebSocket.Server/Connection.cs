@@ -200,10 +200,20 @@ namespace BNet.WebSocket.Server
             }
             finally
             {
-                // Ensure the client is removed from the dictionary and streams are properly disposed of
+                if (client.Connected)
+                {
+                    client.Close(); // Ensures proper closing of the connection
+                }
+                // Dispose streams only if they are not already disposed
+                if (networkStream != null && networkStream.CanRead)
+                {
+                    networkStream.Dispose();
+                }
+                if (secureStream != null && secureStream is SslStream sslStream && sslStream.CanRead)
+                {
+                    sslStream.Dispose();
+                }
                 RemoveClient(client);
-                networkStream?.Dispose(); // Dispose of the network stream if necessary
-                secureStream?.Dispose(); // Dispose of the secure stream if necessary
             }
         }
 
@@ -484,71 +494,19 @@ namespace BNet.WebSocket.Server
             }
         }
 
-        private async void RemoveClient(TcpClient client, string closeReason = null)
+        private  void RemoveClient(TcpClient client, string closeReason = null)
         {
-            if (_clients.TryRemove(client, out Stream stream))
+            if (_clients.TryRemove(client, out var stream))
             {
-                try
-                {
-                    // Send a close frame to the client
-                    await SendCloseFrameAsync(stream, reason: closeReason);
-                }
-                catch (Exception ex)
-                {
-                    SetOnError($"RemoveClient: Error sending close frame. {ex.Message}");
-                }
-
-                try
-                {
-                    // Close and dispose of the stream
-                    stream.Close();
-                    stream.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    SetOnError($"RemoveClient: {ex.Message} while closing stream.");
-                }
-
-                try
-                {
-                    // Close the TcpClient
-                    client.Close();
-                }
-                catch (Exception ex)
-                {
-                    SetOnError($"RemoveClient: {ex.Message} while closing TcpClient.");
-                }
-
-                // Log or update the state
+                stream?.Dispose();
+         
+             
                 SetOnDisconnectedClient(_clients.Count);
             }
+
+
         }
 
-        private async Task SendCloseFrameAsync(Stream stream, ushort closeCode = 1000, string reason = null)
-        {
-            var reasonBytes = string.IsNullOrEmpty(reason) ? new byte[0] : Encoding.UTF8.GetBytes(reason);
-            var closeFrameLength = 2 + reasonBytes.Length;
-            var closeFrame = new byte[closeFrameLength + 2]; // 2 bytes for the frame header
 
-            closeFrame[0] = 0x88; // Final frame + Close frame opcode
-            closeFrame[1] = (byte)closeFrameLength; // Payload length
-
-            // Write the close code
-            closeFrame[2] = (byte)(closeCode >> 8);
-            closeFrame[3] = (byte)closeCode;
-
-            // Write the reason (if any)
-            Array.Copy(reasonBytes, 0, closeFrame, 4, reasonBytes.Length);
-
-            try
-            {
-                await stream.WriteAsync(closeFrame, 0, closeFrame.Length);
-                await stream.FlushAsync(); // Ensure the frame is sent immediately
-            }
-            catch (Exception ex)
-            {
-                SetOnError($"SendCloseFrameAsync: {ex.Message}");
-            }
-        }
     }
 }
