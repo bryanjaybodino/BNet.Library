@@ -19,7 +19,7 @@ namespace BNet.WebSocket.Server
         private TcpListener _listener;
         private ConcurrentDictionary<TcpClient, Stream> _clients = new ConcurrentDictionary<TcpClient, Stream>();
 
-        private ConcurrentDictionary<Task, CancellationTokenSource> _clientCancellationTokens = new ConcurrentDictionary<Task, CancellationTokenSource>();
+
         private ConcurrentDictionary<string, HashSet<TcpClient>> _rooms = new ConcurrentDictionary<string, HashSet<TcpClient>>();
         public bool IsRunning { get; private set; }
 
@@ -62,12 +62,16 @@ namespace BNet.WebSocket.Server
                                 RemoveClient(client);
                                 continue;
                             }
+                            else
+                            {
+                                HandleClientAsync(client);
+                               
+                            }
                         }
 
-                        var clientCancellationTokenSource = new CancellationTokenSource();
-                        var clientTask = Task.Run(() => HandleClientAsync(client, clientCancellationTokenSource.Token), clientCancellationTokenSource.Token);
-                        // Track the task and cancellation token if needed
-                        _clientCancellationTokens[clientTask] = clientCancellationTokenSource;
+
+
+
                     }
                     catch (Exception ex)
                     {
@@ -119,13 +123,6 @@ namespace BNet.WebSocket.Server
                 {
                     RemoveClient(client);
                 }
-
-                // If you have ongoing operations/tasks, cancel them
-                foreach (var cts in _clientCancellationTokens.Values)
-                {
-                    cts.Cancel();
-                }
-
                 // Await tasks if you have asynchronous operations to wait on
                 await Task.WhenAll(tasks);
             }
@@ -157,7 +154,7 @@ namespace BNet.WebSocket.Server
             }
         }
 
-        private async Task HandleClientAsync(TcpClient client, CancellationToken token)
+        private async void HandleClientAsync(TcpClient client)
         {
             NetworkStream networkStream = null;
             Stream secureStream = null;
@@ -195,7 +192,7 @@ namespace BNet.WebSocket.Server
                 if (!ex.Message.Contains("disposed object"))
                 {
                     SetOnError($"HandleClientAsync: {ex.Message}");
-                } 
+                }
             }
             finally
             {
@@ -493,7 +490,7 @@ namespace BNet.WebSocket.Server
             }
         }
 
-        private  void RemoveClient(TcpClient client, string closeReason = null)
+        private void RemoveClient(TcpClient client, string closeReason = null)
         {
             if (_clients.TryRemove(client, out var stream))
             {
