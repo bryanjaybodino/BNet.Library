@@ -54,7 +54,15 @@ namespace BNet.WebSocket.Server
                     try
                     {
                         var client = await _listener.AcceptTcpClientAsync();
-
+                        // Use a lock to ensure single client handling
+                        lock (_clients)
+                        {
+                            if (_clients.ContainsKey(client))
+                            {
+                                RemoveClient(client,"Client is already connected");
+                                continue;
+                            }
+                        }
                         // Use TaskFactory to handle the client
                         await _taskFactory.StartNew(() => HandleClientAsync(client), CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
                     }
@@ -111,6 +119,7 @@ namespace BNet.WebSocket.Server
                     RemoveClient(client, "Server has stop");
                 }
                 // Await tasks if you have asynchronous operations to wait on
+
                 await Task.WhenAll(tasks);
             }
             catch (Exception ex)
@@ -204,9 +213,9 @@ namespace BNet.WebSocket.Server
                         JoinRoom(roomId, client);
                     }
 
-                    SetOnConnectedClient(_clients.Count);
+                 
                     _clients.TryAdd(client, stream);
-
+                    SetOnConnectedClient(_clients.Count);
 
                     while (client.Connected)
                     {
@@ -521,8 +530,9 @@ namespace BNet.WebSocket.Server
                 // Dispose of the client
                 if (client != null)
                 {
-                    client.Close();          
+                    client.Close();
                 }
+                SetOnConnectedClient(_clients.Count);
             }
         }
     }
