@@ -14,7 +14,7 @@
 		<PackAsTool>False</PackAsTool>
 		<PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
 		<PackageLicenseFile>_License.txt</PackageLicenseFile>
-		<Version>3.0.0</Version>
+		<Version>4.0.0</Version>
 		<IncludeLicenseFile>false</IncludeLicenseFile>
 		<OutputType>Library</OutputType>
 		<Authors>Bryan Jay Bodino</Authors>
