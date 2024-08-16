@@ -4,13 +4,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Net.Security;
 
 namespace BNet.WebSocket.Server
 {
@@ -18,7 +18,7 @@ namespace BNet.WebSocket.Server
     {
         private TcpListener _listener;
         private ConcurrentDictionary<TcpClient, Stream> _clients = new ConcurrentDictionary<TcpClient, Stream>();
-        private readonly TaskFactory _taskFactory = new TaskFactory(TaskScheduler.Default);
+
 
         private ConcurrentDictionary<string, HashSet<TcpClient>> _rooms = new ConcurrentDictionary<string, HashSet<TcpClient>>();
         public bool IsRunning { get; private set; }
@@ -41,6 +41,9 @@ namespace BNet.WebSocket.Server
             ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
             _serverCertificate = new X509Certificate2(rawData, password);
         }
+
+
+
         public async Task StartAsync()
         {
             try
@@ -51,51 +54,37 @@ namespace BNet.WebSocket.Server
 
                 while (IsRunning)
                 {
-                    try
-                    {
-                        var client = await _listener.AcceptTcpClientAsync();
-                        // Use a lock to ensure single client handling
-                        lock (_clients)
-                        {
-                            if (_clients.ContainsKey(client))
-                            {
-                                RemoveClient(client,"Client is already connected");
-                                continue;
-                            }
-                        }
-                        // Use TaskFactory to handle the client
-                        await _taskFactory.StartNew(() => HandleClientAsync(client), CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
-                    }
-                    catch (Exception ex)
-                    {
-                        SetOnError($"StartAsync: {ex.Message}");
-                    }
+                    TcpClient client = await _listener.AcceptTcpClientAsync();
+                    _ = Task.Run(() => HandleClientAsync(client));
                 }
             }
             catch (Exception ex)
             {
-                SetOnError($"StartAsync: {ex.Message}");
+                await SetOnError($"StartAsync: {ex.Message}");
             }
         }
 
-
-        public async Task SendMessageToRoomAsync(string roomId, string message)
+        public Task SendMessageToRoomAsync(string roomId, string message)
         {
             if (_rooms.TryGetValue(roomId, out var clientsInRoom))
             {
-                var tasks = new List<Task>();
-
-                foreach (var client in clientsInRoom)
+                var tasks = clientsInRoom.Select(client =>
                 {
                     if (_clients.TryGetValue(client, out var stream))
                     {
-                        tasks.Add(_taskFactory.StartNew(() => WriteMessageAsync(stream, message), CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default));
+                        return WriteMessageAsync(stream, message);
                     }
-                }
+                    return Task.FromResult(0); // Return a completed task
+                }).ToArray();
 
-                await Task.WhenAll(tasks);
+                // Use Task.WhenAll to await the completion of all tasks
+                return Task.WhenAll(tasks);
             }
+
+            // Return a completed task if no clients found
+            return Task.FromResult(0);
         }
+
 
         private void JoinRoom(string roomId, TcpClient client)
         {
@@ -105,26 +94,24 @@ namespace BNet.WebSocket.Server
                 clientsInRoom.Add(client);
             }
         }
-
-        public async Task StopAsync()
+        public Task StopAsync()
         {
             try
             {
                 IsRunning = false;
                 _listener.Stop();
 
-                var tasks = new List<Task>();
-                foreach (var client in _clients.Keys.ToList()) // ToList to avoid modification during iteration
+                var tasks = _clients.Keys.Select(client =>
                 {
-                    RemoveClient(client, "Server has stop");
-                }
-                // Await tasks if you have asynchronous operations to wait on
+                    RemoveClient(client); // Assuming RemoveClient is synchronous
+                    return Task.FromResult(0); // Return a completed task for each client
+                }).ToArray();
 
-                await Task.WhenAll(tasks);
+                return Task.WhenAll(tasks);
             }
             catch (Exception ex)
             {
-                SetOnError($"StopAsync: {ex.Message}");
+                return SetOnError($"StopAsync: {ex.Message}");
             }
         }
 
@@ -137,138 +124,109 @@ namespace BNet.WebSocket.Server
             }
 
             var sslStream = new SslStream(stream, false);
+            await sslStream.AuthenticateAsServerAsync(_serverCertificate);
+            return sslStream;
+        }
+
+        private async Task HandleClientAsync(TcpClient client)
+        {
             try
             {
-                await sslStream.AuthenticateAsServerAsync(_serverCertificate);
-                return sslStream;
+                using (NetworkStream networkStream = client.GetStream())
+                {
+                    using (Stream secureStream = await HandleSecurityAsync(networkStream))
+                    {
+                        if (secureStream == null)
+                        {
+                            throw new NotSupportedException("Failed to secure the stream for client.");
+                        }
+
+                        // Check if client is already connected before adding it
+                        if (_clients.ContainsKey(client))
+                        {
+                            throw new NotSupportedException("Client already connected.");
+                        }
+
+                        // Add the client and ensure no duplicates
+                        if (!_clients.TryAdd(client, secureStream))
+                        {
+                            throw new NotSupportedException("Failed to add client to the dictionary.");
+                        }
+
+                        await HandleStartupAsync(client, secureStream);
+                    }
+                }
             }
             catch (Exception ex)
             {
-                sslStream.Dispose();
-                Console.WriteLine($"Authentication failed: {ex.Message}");
-                throw; // Ensure the caller is aware of the failure
+                await SetOnError($"{ex.Message}");
+            }
+            finally
+            {
+                // Ensure client is removed from dictionary when done
+                RemoveClient(client);
             }
         }
 
-        private void HandleClientAsync(TcpClient client)
-        {
-            _taskFactory.StartNew(async () =>
-            {
-                NetworkStream networkStream = null;
-                Stream secureStream = null;
-
-                try
-                {
-                    networkStream = client.GetStream();
-                    secureStream = await HandleSecurityAsync(networkStream);
-
-                    if (secureStream == null)
-                    {
-                        RemoveClient(client, $"Failed to secure the stream for client {client.Client.RemoteEndPoint}. Disconnecting.");
-                        return;
-                    }
-
-                    if (_clients.ContainsKey(client))
-                    {
-                        RemoveClient(client, $"Client {client.Client.RemoteEndPoint} already connected.");
-                        return;
-                    }
-
-
-                    await HandleStartupAsync(client, secureStream);
-                }
-                catch (Exception ex)
-                {
-                    if (!ex.Message.Contains("disposed object"))
-                    {
-                        SetOnError($"HandleClientAsync: {ex.Message}");
-                    }
-                }
-                finally
-                {
-                    if (client.Connected)
-                    {
-                        client.Close(); // Ensures proper closing of the connection
-                    }
-                    // Dispose streams only if they are not already disposed
-                    networkStream?.Dispose();
-                    secureStream?.Dispose();
-                    RemoveClient(client, "Disconnected");
-                }
-            }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
-        }
 
         private async Task HandleStartupAsync(TcpClient client, Stream stream)
         {
-            try
+            string handshakeRequest = await ReadRequestAsync(client, stream);
+            if (IsWebSocketHandshake(handshakeRequest, out string key))
             {
-                string handshakeRequest = await ReadRequestAsync(client, stream);
-                if (IsWebSocketHandshake(handshakeRequest, out string key))
+                await SendHandshakeResponseAsync(stream, key);
+
+                string roomId = ExtractRoomIdFromRequest(handshakeRequest);
+                if (!string.IsNullOrEmpty(roomId))
                 {
-                    await SendHandshakeResponseAsync(stream, key);
+                    JoinRoom(roomId, client);
+                }
+                await SetOnConnectedClient(_clients.Count);
+                while (client.Connected)
+                {
 
-                    string roomId = ExtractRoomIdFromRequest(handshakeRequest);
-                    if (!string.IsNullOrEmpty(roomId))
+                    string message = await ReadMessageAsync(client, stream);
+                    if (message != null)
                     {
-                        JoinRoom(roomId, client);
-                    }
-
-                 
-                    _clients.TryAdd(client, stream);
-                    SetOnConnectedClient(_clients.Count);
-
-                    while (client.Connected)
-                    {
-                        string message = await ReadMessageAsync(client, stream);
-                        if (message != null)
+                        await SetOnReceived(message);
+                        if (string.IsNullOrEmpty(roomId))
                         {
-                            SetOnReceived(message);
-                            if (roomId == null)
-                            {
-                                await SendMessageAsync(message);
-                            }
-                            else
-                            {
-                                await SendMessageToRoomAsync(roomId, message); // Send message to the room
-                            }
-
+                            await SendMessageAsync(message);
                         }
                         else
                         {
-                            RemoveClient(client, "Message is null");
+                            await SendMessageToRoomAsync(roomId, message);
                         }
+                    }
+                    else
+                    {
+                        throw new NotSupportedException("Message Null");
                     }
                 }
             }
-            catch (Exception ex)
+            else
             {
-
-                RemoveClient(client, ex.Message);
+                throw new NotSupportedException("Invalid WebSocket handshake.");
             }
         }
 
         private async Task<string> ReadRequestAsync(TcpClient client, Stream stream)
         {
-            try
-            {
-                var requestBuilder = new StringBuilder();
-                var buffer = new byte[client.ReceiveBufferSize];
-                int bytesRead;
+            var requestBuilder = new StringBuilder();
+            var buffer = new byte[client.ReceiveBufferSize];
+            int bytesRead;
 
-                do
+            do
+            {
+                bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                if (bytesRead > 0)
                 {
-                    bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
                     requestBuilder.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));
                 }
-                while (bytesRead > 0 && !requestBuilder.ToString().EndsWith("\r\n\r\n"));
+            }
+            while (bytesRead > 0 && !requestBuilder.ToString().EndsWith("\r\n\r\n"));
 
-                return requestBuilder.ToString();
-            }
-            catch (Exception er)
-            {
-                RemoveClient(client, er.Message);
-                return null;
-            }
+            return requestBuilder.ToString();
         }
 
         private bool IsWebSocketHandshake(string request, out string key)
@@ -302,13 +260,12 @@ namespace BNet.WebSocket.Server
                 }
             }
 
-            // Construct the response with correct CRLF line endings
             string response =
                 "HTTP/1.1 101 Switching Protocols\r\n" +
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
                 $"Sec-WebSocket-Accept: {CalculateWebSocketAcceptKey()}\r\n" +
-                "\r\n";  // End the headers with an extra CRLF
+                "\r\n";
 
             byte[] responseBytes = Encoding.UTF8.GetBytes(response);
             await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
@@ -316,41 +273,32 @@ namespace BNet.WebSocket.Server
 
         private string ExtractRoomIdFromRequest(string request)
         {
-            // Split request into lines
             var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
-
-            // Extract Host header
             string hostHeader = lines.FirstOrDefault(line => line.StartsWith("Host:"));
             if (hostHeader != null)
             {
                 var hostParts = hostHeader.Substring("Host:".Length).Trim().Split(':');
                 string hostname = hostParts[0];
-                int port = 80; // Default HTTP port
+                int port = 80;
 
                 if (hostParts.Length > 1 && int.TryParse(hostParts[1], out int parsedPort))
                 {
                     port = parsedPort;
                 }
 
-                // Extract the request line
                 var requestLine = lines.FirstOrDefault();
                 if (requestLine != null)
                 {
-                    // Split the request line into components
                     var requestParts = requestLine.Split(' ');
 
                     if (requestParts.Length > 1)
                     {
-                        // The URL is the second part of the request line
                         var url = requestParts[1];
-
-                        // Create a full URI with the hostname and port
                         var uri = new Uri($"http://{hostname}:{port}{url}");
                         var query = uri.Query;
 
                         if (!string.IsNullOrEmpty(query))
                         {
-                            // Parse query parameters
                             var queryParams = query.TrimStart('?').Split('&');
                             foreach (var param in queryParams)
                             {
@@ -363,78 +311,111 @@ namespace BNet.WebSocket.Server
                         }
                     }
                 }
+                return null;
+            }
+            else
+            {
+                throw new NotSupportedException("Room ID not found in request.");
             }
 
-            return null;
         }
-
-
-
 
         private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
         {
-            byte[] buffer = new byte[client.ReceiveBufferSize];
+            var messageBuilder = new StringBuilder();
+            var buffer = new byte[client.ReceiveBufferSize];
+            int bytesRead;
 
-            try
+            bool isFinalFragment = false;
+
+            do
             {
-                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
                 if (bytesRead == 0)
                 {
-                    RemoveClient(client, "Disconnected");
-                    return null;
+                    throw new NotSupportedException("Disconnected");
                 }
 
-                // Frame header
-                byte b0 = buffer[0];
-                bool isFinalFragment = (b0 & 0x80) != 0;
-                bool isTextFrame = (b0 & 0x0F) == 1;
+                int offset = 0;
 
-                if (!isFinalFragment || !isTextFrame)
+                while (offset < bytesRead)
                 {
-                    RemoveClient(client, "Only final text frames are supported");
-                    return null;
+                    byte b0 = buffer[offset]; // First byte
+                    byte b1 = buffer[offset + 1]; // Second byte
+
+                    bool isFinal = (b0 & 0x80) != 0;
+                    byte opcode = (byte)(b0 & 0x0F);
+
+                    if (opcode == 8) // Close frame
+                    {
+                        // Handle close frame if necessary
+                        throw new NotSupportedException("Close frame received");
+                    }
+                    else if (opcode == 9) // Ping frame
+                    {
+                        // Handle ping frame if necessary
+                        // Optionally send a Pong response
+                        throw new NotSupportedException("Ping frame received");
+                    }
+                    else if (opcode == 10) // Pong frame
+                    {
+                        // Handle pong frame if necessary
+                        throw new NotSupportedException("Pong frame received");
+                    }
+                    else if (opcode != 1 && opcode != 2) // Only text and binary frames are supported
+                    {
+                        throw new NotSupportedException("Unsupported frame type");
+                    }
+
+                    if (!isFinal && opcode != 1 && opcode != 2)
+                    {
+                        throw new NotSupportedException("Only text and binary frames are supported");
+                    }
+
+                    // Handle payload length
+                    int payloadLength = b1 & 0x7F;
+                    int lengthFieldSize = 0;
+
+                    if (payloadLength == 126)
+                    {
+                        payloadLength = (buffer[offset + 2] << 8) | buffer[offset + 3];
+                        lengthFieldSize = 2;
+                    }
+                    else if (payloadLength == 127)
+                    {
+                        // 64-bit length field is not supported
+                        throw new NotSupportedException("Payload length 127 (64-bit length) is not supported");
+                    }
+
+                    // Masking key and payload
+                    byte[] maskingKey = new byte[4];
+                    Array.Copy(buffer, offset + 2 + lengthFieldSize, maskingKey, 0, 4);
+
+                    // Handle payload buffer
+                    byte[] payload = new byte[payloadLength];
+                    Array.Copy(buffer, offset + 2 + lengthFieldSize + 4, payload, 0, payloadLength);
+
+                    // Apply masking
+                    for (int i = 0; i < payload.Length; i++)
+                    {
+                        payload[i] ^= maskingKey[i % 4];
+                    }
+
+                    // Append payload to message
+                    messageBuilder.Append(Encoding.UTF8.GetString(payload));
+
+                    // Move to the next frame
+                    offset += 2 + lengthFieldSize + 4 + payloadLength;
+
+                    isFinalFragment = isFinal;
                 }
+            } while (!isFinalFragment);
 
-                // Payload length
-                int payloadLength = buffer[1] & 0x7F;
-                int offset = 2;
 
-                if (payloadLength == 126)
-                {
-                    // 16-bit length
-                    payloadLength = (buffer[2] << 8) | buffer[3];
-                    offset += 2;
-                }
-                else if (payloadLength == 127)
-                {
-                    RemoveClient(client, "Payload length 127 (64-bit length) is not supported");
-                    return null;
-                }
-
-                // Masking key
-                byte[] maskingKey = new byte[4];
-                Array.Copy(buffer, offset, maskingKey, 0, 4);
-                offset += 4;
-
-                // Extract payload
-                byte[] payload = new byte[payloadLength];
-                Array.Copy(buffer, offset, payload, 0, payloadLength);
-
-                // Unmask payload
-                for (int i = 0; i < payload.Length; i++)
-                {
-                    payload[i] ^= maskingKey[i % 4];
-                }
-
-                return Encoding.UTF8.GetString(payload);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error reading message: {ex.Message}");
-                RemoveClient(client, "Error reading message");
-                return null;
-            }
+            return messageBuilder.ToString();
         }
+
+
 
 
         private async Task WriteMessageAsync(Stream stream, string message)
@@ -443,8 +424,6 @@ namespace BNet.WebSocket.Server
             int payloadLength = payload.Length;
             byte[] frame;
 
-
-            // Determine the length of the frame
             if (payloadLength <= 125)
             {
                 frame = new byte[1 + 1 + payloadLength];
@@ -471,69 +450,30 @@ namespace BNet.WebSocket.Server
                 frame[9] = (byte)payloadLength;
             }
 
-            // Set the frame header
             frame[0] = 0x81; // Final fragment + text frame opcode
-
-            // Copy the payload to the frame
             Array.Copy(payload, 0, frame, frame.Length - payloadLength, payloadLength);
 
-
-            try
-            {
-                await stream.WriteAsync(frame, 0, frame.Length);
-                await stream.FlushAsync(); // Ensure data is flushed to the network
-            }
-            catch (Exception ex)
-            {
-            }
+            await stream.WriteAsync(frame, 0, frame.Length);
+            await stream.FlushAsync();
         }
-
-
 
         public Task SendMessageAsync(string message)
         {
-            var streamTasks = _clients.Values.ToList();
-            var tasks = new List<Task>();
-
-            foreach (var stream in streamTasks)
-            {
-                var task = _taskFactory.StartNew(async () =>
-                {
-                    try
-                    {
-                        await WriteMessageAsync(stream, message);
-                    }
-                    catch (Exception ex)
-                    {
-                        SetOnError($"SendMessageAsync: {ex.Message}");
-                    }
-                }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default).Unwrap();
-
-                tasks.Add(task);
-            }
-
+            var tasks = _clients.Values.Select(stream => WriteMessageAsync(stream, message)).ToArray();
             return Task.WhenAll(tasks);
         }
 
-        private void RemoveClient(TcpClient client, string reason)
+        private async void RemoveClient(TcpClient client)
         {
+
             if (_clients.TryRemove(client, out Stream stream))
             {
-                Console.WriteLine($"Client removed: {reason}");
-
-                // Dispose of the stream
-                if (stream != null)
-                {
-                    stream.Dispose();
-                }
-
-                // Dispose of the client
-                if (client != null)
-                {
-                    client.Close();
-                }
-                SetOnConnectedClient(_clients.Count);
+                stream?.Dispose();
+                client?.Close();
+                await SetOnConnectedClient(_clients.Count);
             }
+
         }
+
     }
 }
