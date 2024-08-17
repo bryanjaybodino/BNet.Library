@@ -61,12 +61,6 @@ namespace BNet.WebSocket.Server
                 await SetOnError($"StartAsync: {ex.Message}");
             }
         }
-        private string GetClientId(TcpClient client)
-        {
-            // Implement logic to generate or retrieve a unique client ID
-            // For example, use client.RemoteEndPoint.ToString() or another method to ensure uniqueness
-            return client.Client.RemoteEndPoint.ToString();
-        }
         public Task SendMessageToRoomAsync(string roomId, string message)
         {
             if (_rooms.TryGetValue(roomId, out var clientsInRoom))
@@ -334,7 +328,6 @@ namespace BNet.WebSocket.Server
             }
 
         }
-
         private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
         {
             var messageBuilder = new StringBuilder();
@@ -415,7 +408,6 @@ namespace BNet.WebSocket.Server
             return messageBuilder.ToString();
         }
 
-
         private async Task SendPongAsync(Stream stream, byte[] buffer, int offset, int bytesRead)
         {
             // Calculate payload length (same as in Ping)
@@ -436,10 +428,6 @@ namespace BNet.WebSocket.Server
             await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
             await stream.FlushAsync();
         }
-
-
-
-
         private async Task WriteMessageAsync(Stream stream, string message)
         {
             byte[] payload = Encoding.UTF8.GetBytes(message);
@@ -492,7 +480,7 @@ namespace BNet.WebSocket.Server
                 if (_clients.TryRemove(client, out Stream stream))
                 {
                     stream?.Dispose();
-                    client?.Close();        
+                    client?.Close();
                 }
             }
             await SetOnConnectedClient(_clients.Count);
