@@ -33,8 +33,8 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="BNet.WebSocket.Server, Version=2.0.0.0, Culture=neutral, processorArchitecture=MSIL">
-      <HintPath>..\packages\BNet.WebSocket.Server.2.0.0\lib\net472\BNet.WebSocket.Server.dll</HintPath>
+    <Reference Include="BNet.WebSocket.Server, Version=5.0.0.0, Culture=neutral, processorArchitecture=MSIL">
+      <HintPath>..\packages\BNet.WebSocket.Server.5.0.0\lib\net472\BNet.WebSocket.Server.dll</HintPath>
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />

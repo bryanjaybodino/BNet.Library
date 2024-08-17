@@ -8,3 +8,7 @@ Github Repository
 
 1. https://github.com/bryanjaybodino/BNet.Library/tree/master/BNet.WebSocket.Server.Sample
 2. https://github.com/bryanjaybodino/BNet.Library/tree/master/BNet.WebSocket.Server
+
+Youtube Tutorial
+
+https://www.youtube.com/watch?v=1qIYJg2WNOk
