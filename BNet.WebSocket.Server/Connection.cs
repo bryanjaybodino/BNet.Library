@@ -18,8 +18,6 @@ namespace BNet.WebSocket.Server
     {
         private TcpListener _listener;
         private ConcurrentDictionary<TcpClient, Stream> _clients = new ConcurrentDictionary<TcpClient, Stream>();
-
-
         private ConcurrentDictionary<string, HashSet<TcpClient>> _rooms = new ConcurrentDictionary<string, HashSet<TcpClient>>();
         public bool IsRunning { get; private set; }
 
@@ -55,7 +53,7 @@ namespace BNet.WebSocket.Server
                 while (IsRunning)
                 {
                     TcpClient client = await _listener.AcceptTcpClientAsync();
-                    _ = Task.Run(() => HandleClientAsync(client));
+                    await Task.Run(() => HandleClientAsync(client));
                 }
             }
             catch (Exception ex)
@@ -63,7 +61,12 @@ namespace BNet.WebSocket.Server
                 await SetOnError($"StartAsync: {ex.Message}");
             }
         }
-
+        private string GetClientId(TcpClient client)
+        {
+            // Implement logic to generate or retrieve a unique client ID
+            // For example, use client.RemoteEndPoint.ToString() or another method to ensure uniqueness
+            return client.Client.RemoteEndPoint.ToString();
+        }
         public Task SendMessageToRoomAsync(string roomId, string message)
         {
             if (_rooms.TryGetValue(roomId, out var clientsInRoom))
@@ -132,25 +135,38 @@ namespace BNet.WebSocket.Server
         {
             try
             {
+
+                var endpoint = client.Client.RemoteEndPoint as IPEndPoint;
+                if (endpoint == null)
+                {
+                    throw new Exception("Unable to retrieve client endpoint.");
+                }
+
+                string clientKey = $"{endpoint.Address}:{endpoint.Port}";
+
                 using (NetworkStream networkStream = client.GetStream())
                 {
                     using (Stream secureStream = await HandleSecurityAsync(networkStream))
                     {
                         if (secureStream == null)
                         {
-                            throw new NotSupportedException("Failed to secure the stream for client.");
+                            throw new Exception("Failed to secure the stream for client.");
                         }
 
-                        // Check if client is already connected before adding it
-                        if (_clients.ContainsKey(client))
-                        {
-                            throw new NotSupportedException("Client already connected.");
-                        }
 
-                        // Add the client and ensure no duplicates
-                        if (!_clients.TryAdd(client, secureStream))
+                        lock (_clients)
                         {
-                            throw new NotSupportedException("Failed to add client to the dictionary.");
+                            if (_clients.ContainsKey(client))
+                            {
+                                throw new Exception("Client already connected.");
+                            }
+                            else
+                            {
+                                if (!_clients.TryAdd(client, secureStream))
+                                {
+                                    throw new Exception("Failed to add client to the dictionary.");
+                                }
+                            }
                         }
 
                         await HandleStartupAsync(client, secureStream);
@@ -200,13 +216,14 @@ namespace BNet.WebSocket.Server
                     }
                     else
                     {
-                        throw new NotSupportedException("Message Null");
+                        throw new Exception("Message Null");
                     }
                 }
+                throw new Exception("Client Disconnected");
             }
             else
             {
-                throw new NotSupportedException("Invalid WebSocket handshake.");
+                throw new Exception("Invalid WebSocket handshake.");
             }
         }
 
@@ -246,25 +263,23 @@ namespace BNet.WebSocket.Server
             }
             return false;
         }
-
+        private string CalculateWebSocketAcceptKey(string key)
+        {
+            var magicGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+            using (var sha1 = SHA1.Create())
+            {
+                var keyBytes = Encoding.UTF8.GetBytes(key + magicGuid);
+                var hashBytes = sha1.ComputeHash(keyBytes);
+                return Convert.ToBase64String(hashBytes);
+            }
+        }
         private async Task SendHandshakeResponseAsync(Stream stream, string key)
         {
-            string CalculateWebSocketAcceptKey()
-            {
-                var magicGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-                using (var sha1 = SHA1.Create())
-                {
-                    var keyBytes = Encoding.UTF8.GetBytes(key + magicGuid);
-                    var hashBytes = sha1.ComputeHash(keyBytes);
-                    return Convert.ToBase64String(hashBytes);
-                }
-            }
-
             string response =
                 "HTTP/1.1 101 Switching Protocols\r\n" +
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
-                $"Sec-WebSocket-Accept: {CalculateWebSocketAcceptKey()}\r\n" +
+                $"Sec-WebSocket-Accept: {CalculateWebSocketAcceptKey(key)}\r\n" +
                 "\r\n";
 
             byte[] responseBytes = Encoding.UTF8.GetBytes(response);
@@ -315,7 +330,7 @@ namespace BNet.WebSocket.Server
             }
             else
             {
-                throw new NotSupportedException("Room ID not found in request.");
+                throw new Exception("Room ID not found in request.");
             }
 
         }
@@ -325,7 +340,6 @@ namespace BNet.WebSocket.Server
             var messageBuilder = new StringBuilder();
             var buffer = new byte[client.ReceiveBufferSize];
             int bytesRead;
-
             bool isFinalFragment = false;
 
             do
@@ -333,36 +347,31 @@ namespace BNet.WebSocket.Server
                 bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
                 if (bytesRead == 0)
                 {
-                    throw new NotSupportedException("Disconnected");
+                    throw new NotSupportedException("Client Disconnected");
                 }
 
                 int offset = 0;
-
                 while (offset < bytesRead)
                 {
-                    byte b0 = buffer[offset]; // First byte
-                    byte b1 = buffer[offset + 1]; // Second byte
+                    byte b0 = buffer[offset];
+                    byte b1 = buffer[offset + 1];
 
                     bool isFinal = (b0 & 0x80) != 0;
                     byte opcode = (byte)(b0 & 0x0F);
 
                     if (opcode == 8) // Close frame
                     {
-                        // Handle close frame if necessary
                         throw new NotSupportedException("Close frame received");
                     }
                     else if (opcode == 9) // Ping frame
                     {
-                        // Handle ping frame if necessary
-                        // Optionally send a Pong response
-                        throw new NotSupportedException("Ping frame received");
+                        await SendPongAsync(stream, buffer, offset, bytesRead);
                     }
                     else if (opcode == 10) // Pong frame
                     {
                         // Handle pong frame if necessary
-                        throw new NotSupportedException("Pong frame received");
                     }
-                    else if (opcode != 1 && opcode != 2) // Only text and binary frames are supported
+                    else if (opcode != 1 && opcode != 2)
                     {
                         throw new NotSupportedException("Unsupported frame type");
                     }
@@ -372,7 +381,6 @@ namespace BNet.WebSocket.Server
                         throw new NotSupportedException("Only text and binary frames are supported");
                     }
 
-                    // Handle payload length
                     int payloadLength = b1 & 0x7F;
                     int lengthFieldSize = 0;
 
@@ -383,36 +391,50 @@ namespace BNet.WebSocket.Server
                     }
                     else if (payloadLength == 127)
                     {
-                        // 64-bit length field is not supported
                         throw new NotSupportedException("Payload length 127 (64-bit length) is not supported");
                     }
 
-                    // Masking key and payload
                     byte[] maskingKey = new byte[4];
                     Array.Copy(buffer, offset + 2 + lengthFieldSize, maskingKey, 0, 4);
 
-                    // Handle payload buffer
                     byte[] payload = new byte[payloadLength];
                     Array.Copy(buffer, offset + 2 + lengthFieldSize + 4, payload, 0, payloadLength);
 
-                    // Apply masking
                     for (int i = 0; i < payload.Length; i++)
                     {
                         payload[i] ^= maskingKey[i % 4];
                     }
 
-                    // Append payload to message
                     messageBuilder.Append(Encoding.UTF8.GetString(payload));
-
-                    // Move to the next frame
                     offset += 2 + lengthFieldSize + 4 + payloadLength;
 
                     isFinalFragment = isFinal;
                 }
             } while (!isFinalFragment);
 
-
             return messageBuilder.ToString();
+        }
+
+
+        private async Task SendPongAsync(Stream stream, byte[] buffer, int offset, int bytesRead)
+        {
+            // Calculate payload length (same as in Ping)
+            int payloadLength = bytesRead - offset - 2;
+
+            // Create Pong frame
+            byte[] pongFrame = new byte[2 + payloadLength];
+            pongFrame[0] = 0x8A; // FIN + Pong opcode
+            pongFrame[1] = (byte)payloadLength; // Payload length
+
+            // Copy payload from Ping frame to Pong frame
+            if (payloadLength > 0)
+            {
+                Array.Copy(buffer, offset + 2, pongFrame, 2, payloadLength);
+            }
+
+            // Send Pong frame
+            await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
+            await stream.FlushAsync();
         }
 
 
@@ -465,14 +487,15 @@ namespace BNet.WebSocket.Server
 
         private async void RemoveClient(TcpClient client)
         {
-
-            if (_clients.TryRemove(client, out Stream stream))
+            lock (_clients)
             {
-                stream?.Dispose();
-                client?.Close();
-                await SetOnConnectedClient(_clients.Count);
+                if (_clients.TryRemove(client, out Stream stream))
+                {
+                    stream?.Dispose();
+                    client?.Close();        
+                }
             }
-
+            await SetOnConnectedClient(_clients.Count);
         }
 
     }
