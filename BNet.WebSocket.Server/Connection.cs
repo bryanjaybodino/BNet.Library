@@ -87,10 +87,7 @@ namespace BNet.WebSocket.Server
         private void JoinRoom(string roomId, TcpClient client)
         {
             var clientsInRoom = _rooms.GetOrAdd(roomId, _ => new HashSet<TcpClient>());
-            lock (clientsInRoom)
-            {
-                clientsInRoom.Add(client);
-            }
+            clientsInRoom.Add(client);
         }
         public Task StopAsync()
         {
@@ -99,9 +96,9 @@ namespace BNet.WebSocket.Server
                 IsRunning = false;
                 _listener.Stop();
 
-                var tasks = _clients.Keys.Select(client =>
+                var tasks = _clients.Keys.Select(async client =>
                 {
-                    RemoveClient(client); // Assuming RemoveClient is synchronous
+                    await RemoveClientAsync(client); // Assuming RemoveClient is synchronous
                     return Task.FromResult(0); // Return a completed task for each client
                 }).ToArray();
 
@@ -125,7 +122,6 @@ namespace BNet.WebSocket.Server
             await sslStream.AuthenticateAsServerAsync(_serverCertificate);
             return sslStream;
         }
-
         private async Task HandleClientAsync(TcpClient client)
         {
             try
@@ -139,8 +135,7 @@ namespace BNet.WebSocket.Server
                             throw new NotSupportedException("Failed to secure the stream for client.");
                         }
 
-                        lock (_clients)
-                        {
+                      
                             if (_clients.ContainsKey(client))
                             {
                                 throw new Exception("Client already connected.");
@@ -152,8 +147,7 @@ namespace BNet.WebSocket.Server
                                     throw new Exception("Failed to add client to the dictionary.");
                                 }
                             }
-                        }
-
+                      
                         await HandleStartupAsync(client, secureStream);
                     }
                 }
@@ -165,10 +159,9 @@ namespace BNet.WebSocket.Server
             finally
             {
                 // Ensure client is removed from dictionary when done
-                RemoveClient(client);
+                await RemoveClientAsync(client);
             }
         }
-
 
         private async Task HandleStartupAsync(TcpClient client, Stream stream)
         {
@@ -519,18 +512,14 @@ namespace BNet.WebSocket.Server
             return Task.WhenAll(tasks);
         }
 
-        private async void RemoveClient(TcpClient client)
+        private async Task RemoveClientAsync(TcpClient client)
         {
-            lock (_clients)
+            if (_clients.TryRemove(client, out Stream stream))
             {
-                if (_clients.TryRemove(client, out Stream stream))
-                {
-                    stream?.Dispose();
-                    client?.Close();
-                }
+                stream?.Dispose();
+                client?.Close();
             }
             await SetOnConnectedClient(_clients.Count);
         }
-
     }
 }
