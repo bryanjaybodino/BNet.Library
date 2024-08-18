@@ -199,14 +199,15 @@ namespace BNet.WebSocket.Server
                             await SendMessageToRoomAsync(roomId, message);
                         }
                     }
+                    else if (message == null)
+                    {
+                        throw new Exception("Force close client due to abnormal activity");
+                    }
                     else if (message == "Unexpected frame type received") // This is my placeholder
                     {
                         //Do Nothing
                     }
-                    else
-                    {
-                        throw new Exception("Message Null");
-                    }
+
                 }
                 throw new Exception("Client Disconnected");
             }
@@ -404,8 +405,22 @@ namespace BNet.WebSocket.Server
                     }
                     else if (opcode == 8) // Close frame
                     {
-                        // Handle close frame if necessary
-                        throw new NotSupportedException("Close frame received");
+                        // Handle close frame
+                        byte[] closeFrame = new byte[bytesRead];
+                        Array.Copy(buffer, offset, closeFrame, 0, bytesRead);
+
+                        // Optionally extract the close code and reason
+                        if (bytesRead > 2)
+                        {
+                            ushort closeCode = (ushort)((closeFrame[0] << 8) | closeFrame[1]);
+                            string closeReason = Encoding.UTF8.GetString(closeFrame, 2, bytesRead - 2);
+                            // Log or handle close code and reason
+                        }
+
+                        // Optionally send a close frame back
+                        byte[] responseCloseFrame = CreateCloseFrame();
+                        await stream.WriteAsync(responseCloseFrame, 0, responseCloseFrame.Length);
+                        throw new InvalidOperationException("Received close frame with no status code.");
                     }
                     else if (opcode == 9) // Ping frame
                     {
@@ -438,6 +453,26 @@ namespace BNet.WebSocket.Server
             Array.Copy(buffer, offset + 2, pongFrame, 2, pongFrame.Length - 2);
             return pongFrame;
         }
+
+   
+        private byte[] CreateCloseFrame(ushort statusCode = 1000, string reason = "")
+        {
+            byte[] statusCodeBytes = BitConverter.GetBytes(statusCode);
+            Array.Reverse(statusCodeBytes); // Ensure big-endian byte order
+
+            byte[] reasonBytes = Encoding.UTF8.GetBytes(reason);
+            byte[] frame = new byte[2 + reasonBytes.Length];
+
+            // Close code
+            frame[0] = (byte)((statusCodeBytes[0] >> 8) & 0xFF);
+            frame[1] = (byte)(statusCodeBytes[1] & 0xFF);
+
+            // Close reason
+            Array.Copy(reasonBytes, 0, frame, 2, reasonBytes.Length);
+
+            return frame;
+        }
+
 
         private async Task WriteMessageAsync(Stream stream, string message)
         {
