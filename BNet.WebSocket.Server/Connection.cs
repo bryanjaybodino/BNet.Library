@@ -86,10 +86,6 @@ namespace BNet.WebSocket.Server
         private void JoinRoom(string roomId, TcpClient client)
         {
             var clientsInRoom = _rooms.GetOrAdd(roomId, _ => new HashSet<TcpClient>());
-            lock (clientsInRoom)
-            {
-                clientsInRoom.Add(client);
-            }
         }
         public Task StopAsync()
         {
@@ -336,6 +332,8 @@ namespace BNet.WebSocket.Server
         {
             var messageBuilder = new List<byte>();
             bool isFinalFragment = false;
+            int payloadLength = 0;
+            int payloadRead = 0;
 
             while (!isFinalFragment)
             {
@@ -357,59 +355,81 @@ namespace BNet.WebSocket.Server
 
                     if (!isTextFrame)
                     {
-                        //Itong Codes na ito ay placeholder para hindi mag double response pag base64string yung nilagay ni client
+                        // Handle non-text frames as needed
                         return "BNet.WebSocket.Server = Image";
                     }
 
-                    int payloadLength = buffer[offset + 1] & 0x7F;
-                    int headerSize = 2;
-
-                    if (payloadLength == 126)
+                    if (payloadLength == 0)
                     {
-                        payloadLength = (buffer[offset + 2] << 8) | buffer[offset + 3];
-                        headerSize += 2;
+                        payloadLength = buffer[offset + 1] & 0x7F;
+                        int headerSize = 2;
+
+                        if (payloadLength == 126)
+                        {
+                            payloadLength = (buffer[offset + 2] << 8) | buffer[offset + 3];
+                            headerSize += 2;
+                        }
+                        else if (payloadLength == 127)
+                        {
+                            payloadLength = (int)(
+                                ((long)buffer[offset + 2] << 56) |
+                                ((long)buffer[offset + 3] << 48) |
+                                ((long)buffer[offset + 4] << 40) |
+                                ((long)buffer[offset + 5] << 32) |
+                                ((long)buffer[offset + 6] << 24) |
+                                ((long)buffer[offset + 7] << 16) |
+                                ((long)buffer[offset + 8] << 8) |
+                                ((long)buffer[offset + 9])
+                            );
+                            headerSize += 8;
+                        }
+
+                        byte[] maskingKey = new byte[4];
+                        Array.Copy(buffer, offset + headerSize, maskingKey, 0, 4);
+
+                        int payloadOffset = offset + headerSize + 4;
+                        int remainingBytes = bytesRead - payloadOffset;
+
+                        payloadRead = Math.Min(payloadLength, remainingBytes);
+                        byte[] payload = new byte[payloadRead];
+                        Array.Copy(buffer, payloadOffset, payload, 0, payloadRead);
+
+                        for (int i = 0; i < payload.Length; i++)
+                        {
+                            payload[i] ^= maskingKey[i % 4];
+                        }
+
+                        messageBuilder.AddRange(payload);
+
+                        offset += headerSize + 4 + payloadRead;
+
+                        if (isFinalFragment)
+                        {
+                            break;
+                        }
+
+                        // Reset payload length for next fragment
+                        payloadLength = 0;
+                        payloadRead = 0;
                     }
-                    else if (payloadLength == 127)
+                    else
                     {
-                        payloadLength = (int)(
-                            ((long)buffer[offset + 2] << 56) |
-                            ((long)buffer[offset + 3] << 48) |
-                            ((long)buffer[offset + 4] << 40) |
-                            ((long)buffer[offset + 5] << 32) |
-                            ((long)buffer[offset + 6] << 24) |
-                            ((long)buffer[offset + 7] << 16) |
-                            ((long)buffer[offset + 8] << 8) |
-                            ((long)buffer[offset + 9])
-                        );
-                        headerSize += 8;
-                    }
+                        // Handle continuation frames
+                        int payloadOffset = offset + 4;
+                        int remainingBytes = bytesRead - payloadOffset;
+                        int payloadSize = Math.Min(payloadLength - messageBuilder.Count, remainingBytes);
 
-                    byte[] maskingKey = new byte[4];
-                    Array.Copy(buffer, offset + headerSize, maskingKey, 0, 4);
+                        byte[] payload = new byte[payloadSize];
+                        Array.Copy(buffer, payloadOffset, payload, 0, payloadSize);
 
-                    int payloadOffset = offset + headerSize + 4;
-                    int payloadSize = bytesRead - payloadOffset;
+                        messageBuilder.AddRange(payload);
 
-                    if (payloadSize > payloadLength)
-                    {
-                        payloadSize = payloadLength;
-                    }
+                        offset += payloadSize;
 
-                    byte[] payload = new byte[payloadSize];
-                    Array.Copy(buffer, payloadOffset, payload, 0, payloadSize);
-
-                    for (int i = 0; i < payload.Length; i++)
-                    {
-                        payload[i] ^= maskingKey[i % 4];
-                    }
-
-                    messageBuilder.AddRange(payload);
-
-                    offset += headerSize + 4 + payloadSize;
-
-                    if (isFinalFragment)
-                    {
-                        break;
+                        if (messageBuilder.Count >= payloadLength)
+                        {
+                            isFinalFragment = true;
+                        }
                     }
                 }
             }
