@@ -196,7 +196,7 @@ namespace BNet.WebSocket.Server
                 {
 
                     string message = await ReadMessageAsync(client, stream);
-                    if (message != null)
+                    if (message != null && message != "BNet.WebSocket.Server = Image")
                     {
                         await SetOnReceived(message);
                         if (string.IsNullOrEmpty(roomId))
@@ -207,6 +207,10 @@ namespace BNet.WebSocket.Server
                         {
                             await SendMessageToRoomAsync(roomId, message);
                         }
+                    }
+                    else if (message == "BNet.WebSocket.Server = Image") // This is my placeholder
+                    {
+                        //Do Nothing
                     }
                     else
                     {
@@ -330,104 +334,89 @@ namespace BNet.WebSocket.Server
         }
         private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
         {
-            var messageBuilder = new StringBuilder();
-            var buffer = new byte[client.ReceiveBufferSize];
-            int bytesRead;
+            var messageBuilder = new List<byte>();
             bool isFinalFragment = false;
 
-            do
+            while (!isFinalFragment)
             {
-                bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                byte[] buffer = new byte[client.ReceiveBufferSize];
+                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
                 if (bytesRead == 0)
                 {
-                    throw new NotSupportedException("Client Disconnected");
+                    // Connection closed
+                    return null;
                 }
 
                 int offset = 0;
+
                 while (offset < bytesRead)
                 {
                     byte b0 = buffer[offset];
-                    byte b1 = buffer[offset + 1];
+                    isFinalFragment = (b0 & 0x80) != 0;
+                    bool isTextFrame = (b0 & 0x0F) == 1;
 
-                    bool isFinal = (b0 & 0x80) != 0;
-                    byte opcode = (byte)(b0 & 0x0F);
-
-                    if (opcode == 8) // Close frame
+                    if (!isTextFrame)
                     {
-                        throw new NotSupportedException("Close frame received");
-                    }
-                    else if (opcode == 9) // Ping frame
-                    {
-                        await SendPongAsync(stream, buffer, offset, bytesRead);
-                    }
-                    else if (opcode == 10) // Pong frame
-                    {
-                        // Handle pong frame if necessary
-                    }
-                    else if (opcode != 1 && opcode != 2)
-                    {
-                        throw new NotSupportedException("Unsupported frame type");
+                        //Itong Codes na ito ay placeholder para hindi mag double response pag base64string yung nilagay ni client
+                        return "BNet.WebSocket.Server = Image";
                     }
 
-                    if (!isFinal && opcode != 1 && opcode != 2)
-                    {
-                        throw new NotSupportedException("Only text and binary frames are supported");
-                    }
-
-                    int payloadLength = b1 & 0x7F;
-                    int lengthFieldSize = 0;
+                    int payloadLength = buffer[offset + 1] & 0x7F;
+                    int headerSize = 2;
 
                     if (payloadLength == 126)
                     {
                         payloadLength = (buffer[offset + 2] << 8) | buffer[offset + 3];
-                        lengthFieldSize = 2;
+                        headerSize += 2;
                     }
                     else if (payloadLength == 127)
                     {
-                        throw new NotSupportedException("Payload length 127 (64-bit length) is not supported");
+                        payloadLength = (int)(
+                            ((long)buffer[offset + 2] << 56) |
+                            ((long)buffer[offset + 3] << 48) |
+                            ((long)buffer[offset + 4] << 40) |
+                            ((long)buffer[offset + 5] << 32) |
+                            ((long)buffer[offset + 6] << 24) |
+                            ((long)buffer[offset + 7] << 16) |
+                            ((long)buffer[offset + 8] << 8) |
+                            ((long)buffer[offset + 9])
+                        );
+                        headerSize += 8;
                     }
 
                     byte[] maskingKey = new byte[4];
-                    Array.Copy(buffer, offset + 2 + lengthFieldSize, maskingKey, 0, 4);
+                    Array.Copy(buffer, offset + headerSize, maskingKey, 0, 4);
 
-                    byte[] payload = new byte[payloadLength];
-                    Array.Copy(buffer, offset + 2 + lengthFieldSize + 4, payload, 0, payloadLength);
+                    int payloadOffset = offset + headerSize + 4;
+                    int payloadSize = bytesRead - payloadOffset;
+
+                    if (payloadSize > payloadLength)
+                    {
+                        payloadSize = payloadLength;
+                    }
+
+                    byte[] payload = new byte[payloadSize];
+                    Array.Copy(buffer, payloadOffset, payload, 0, payloadSize);
 
                     for (int i = 0; i < payload.Length; i++)
                     {
                         payload[i] ^= maskingKey[i % 4];
                     }
 
-                    messageBuilder.Append(Encoding.UTF8.GetString(payload));
-                    offset += 2 + lengthFieldSize + 4 + payloadLength;
+                    messageBuilder.AddRange(payload);
 
-                    isFinalFragment = isFinal;
+                    offset += headerSize + 4 + payloadSize;
+
+                    if (isFinalFragment)
+                    {
+                        break;
+                    }
                 }
-            } while (!isFinalFragment);
-
-            return messageBuilder.ToString();
-        }
-
-        private async Task SendPongAsync(Stream stream, byte[] buffer, int offset, int bytesRead)
-        {
-            // Calculate payload length (same as in Ping)
-            int payloadLength = bytesRead - offset - 2;
-
-            // Create Pong frame
-            byte[] pongFrame = new byte[2 + payloadLength];
-            pongFrame[0] = 0x8A; // FIN + Pong opcode
-            pongFrame[1] = (byte)payloadLength; // Payload length
-
-            // Copy payload from Ping frame to Pong frame
-            if (payloadLength > 0)
-            {
-                Array.Copy(buffer, offset + 2, pongFrame, 2, payloadLength);
             }
 
-            // Send Pong frame
-            await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
-            await stream.FlushAsync();
+            return Encoding.UTF8.GetString(messageBuilder.ToArray());
         }
+
         private async Task WriteMessageAsync(Stream stream, string message)
         {
             byte[] payload = Encoding.UTF8.GetBytes(message);
