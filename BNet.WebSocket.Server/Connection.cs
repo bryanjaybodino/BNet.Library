@@ -349,95 +349,95 @@ namespace BNet.WebSocket.Server
                     isFinalFragment = (b0 & 0x80) != 0;
                     byte opcode = (byte)(b0 & 0x0F);
 
-                    if (opcode == 1) // Text Frame
+                    switch (opcode)
                     {
-                        byte b1 = buffer[offset + 1];
-                        int payloadLength = b1 & 0x7F;
-                        int headerSize = 2;
+                        case 1: // Text Frame
+                        case 2: // Binary Frame
+                                // Process Text or Binary Frame
+                            int payloadLength = buffer[offset + 1] & 0x7F;
+                            int headerSize = 2;
 
-                        if (payloadLength == 126)
-                        {
-                            payloadLength = (buffer[offset + 2] << 8) | buffer[offset + 3];
-                            headerSize += 2;
-                        }
-                        else if (payloadLength == 127)
-                        {
-                            payloadLength = (int)(
-                                ((long)buffer[offset + 2] << 56) |
-                                ((long)buffer[offset + 3] << 48) |
-                                ((long)buffer[offset + 4] << 40) |
-                                ((long)buffer[offset + 5] << 32) |
-                                ((long)buffer[offset + 6] << 24) |
-                                ((long)buffer[offset + 7] << 16) |
-                                ((long)buffer[offset + 8] << 8) |
-                                ((long)buffer[offset + 9])
-                            );
-                            headerSize += 8;
-                        }
+                            if (payloadLength == 126)
+                            {
+                                payloadLength = (buffer[offset + 2] << 8) | buffer[offset + 3];
+                                headerSize += 2;
+                            }
+                            else if (payloadLength == 127)
+                            {
+                                payloadLength = (int)(
+                                    ((long)buffer[offset + 2] << 56) |
+                                    ((long)buffer[offset + 3] << 48) |
+                                    ((long)buffer[offset + 4] << 40) |
+                                    ((long)buffer[offset + 5] << 32) |
+                                    ((long)buffer[offset + 6] << 24) |
+                                    ((long)buffer[offset + 7] << 16) |
+                                    ((long)buffer[offset + 8] << 8) |
+                                    ((long)buffer[offset + 9])
+                                );
+                                headerSize += 8;
+                            }
 
-                        byte[] maskingKey = new byte[4];
-                        Array.Copy(buffer, offset + headerSize, maskingKey, 0, 4);
+                            byte[] maskingKey = new byte[4];
+                            Array.Copy(buffer, offset + headerSize, maskingKey, 0, 4);
 
-                        int payloadOffset = offset + headerSize + 4;
-                        int remainingBytes = bytesRead - payloadOffset;
-                        int payloadRead = Math.Min(payloadLength, remainingBytes);
+                            int payloadOffset = offset + headerSize + 4;
+                            int remainingBytes = bytesRead - payloadOffset;
+                            int payloadRead = Math.Min(payloadLength, remainingBytes);
 
-                        byte[] payload = new byte[payloadRead];
-                        Array.Copy(buffer, payloadOffset, payload, 0, payloadRead);
+                            byte[] payload = new byte[payloadRead];
+                            Array.Copy(buffer, payloadOffset, payload, 0, payloadRead);
 
-                        // Apply masking to the payload
-                        for (int i = 0; i < payload.Length; i++)
-                        {
-                            payload[i] ^= maskingKey[i % 4];
-                        }
+                            // Apply masking to the payload
+                            for (int i = 0; i < payload.Length; i++)
+                            {
+                                payload[i] ^= maskingKey[i % 4];
+                            }
 
-                        messageBuilder.AddRange(payload);
+                            messageBuilder.AddRange(payload);
 
-                        offset += headerSize + 4 + payloadRead;
+                            offset += headerSize + 4 + payloadRead;
 
-                        if (isFinalFragment)
-                        {
+                            if (isFinalFragment)
+                            {
+                                break;
+                            }
+
+                            // Reset payload length for the next fragment
+                            payloadLength = 0;
                             break;
-                        }
 
-                        // Reset payload length for the next fragment
-                        payloadLength = 0;
-                    }
-                    else if (opcode == 8) // Close frame
-                    {
-                        // Handle close frame
-                        byte[] closeFrame = new byte[bytesRead];
-                        Array.Copy(buffer, offset, closeFrame, 0, bytesRead);
+                        case 8: // Close frame
+                            byte[] closeFrame = new byte[bytesRead];
+                            Array.Copy(buffer, offset, closeFrame, 0, bytesRead);
 
-                        // Optionally extract the close code and reason
-                        if (bytesRead > 2)
-                        {
-                            ushort closeCode = (ushort)((closeFrame[0] << 8) | closeFrame[1]);
-                            string closeReason = Encoding.UTF8.GetString(closeFrame, 2, bytesRead - 2);
-                            // Log or handle close code and reason
-                        }
+                            // Extract close code and reason
+                            if (bytesRead > 2)
+                            {
+                                ushort closeCode = (ushort)((closeFrame[0] << 8) | closeFrame[1]);
+                                string closeReason = Encoding.UTF8.GetString(closeFrame, 2, bytesRead - 2);
+                                // Log or handle close code and reason
+                            }
 
-                        // Optionally send a close frame back
-                        byte[] responseCloseFrame = CreateCloseFrame();
-                        await stream.WriteAsync(responseCloseFrame, 0, responseCloseFrame.Length);
-                        throw new InvalidOperationException("Received close frame with no status code.");
-                    }
-                    else if (opcode == 9) // Ping frame
-                    {
-                        // Handle ping frame: send Pong response
-                        byte[] pongFrame = CreatePongFrame(buffer, bytesRead, offset);
-                        await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
-                        offset += 2 + (buffer[offset + 1] & 0x7F); // Move past the Ping frame
-                    }
-                    else if (opcode == 10) // Pong frame
-                    {
-                        // Handle pong frame if necessary
-                        offset += 2 + (buffer[offset + 1] & 0x7F); // Move past the Pong frame
-                    }
-                    else
-                    {
-                        // Handle unexpected frame types
-                        return "Unexpected frame type received";
+                            // Send a close frame response
+                            byte[] responseCloseFrame = CreateCloseFrame();
+                            await stream.WriteAsync(responseCloseFrame, 0, responseCloseFrame.Length);
+                            throw new InvalidOperationException("Received close frame.");
+
+                        case 9: // Ping frame
+                                // Handle Ping frame: send Pong response
+                            byte[] pongFrame = CreatePongFrame(buffer, bytesRead, offset);
+                            await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
+                            offset += 2 + (buffer[offset + 1] & 0x7F); // Move past the Ping frame
+                            break;
+
+                        case 10: // Pong frame
+                                 // Handle Pong frame if necessary
+                            offset += 2 + (buffer[offset + 1] & 0x7F); // Move past the Pong frame
+                            break;
+
+                        default:
+                            // Handle unexpected frame types
+                            return "Unexpected frame type received";
                     }
                 }
             }
@@ -454,7 +454,6 @@ namespace BNet.WebSocket.Server
             return pongFrame;
         }
 
-   
         private byte[] CreateCloseFrame(ushort statusCode = 1000, string reason = "")
         {
             byte[] statusCodeBytes = BitConverter.GetBytes(statusCode);
@@ -472,6 +471,7 @@ namespace BNet.WebSocket.Server
 
             return frame;
         }
+
 
 
         private async Task WriteMessageAsync(Stream stream, string message)
