@@ -135,19 +135,19 @@ namespace BNet.WebSocket.Server
                             throw new NotSupportedException("Failed to secure the stream for client.");
                         }
 
-                      
-                            if (_clients.ContainsKey(client))
+
+                        if (_clients.ContainsKey(client))
+                        {
+                            throw new Exception("Client already connected.");
+                        }
+                        else
+                        {
+                            if (!_clients.TryAdd(client, secureStream))
                             {
-                                throw new Exception("Client already connected.");
+                                throw new Exception("Failed to add client to the dictionary.");
                             }
-                            else
-                            {
-                                if (!_clients.TryAdd(client, secureStream))
-                                {
-                                    throw new Exception("Failed to add client to the dictionary.");
-                                }
-                            }
-                      
+                        }
+
                         await HandleStartupAsync(client, secureStream);
                     }
                 }
@@ -180,7 +180,7 @@ namespace BNet.WebSocket.Server
                 {
 
                     string message = await ReadMessageAsync(client, stream);
-                    if (message != null && message != "Unexpected frame type received")
+                    if (message != null && message != "Unexpected frame type received" && message.Replace(" ", "") != "")
                     {
                         await SetOnReceived(message);
                         if (string.IsNullOrEmpty(roomId))
