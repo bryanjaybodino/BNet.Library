@@ -4,13 +4,12 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
-using System.Net.Security;
 
 namespace BNet.WebSocket.Server
 {
@@ -303,9 +302,14 @@ namespace BNet.WebSocket.Server
                             foreach (var param in queryParams)
                             {
                                 var keyValue = param.Split('=');
-                                if (keyValue.Length == 2 && keyValue[0].ToLower() == "room")
+                                if (keyValue.Length >= 2)
                                 {
-                                    return keyValue[1];
+                                    StringBuilder _params = new StringBuilder();
+                                    for (int i = 0; i < keyValue.Length; i++)
+                                    {
+                                        _params.Append(keyValue[i]);
+                                    }
+                                    return _params.ToString();
                                 }
                             }
                         }
