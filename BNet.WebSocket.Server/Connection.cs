@@ -289,23 +289,9 @@ namespace BNet.WebSocket.Server
                         var url = requestParts[1];
                         var uri = new Uri($"http://{hostname}:{port}{url}");
                         var query = uri.Query;
-
                         if (!string.IsNullOrEmpty(query))
                         {
-                            var queryParams = query.TrimStart('?').Split('&');
-                            foreach (var param in queryParams)
-                            {
-                                var keyValue = param.Split('=');
-                                if (keyValue.Length >= 2)
-                                {
-                                    StringBuilder _params = new StringBuilder();
-                                    for (int i = 0; i < keyValue.Length; i++)
-                                    {
-                                        _params.Append(keyValue[i]);
-                                    }
-                                    return _params.ToString();
-                                }
-                            }
+                            return query;
                         }
                     }
                 }
