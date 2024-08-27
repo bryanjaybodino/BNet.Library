@@ -13,11 +13,16 @@ using System.Threading.Tasks;
 
 namespace BNet.WebSocket.Server
 {
+    class MyClients
+    {
+        public Stream Stream { get; set; }
+        public HashSet<string> Rooms { get; set; } = new HashSet<string>();
+    }
+
     public class Connection : EventHandlers
     {
         private TcpListener _listener;
-        private ConcurrentDictionary<TcpClient, Stream> _clients = new ConcurrentDictionary<TcpClient, Stream>();
-        private ConcurrentDictionary<string, HashSet<TcpClient>> _rooms = new ConcurrentDictionary<string, HashSet<TcpClient>>();
+        private ConcurrentDictionary<TcpClient, MyClients> _clients = new ConcurrentDictionary<TcpClient, MyClients>();
         public bool IsRunning { get; private set; }
 
         private X509Certificate2 _serverCertificate;
@@ -38,8 +43,6 @@ namespace BNet.WebSocket.Server
             ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
             _serverCertificate = new X509Certificate2(rawData, password);
         }
-
-
 
         public async Task StartAsync()
         {
@@ -63,31 +66,25 @@ namespace BNet.WebSocket.Server
 
         public Task SendMessageToRoomAsync(string roomId, string message)
         {
-            if (_rooms.TryGetValue(roomId, out var clientsInRoom))
-            {
-                var tasks = clientsInRoom.Select(client =>
+            var tasks = _clients.Values
+                 .Where(c => c.Rooms.Contains(roomId))
+                .Select(client =>
                 {
-                    if (_clients.TryGetValue(client, out var stream))
-                    {
-                        return WriteMessageAsync(stream, message);
-                    }
-                    return Task.FromResult(0); // Return a completed task
+                    return WriteMessageAsync(client.Stream, message);
                 }).ToArray();
 
-                // Use Task.WhenAll to await the completion of all tasks
-                return Task.WhenAll(tasks);
-            }
-
-            // Return a completed task if no clients found
-            return Task.FromResult(0);
+            // Use Task.WhenAll to await the completion of all tasks
+            return Task.WhenAll(tasks);
         }
-
 
         private void JoinRoom(string roomId, TcpClient client)
         {
-            var clientsInRoom = _rooms.GetOrAdd(roomId, _ => new HashSet<TcpClient>());
-            clientsInRoom.Add(client);
+            if (_clients.TryGetValue(client, out var myClient))
+            {
+                myClient.Rooms.Add(roomId);
+            }
         }
+
         public Task StopAsync()
         {
             try
@@ -109,7 +106,6 @@ namespace BNet.WebSocket.Server
             }
         }
 
-
         private async Task<Stream> HandleSecurityAsync(Stream stream)
         {
             if (_serverCertificate == null)
@@ -121,6 +117,7 @@ namespace BNet.WebSocket.Server
             await sslStream.AuthenticateAsServerAsync(_serverCertificate);
             return sslStream;
         }
+
         private async Task HandleClientAsync(TcpClient client)
         {
             try
@@ -134,14 +131,13 @@ namespace BNet.WebSocket.Server
                             throw new NotSupportedException("Failed to secure the stream for client.");
                         }
 
-
                         if (_clients.ContainsKey(client))
                         {
                             throw new Exception("Client already connected.");
                         }
                         else
                         {
-                            if (!_clients.TryAdd(client, secureStream))
+                            if (!_clients.TryAdd(client, new MyClients { Stream = secureStream }))
                             {
                                 throw new Exception("Failed to add client to the dictionary.");
                             }
@@ -177,7 +173,6 @@ namespace BNet.WebSocket.Server
                 await SetOnConnectedClient(_clients.Count);
                 while (client.Connected)
                 {
-
                     string message = await ReadMessageAsync(client, stream);
                     if (message != null && message != "Unexpected frame type received" && message.Replace(" ", "") != "")
                     {
@@ -199,7 +194,6 @@ namespace BNet.WebSocket.Server
                     {
                         //Do Nothing
                     }
-
                 }
                 throw new Exception("Client Disconnected");
             }
@@ -321,7 +315,6 @@ namespace BNet.WebSocket.Server
             {
                 throw new NotSupportedException("Room ID not found in request.");
             }
-
         }
 
         private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
@@ -350,7 +343,6 @@ namespace BNet.WebSocket.Server
                     {
                         case 1: // Text Frame
                         case 2: // Binary Frame
-                                // Process Text or Binary Frame
                             int payloadLength = buffer[offset + 1] & 0x7F;
                             int headerSize = 2;
 
@@ -421,19 +413,16 @@ namespace BNet.WebSocket.Server
                             throw new InvalidOperationException("Received close frame.");
 
                         case 9: // Ping frame
-                                // Handle Ping frame: send Pong response
                             byte[] pongFrame = CreatePongFrame(buffer, bytesRead, offset);
                             await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
                             offset += 2 + (buffer[offset + 1] & 0x7F); // Move past the Ping frame
                             break;
 
                         case 10: // Pong frame
-                                 // Handle Pong frame if necessary
                             offset += 2 + (buffer[offset + 1] & 0x7F); // Move past the Pong frame
                             break;
 
                         default:
-                            // Handle unexpected frame types
                             return "Unexpected frame type received";
                     }
                 }
@@ -468,8 +457,6 @@ namespace BNet.WebSocket.Server
 
             return frame;
         }
-
-
 
         private async Task WriteMessageAsync(Stream stream, string message)
         {
@@ -512,15 +499,15 @@ namespace BNet.WebSocket.Server
 
         public Task SendMessageAsync(string message)
         {
-            var tasks = _clients.Values.Select(stream => WriteMessageAsync(stream, message)).ToArray();
+            var tasks = _clients.Values.Select(client => WriteMessageAsync(client.Stream, message)).ToArray();
             return Task.WhenAll(tasks);
         }
 
         private async Task RemoveClientAsync(TcpClient client)
         {
-            if (_clients.TryRemove(client, out Stream stream))
+            if (_clients.TryRemove(client, out var myClient))
             {
-                stream?.Dispose();
+                myClient.Stream?.Dispose();
                 client?.Close();
             }
             await SetOnConnectedClient(_clients.Count);
