@@ -66,12 +66,16 @@ namespace BNet.WebSocket.Server
 
         public Task SendMessageToRoomAsync(string roomId, string message)
         {
-            var tasks = _clients.Values
-                 .Where(c => c.Rooms.Contains(roomId))
-                .Select(client =>
-                {
-                    return WriteMessageAsync(client.Stream, message);
-                }).ToArray();
+            // Use HashSet to ensure clients are unique
+            var clients = _clients.Values
+                .Where(c => c.Rooms.Contains(roomId))
+                .Distinct()
+                .ToList();
+
+            // Create a task for each client to write the message
+            var tasks = clients.Select(client =>
+                WriteMessageAsync(client.Stream, message)
+            ).ToArray();
 
             // Use Task.WhenAll to await the completion of all tasks
             return Task.WhenAll(tasks);
@@ -170,7 +174,9 @@ namespace BNet.WebSocket.Server
                 {
                     JoinRoom(roomId, client);
                 }
-                await SetOnConnectedClient(_clients.Count);
+
+                var clients = _clients.Values.Distinct().ToList();
+                await SetOnConnectedClient(clients.Count);
                 while (client.Connected)
                 {
                     string message = await ReadMessageAsync(client, stream);
@@ -483,10 +489,14 @@ namespace BNet.WebSocket.Server
             await stream.FlushAsync();
         }
 
-        public Task SendMessageAsync(string message)
+        public async Task SendMessageAsync(string message)
         {
-            var tasks = _clients.Values.Select(client => WriteMessageAsync(client.Stream, message)).ToArray();
-            return Task.WhenAll(tasks);
+            // Copy clients to avoid modification during enumeration
+            var clients = _clients.Values.Distinct().ToList();
+
+            var tasks = clients.Select(client => WriteMessageAsync(client.Stream, message)).ToArray();
+
+            await Task.WhenAll(tasks);
         }
 
         private async Task RemoveClientAsync(TcpClient client)
@@ -496,7 +506,8 @@ namespace BNet.WebSocket.Server
                 myClient.Stream?.Dispose();
                 client?.Close();
             }
-            await SetOnConnectedClient(_clients.Count);
+            var clients = _clients.Values.Distinct().ToList();
+            await SetOnConnectedClient(clients.Count);
         }
     }
 }
