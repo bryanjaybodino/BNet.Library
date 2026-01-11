@@ -6,25 +6,37 @@ using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using System;
 using System.Linq;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Security.Authentication;
 namespace BNet.FTPServer
 {
-
-    //https://www.serv-u.com/resources/tutorial/cwd-cdup-pwd-rmd-dele-smnt-site-ftp-command
     public class Commands
     {
-        private TcpListener _listener;
-        private bool _isRunning;
-        private string _currentDirectory;
-        private string _rootFolder;
-        private TcpListener _dataListener;
-        private TcpClient _dataClient;
-        private string _renameFrom;
+        //https://www.serv-u.com/resources/tutorial/cwd-cdup-pwd-rmd-dele-smnt-site-ftp-command
+        #region Private Components
         private System.Text.Encoding encoding = System.Text.Encoding.UTF8;
+        private ConcurrentDictionary<TcpClient, Task> _clients = new ConcurrentDictionary<TcpClient, Task>();
+        private Dictionary<TcpClient, string> TcpClientDictionary = new Dictionary<TcpClient, string>();
+        private readonly object _lock = new object(); //Thread Safety: Use the _lock object to synchronize access to _isRunning and _listener.
+        private readonly ConcurrentDictionary<Task, CancellationTokenSource> _clientCancellationTokens = new ConcurrentDictionary<Task, CancellationTokenSource>();
+
+        private TcpListener _listener { get; set; }
+        private TcpListener _dataListener { get; set; }
+        private TcpClient _dataClient { get; set; }
+        private string _rootFolder { get; set; }
+        private string _renameFrom { get; set; }
         private string currentUser { get; set; }
+        #endregion
+
+        #region Public Components
         public Dictionary<string, string> UserCredentials = new Dictionary<string, string>();
         public bool isRunning { get; private set; }
+        #endregion
+
+        #region Constructors
         public Commands()
         {
             _rootFolder = string.Empty;
@@ -35,14 +47,17 @@ namespace BNet.FTPServer
             _rootFolder = Path.GetFullPath(rootFolder);
             _listener = new TcpListener(IPAddress.Any, port);
         }
+        #endregion
 
-
+        #region Setup
         public void Setup(string rootFolder, int port)
         {
             _rootFolder = Path.GetFullPath(rootFolder);
             _listener = new TcpListener(IPAddress.Any, port);
         }
+        #endregion
 
+        #region Certificates
         private X509Certificate2 _serverCertificate;
         public void LoadCertificate(string path, string password)
         {
@@ -56,241 +71,320 @@ namespace BNet.FTPServer
             System.Net.ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12 | SecurityProtocolType.Ssl3;
             _serverCertificate = new X509Certificate2(rawData, password);
         }
+        #endregion
 
+        #region StartAsync
         public async Task StartAsync()
         {
-            Console.WriteLine("\nStarting FTP server...");
-            _isRunning = true;
-            _listener.Start();
-            while (_isRunning)
+            try
             {
-                try
-                {
-                    var client = await _listener.AcceptTcpClientAsync();
+                isRunning = true;
+                _listener.Start();
+                Console.WriteLine("Server started. Waiting for clients...");
 
-                    Console.WriteLine("Client connected.");
-                    await HandleClientAsync(client);
-                }
-                catch (Exception ex)
+                while (isRunning)
                 {
-                    Console.WriteLine($"Error accepting client: {ex.Message}");
+                    try
+                    {
+                        // Accept a new client
+                        var client = await _listener.AcceptTcpClientAsync();
+
+                        var clientCancellationTokenSource = new CancellationTokenSource();
+                        // Handle the new client connection
+                        var clientTask = Task.Run(() => HandleClientAsync(client), clientCancellationTokenSource.Token);
+
+
+                        // Store the task in the dictionary
+                        _clients[client] = clientTask;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Exception: {ex.Message}");
+                        // You might want to log exceptions and continue accepting new clients
+                    }
                 }
             }
+            catch { }
         }
+        #endregion
 
+        #region StopAsync
         public async Task StopAsync()
         {
             try
             {
                 isRunning = false;
                 _listener.Stop();
+
+                // Cancel all client tasks and await their completion
+                var cancellationTasks = new List<Task>();
+                foreach (var cancellationTokenSource in _clientCancellationTokens.Values)
+                {
+                    cancellationTokenSource.Cancel();
+                }
+                foreach (var clientTask in _clients.Values)
+                {
+                    cancellationTasks.Add(clientTask);
+                }
+
+                try
+                {
+                    await Task.WhenAll(cancellationTasks);
+                }
+                catch (OperationCanceledException ex)
+                {
+                    Console.WriteLine(ex.Message);
+                }
+                Console.WriteLine("Server stopped.");
             }
             catch { }
         }
+
+        #endregion
+
         private async Task HandleClientAsync(TcpClient client)
         {
-            _currentDirectory = Path.GetFullPath(_rootFolder);
-            var networkStream = client.GetStream();
-            var reader = new StreamReader(networkStream, encoding);
-            var writer = new StreamWriter(networkStream) { AutoFlush = true };
-
-            await ReplyAsync(networkStream, writer, 220, "Welcome to Simple FTP Server");
-
-            while (_isRunning)
+            try
             {
-                try
+                TcpClientDictionary.Add(client, Path.GetFullPath(_rootFolder));
+                var networkStream = client.GetStream();
+                var reader = new StreamReader(networkStream, encoding);
+                var writer = new StreamWriter(networkStream) { AutoFlush = true };
+
+                await ReplyAsync(networkStream, writer, 220, "Welcome to Simple FTP Server");
+
+                while (isRunning)
                 {
-                    var line = await reader.ReadLineAsync();
-                    if (string.IsNullOrEmpty(line)) continue;
-
-                    var command = line.Split(' ')[0].ToUpperInvariant();
-                    var argument = line.Length > command.Length ? line.Substring(command.Length + 1).Trim() : string.Empty;
-
-                    Console.WriteLine($"Received command: {command} {argument}");
-
-                    switch (command)
+                    try
                     {
-                        case "USER":
-                            Console.ForegroundColor = ConsoleColor.White;
-                            await HandleUserCommandAsync(client, networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "PASS":
-                            Console.ForegroundColor = ConsoleColor.White;
-                            await HandlePassCommandAsync(client, networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "PWD":
-                            Console.ForegroundColor = ConsoleColor.Green;
-                            await HandlePwdCommandAsync(networkStream, writer);
-                            Console.ResetColor();
-                            break;
-                        case "CWD":
-                            Console.ForegroundColor = ConsoleColor.Yellow;
-                            await HandleCwdCommandAsync(networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "PASV":
-                            Console.ForegroundColor = ConsoleColor.Blue;
-                            await HandlePasvCommandAsync(networkStream, writer, client);
-                            Console.ResetColor();
-                            break;
-                        case "LIST":
-                            Console.ForegroundColor = ConsoleColor.Cyan;
-                            await HandleListCommandAsync(networkStream, writer);
-                            Console.ResetColor();
-                            break;
-                        case "STOR":
-                            Console.ForegroundColor = ConsoleColor.DarkBlue;
-                            await HandleStorCommandAsync(networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "RETR":
-                            Console.ForegroundColor = ConsoleColor.DarkCyan;
-                            await HandleRetrCommandAsync(networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "DELE":
-                            Console.ForegroundColor = ConsoleColor.DarkGray;
-                            await HandleDeleCommandAsync(networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "RMD":
-                            Console.ForegroundColor = ConsoleColor.DarkGreen;
-                            await HandleRmdCommandAsync(networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "MKD":
-                            Console.ForegroundColor = ConsoleColor.DarkMagenta;
-                            await HandleMkdCommandAsync(networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "RNFR":
-                            Console.ForegroundColor = ConsoleColor.DarkRed;
-                            await HandleRnfrCommandAsync(networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "RNTO":
-                            Console.ForegroundColor = ConsoleColor.DarkYellow;
-                            await HandleRntoCommandAsync(networkStream, writer, argument);
-                            Console.ResetColor();
-                            break;
-                        case "QUIT":
-                            Console.ForegroundColor = ConsoleColor.Gray;
-                            await ReplyAsync(networkStream, writer, 221, "Goodbye");
-                            Console.ResetColor();
-                            return;
-                        case "AUTH": //CANT SEPERATE BECAUSE WE ARE UPDATING THE reader and writer
-                            Console.ForegroundColor = ConsoleColor.White;
-                            if (_serverCertificate != null && _serverCertificate.HasPrivateKey)
-                            {
-                                bool isValid = _serverCertificate.Verify();
-                                if (argument == "TLS" && isValid)
+                        var line = await reader.ReadLineAsync();
+                        if (string.IsNullOrEmpty(line)) continue;
+
+                        var command = line.Split(' ')[0].ToUpperInvariant();
+                        var argument = line.Length > command.Length ? line.Substring(command.Length + 1).Trim() : string.Empty;
+
+                        Console.WriteLine($"Received command: {command} {argument}");
+
+                        switch (command)
+                        {
+                            case "USER":
+                                Console.ForegroundColor = ConsoleColor.White;
+                                await HandleUserCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "PASS":
+                                Console.ForegroundColor = ConsoleColor.White;
+                                await HandlePassCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "PWD":
+                                Console.ForegroundColor = ConsoleColor.Green;
+                                await HandlePwdCommandAsync(client, networkStream, writer);
+                                Console.ResetColor();
+                                break;
+                            case "CWD":
+                                Console.ForegroundColor = ConsoleColor.Yellow;
+                                await HandleCwdCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "PASV":
+                                Console.ForegroundColor = ConsoleColor.Blue;
+                                await HandlePasvCommandAsync(client, networkStream, writer);
+                                Console.ResetColor();
+                                break;
+                            case "LIST":
+                                Console.ForegroundColor = ConsoleColor.Cyan;
+                                await HandleListCommandAsync(client, networkStream, writer);
+                                Console.ResetColor();
+                                break;
+                            case "STOR":
+                                Console.ForegroundColor = ConsoleColor.DarkBlue;
+                                await HandleStorCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "RETR":
+                                Console.ForegroundColor = ConsoleColor.DarkCyan;
+                                await HandleRetrCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "DELE":
+                                Console.ForegroundColor = ConsoleColor.DarkGray;
+                                await HandleDeleCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "RMD":
+                                Console.ForegroundColor = ConsoleColor.DarkGreen;
+                                await HandleRmdCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "MKD":
+                                Console.ForegroundColor = ConsoleColor.DarkMagenta;
+                                await HandleMkdCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "RNFR":
+                                Console.ForegroundColor = ConsoleColor.DarkRed;
+                                await HandleRnfrCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "RNTO":
+                                Console.ForegroundColor = ConsoleColor.DarkYellow;
+                                await HandleRntoCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "QUIT":
+                                Console.ForegroundColor = ConsoleColor.Gray;
+                                await ReplyAsync(networkStream, writer, 221, "Goodbye");
+                                Console.ResetColor();
+                                return;
+                            case "AUTH": //CANT SEPERATE BECAUSE WE ARE UPDATING THE reader and writer
+                                Console.ForegroundColor = ConsoleColor.White;
+                                if (_serverCertificate != null && _serverCertificate.HasPrivateKey)
                                 {
-                                    await ReplyAsync(networkStream, writer, 234, "Enabling TLS Connection");
-                                    // Ensure that no data is sent/received in plaintext after AUTH TLS
-                                    var sslStream = new SslStream(networkStream, false, (sender, certificate, chain, sslPolicyErrors) => true);
-                                    await sslStream.AuthenticateAsServerAsync(_serverCertificate);
-                                    reader = new StreamReader(sslStream);
-                                    writer = new StreamWriter(sslStream) { AutoFlush = true };
+                                    bool isValid = _serverCertificate.Verify();
+                                    if (argument == "TLS" && isValid)
+                                    {
+                                        await ReplyAsync(networkStream, writer, 234, "Enabling TLS Connection");
+                                        // Ensure that no data is sent/received in plaintext after AUTH TLS
+                                        var sslStream = new SslStream(networkStream, false, (sender, certificate, chain, sslPolicyErrors) => true);
+                                        await sslStream.AuthenticateAsServerAsync(_serverCertificate);
+                                        reader = new StreamReader(sslStream);
+                                        writer = new StreamWriter(sslStream) { AutoFlush = true };
+                                    }
+                                    else
+                                    {
+                                        await ReplyAsync(networkStream, writer, 502, "Certificate is invalid");
+                                    }
                                 }
                                 else
                                 {
-                                    await ReplyAsync(networkStream, writer, 502, "Certificate is invalid");
+                                    await ReplyAsync(networkStream, writer, 502, "Command not implemented");
                                 }
-                            }
-                            else
-                            {
+                                Console.ResetColor();
+                                break;
+                            case "NOOP":
+                                Console.ForegroundColor = ConsoleColor.Magenta;
+                                await ReplyAsync(networkStream, writer, 200, "NOOP command successful.");
+                                Console.ResetColor();
+                                break;
+                            case "TYPE":
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                await HandleTypeCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "SITE":
+                                Console.ForegroundColor = ConsoleColor.Green;
+                                await HandleSiteCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "OPTS":
+                                Console.ForegroundColor = ConsoleColor.Yellow;
+                                await HandleOptsCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "PORT":
+                                Console.ForegroundColor = ConsoleColor.Blue;
+                                await HandlePortCommandAsync(client, networkStream, writer, argument);
+                                Console.ResetColor();
+                                break;
+                            case "SYST":
+                                Console.ForegroundColor = ConsoleColor.Cyan;
+                                await ReplyAsync(networkStream, writer, 215, "UNIX Type: L8");
+                                Console.ResetColor();
+                                break;
+                            default:
                                 await ReplyAsync(networkStream, writer, 502, "Command not implemented");
-                            }
-                            Console.ResetColor();
-                            break;
-                        case "NOOP":
-                            Console.ForegroundColor = ConsoleColor.Magenta;
-                            await ReplyAsync(networkStream, writer, 200, "NOOP command successful.");
-                            Console.ResetColor();
-                            break;
-                        case "TYPE":
-                            await HandleTypeCommandAsync(networkStream, writer, argument);
-                            break;
-                        case "SITE":
-                            await HandleSiteCommandAsync(networkStream, writer, argument);
-                            break;
-                        case "OPTS":
-                            await HandleOptsCommandAsync(networkStream, writer, argument);
-                            break;
-                        case "PORT":
-                            await HandlePortCommandAsync(networkStream, writer, argument);
-                            break;
-                        case "SYST":
-                            Console.ForegroundColor = ConsoleColor.Cyan;
-                            await ReplyAsync(networkStream, writer, 215, "UNIX Type: L8");
-                            Console.ResetColor();
-                            break;
-                        default:
-                            await ReplyAsync(networkStream, writer, 502, "Command not implemented");
-                            break;
+                                break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        await ReplyAsync(networkStream, writer, 500, "Internal error " + ex.Message);
                     }
                 }
-                catch (Exception ex)
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Exception while handling client: {ex.Message}");
+            }
+            finally
+            {
+                Console.WriteLine("Client disconnected.");
+                // Optionally remove the client from the dictionary
+                dictionaryTCPClientRemove(client);
+
+            }
+        }
+
+
+        #region HandlePortCommandAsync
+        private async Task HandlePortCommandAsync(TcpClient client, NetworkStream networkStream, StreamWriter writer, string argument)
+        {
+            try
+            {
+                var parts = argument.Split(',');
+
+                // Check if the PORT command has the correct number of arguments
+                if (parts.Length != 6)
                 {
-                    await ReplyAsync(networkStream, writer, 500, "Internal error");
+                    await ReplyAsync(networkStream, writer, 501, "Syntax error in parameters or arguments.");
+                    return;
+                }
+
+                // Extract IP address and port components
+                var ipAddress = string.Join(".", parts.Take(4));
+                var portHigh = int.Parse(parts[4]);
+                var portLow = int.Parse(parts[5]);
+
+                // Calculate the port number
+                var port = (portHigh * 256) + portLow;
+
+                // Validate and parse the IP address
+                if (IPAddress.TryParse(ipAddress, out var address))
+                {
+                    // Set up the data listener on the specified IP address and port
+                    _dataListener = new TcpListener(address, 0);
+                    _dataListener.Start();
+
+                    // Store the port for later use in data connection
+                    await ReplyAsync(networkStream, writer, 200, "PORT command successful.");
+                }
+                else
+                {
+                    await ReplyAsync(networkStream, writer, 501, "501 Invalid IP address.");
                 }
             }
-        }
-
-        private async Task HandlePortCommandAsync(NetworkStream networkStream, StreamWriter writer, string argument)
-        {
-            var parts = argument.Split(',');
-
-            // Check if the PORT command has the correct number of arguments
-            if (parts.Length != 6)
+            catch (Exception ex)
             {
-                await ReplyAsync(networkStream, writer, 501, "Syntax error in parameters or arguments.");
-                return;
+                await ReplyAsync(networkStream, writer, 501, "501 Invalid IP address. " + ex.Message);
             }
-
-            // Extract IP address and port components
-            var ipAddress = string.Join(".", parts.Take(4));
-            var portHigh = int.Parse(parts[4]);
-            var portLow = int.Parse(parts[5]);
-
-            // Calculate the port number
-            var port = (portHigh * 256) + portLow;
-
-            // Validate and parse the IP address
-            if (IPAddress.TryParse(ipAddress, out var address))
+            finally
             {
-                // Set up the data listener on the specified IP address and port
-                _dataListener = new TcpListener(address, port);
-                _dataListener.Start();
+                _dataListener?.Stop();
+                _dataListener = null;
 
-                // Store the port for later use in data connection
-                await ReplyAsync(networkStream, writer, 200, "PORT command successful.");
-            }
-            else
-            {
-                await ReplyAsync(networkStream, writer, 501, "501 Invalid IP address.");
             }
         }
+        #endregion
 
-
-
-        private async Task HandlePwdCommandAsync(NetworkStream stream, StreamWriter writer)
+        #region HandlePwdCommandAsync
+        private async Task HandlePwdCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer)
         {
             string path = "";
-            if (_currentDirectory.Replace(_rootFolder, "") == "")
+            if (dictionaryCurrentDirectory(client).Replace(_rootFolder, "") == "")
             {
                 path = "/";
             }
             else
             {
-                path = _currentDirectory.Replace(_rootFolder, "");
+                path = dictionaryCurrentDirectory(client).Replace(_rootFolder, "");
             }
             await ReplyAsync(stream, writer, 257, $"\"{path}\" is current directory");
         }
+        #endregion
 
-        private async Task HandleTypeCommandAsync(NetworkStream stream, StreamWriter writer, string argument)
+        #region HandleTypeCommandAsync
+        private async Task HandleTypeCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string argument)
         {
             if (argument == "I")
             {
@@ -305,8 +399,10 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 504, "Command not implemented for that argument");
             }
         }
+        #endregion
 
-        private async Task HandleOptsCommandAsync(NetworkStream stream, StreamWriter writer, string argument)
+        #region HandleOptsCommandAsync
+        private async Task HandleOptsCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string argument)
         {
             if (argument.Equals("UTF8 ON", StringComparison.OrdinalIgnoreCase))
             {
@@ -323,8 +419,10 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 501, "Unsupported option");
             }
         }
+        #endregion
 
-        private async Task HandleCwdCommandAsync(NetworkStream stream, StreamWriter writer, string directoryName)
+        #region HandleCwdCommandAsync
+        private async Task HandleCwdCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string directoryName)
         {
             if (string.IsNullOrWhiteSpace(directoryName))
             {
@@ -341,7 +439,7 @@ namespace BNet.FTPServer
             }
             else
             {
-                newDirectory = Path.Combine(_currentDirectory, directoryName);
+                newDirectory = Path.Combine(dictionaryCurrentDirectory(client), directoryName);
             }
 
             // Ensure newDirectory is within the root folder
@@ -354,7 +452,7 @@ namespace BNet.FTPServer
 
             if (Directory.Exists(newDirectory))
             {
-                _currentDirectory = newDirectory;
+                dictionaryTCPClientUpdate(client, newDirectory);
                 await ReplyAsync(stream, writer, 250, "Directory successfully changed.");
             }
             else
@@ -363,8 +461,10 @@ namespace BNet.FTPServer
                 return;
             }
         }
+        #endregion
 
-        private async Task HandleMkdCommandAsync(NetworkStream stream, StreamWriter writer, string directoryName)
+        #region HandleMkdCommandAsync
+        private async Task HandleMkdCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string directoryName)
         {
             if (string.IsNullOrWhiteSpace(directoryName))
             {
@@ -372,7 +472,7 @@ namespace BNet.FTPServer
                 return;
             }
 
-            string fullPath = Path.IsPathRooted(directoryName) ? Path.GetFullPath(directoryName) : Path.GetFullPath(Path.Combine(_currentDirectory, directoryName));
+            string fullPath = Path.IsPathRooted(directoryName) ? Path.GetFullPath(directoryName) : Path.GetFullPath(Path.Combine(dictionaryCurrentDirectory(client), directoryName));
 
             try
             {
@@ -384,16 +484,20 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 550, "Failed to create directory.");
             }
         }
+        #endregion
 
-        private async Task HandlePasvCommandAsync(NetworkStream stream, StreamWriter writer, TcpClient client)
+        #region HandlePasvCommandAsync
+        private async Task HandlePasvCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer)
         {
             try
             {
-                var port = new Random().Next(2022, 7000);
+
+                const int minPort = 20022;
+                const int maxPort = 49151;
+                var port = new System.Random().Next(minPort, maxPort);
                 _dataListener = new TcpListener(IPAddress.Any, 0);
                 _dataListener.ExclusiveAddressUse = true;
                 _dataListener.Server.NoDelay = true;
-                _dataListener.Server.UseOnlyOverlappedIO = true;
                 _dataListener.Start();
 
 
@@ -420,40 +524,36 @@ namespace BNet.FTPServer
             }
             catch (Exception ex)
             {
-                await ReplyAsync(stream, writer, 500, "Failed to enter passive mode.");
+                await ReplyAsync(stream, writer, 500, "Failed to enter passive mode. " + ex.Message);
             }
         }
+        #endregion
 
-        private async Task HandleListCommandAsync(NetworkStream stream, StreamWriter writer)
+        #region HandleListCommandAsync
+        private async Task HandleListCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer)
         {
             await ReplyAsync(stream, writer, 150, "Here comes the directory listing");
 
             try
             {
-                if (_dataListener == null)
-                {
-                    await ReplyAsync(stream, writer, 425, "Can't open data connection.");
-                    return;
-                }
-
+                CheckConnection();
                 Console.WriteLine("Waiting for data connection...");
                 _dataClient = await _dataListener.AcceptTcpClientAsync();
                 var dataStream = _dataClient.GetStream();
                 var dataWriter = new StreamWriter(dataStream) { AutoFlush = true };
 
-                if (!Directory.Exists(_currentDirectory))
+                if (!Directory.Exists(dictionaryCurrentDirectory(client)))
                 {
                     await ReplyAsync(stream, writer, 550, "Directory not found.");
                     return;
                 }
 
-                await ListDirectoryContents(dataWriter, _currentDirectory);
+                await ListDirectoryContents(dataWriter, dictionaryCurrentDirectory(client));
 
                 await dataWriter.FlushAsync();
                 dataWriter.Close();
                 dataStream.Close();
-                _dataClient.Close();
-
+                _dataClient?.Close();
                 await ReplyAsync(stream, writer, 226, "Directory send OK");
             }
             catch (IOException ioEx)
@@ -475,8 +575,12 @@ namespace BNet.FTPServer
                 Console.WriteLine("Data connection closed\n");
             }
         }
-        private async Task HandleStorCommandAsync(NetworkStream stream, StreamWriter writer, string fileName)
+        #endregion
+
+        #region HandleStorCommandAsync
+        private async Task HandleStorCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string fileName)
         {
+            CheckConnection();
             if (string.IsNullOrWhiteSpace(fileName))
             {
                 await ReplyAsync(stream, writer, 501, "Syntax error in parameters or arguments.");
@@ -490,7 +594,7 @@ namespace BNet.FTPServer
                 _dataClient = await _dataListener.AcceptTcpClientAsync();
                 var dataStream = _dataClient.GetStream();
 
-                var filePath = Path.Combine(_currentDirectory, fileName);
+                var filePath = Path.Combine(dictionaryCurrentDirectory(client), fileName);
                 using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write))
                 {
                     await dataStream.CopyToAsync(fileStream);
@@ -509,22 +613,26 @@ namespace BNet.FTPServer
                 Console.WriteLine("Data connection closed\n");
             }
         }
+        #endregion
 
-        private async Task HandleRetrCommandAsync(NetworkStream stream, StreamWriter writer, string fileName)
+        #region HandleRetrCommandAsync
+        private async Task HandleRetrCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string fileName)
         {
+            CheckConnection();
             if (string.IsNullOrWhiteSpace(fileName))
             {
                 await ReplyAsync(stream, writer, 501, "Syntax error in parameters or arguments.");
                 return;
             }
 
-            var filePath = Path.Combine(_currentDirectory, fileName);
+            var filePath = Path.Combine(dictionaryCurrentDirectory(client), fileName);
 
             if (!File.Exists(filePath))
             {
                 await ReplyAsync(stream, writer, 550, "File not found.");
                 return;
             }
+
 
             await ReplyAsync(stream, writer, 150, "Opening data connection for file transfer");
 
@@ -551,8 +659,10 @@ namespace BNet.FTPServer
                 Console.WriteLine("Data connection closed\n");
             }
         }
+        #endregion
 
-        private async Task HandleRnfrCommandAsync(NetworkStream stream, StreamWriter writer, string fileName)
+        #region HandleRnfrCommandAsync
+        private async Task HandleRnfrCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string fileName)
         {
             if (string.IsNullOrWhiteSpace(fileName))
             {
@@ -560,7 +670,7 @@ namespace BNet.FTPServer
                 return;
             }
 
-            var filePath = Path.Combine(_currentDirectory, fileName);
+            var filePath = Path.Combine(dictionaryCurrentDirectory(client), fileName);
 
             if (!File.Exists(filePath) && !Directory.Exists(filePath))
             {
@@ -571,8 +681,10 @@ namespace BNet.FTPServer
             _renameFrom = filePath;
             await ReplyAsync(stream, writer, 350, "Requested file action pending further information.");
         }
+        #endregion
 
-        private async Task HandleRntoCommandAsync(NetworkStream stream, StreamWriter writer, string newFileName)
+        #region HandleRntoCommandAsync
+        private async Task HandleRntoCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string newFileName)
         {
             if (string.IsNullOrWhiteSpace(_renameFrom))
             {
@@ -580,7 +692,7 @@ namespace BNet.FTPServer
                 return;
             }
 
-            var newFilePath = Path.Combine(_currentDirectory, newFileName);
+            var newFilePath = Path.Combine(dictionaryCurrentDirectory(client), newFileName);
 
             try
             {
@@ -606,8 +718,10 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 550, $"Failed to rename file or directory: {ex.Message}");
             }
         }
+        #endregion
 
-        private async Task HandleDeleCommandAsync(NetworkStream stream, StreamWriter writer, string fileName)
+        #region HandleDeleCommandAsync
+        private async Task HandleDeleCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string fileName)
         {
             if (string.IsNullOrWhiteSpace(fileName))
             {
@@ -615,7 +729,7 @@ namespace BNet.FTPServer
                 return;
             }
 
-            var filePath = Path.Combine(_currentDirectory, fileName);
+            var filePath = Path.Combine(dictionaryCurrentDirectory(client), fileName);
 
             if (!File.Exists(filePath))
             {
@@ -633,8 +747,10 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 550, $"Failed to delete file: {ex.Message}");
             }
         }
+        #endregion
 
-        private async Task HandleRmdCommandAsync(NetworkStream stream, StreamWriter writer, string directoryName)
+        #region HandleRmdCommandAsync
+        private async Task HandleRmdCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string directoryName)
         {
             if (string.IsNullOrWhiteSpace(directoryName))
             {
@@ -642,7 +758,7 @@ namespace BNet.FTPServer
                 return;
             }
 
-            var dirPath = Path.Combine(_currentDirectory, directoryName);
+            var dirPath = Path.Combine(dictionaryCurrentDirectory(client), directoryName);
 
             if (!Directory.Exists(dirPath))
             {
@@ -660,8 +776,10 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 550, $"Failed to remove directory: {ex.Message}");
             }
         }
+        #endregion
 
-        private async Task HandleSiteCommandAsync(NetworkStream stream, StreamWriter writer, string argument)
+        #region HandleSiteCommandAsync
+        private async Task HandleSiteCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string argument)
         {
             if (argument.Equals("CHMOD 777", StringComparison.OrdinalIgnoreCase))
             {
@@ -672,7 +790,9 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 501, "Unsupported SITE command.");
             }
         }
+        #endregion
 
+        #region ListDirectoryContents
         private async Task ListDirectoryContents(StreamWriter dataWriter, string directory)
         {
             var dirs = Directory.GetDirectories(directory);
@@ -696,6 +816,9 @@ namespace BNet.FTPServer
                 await dataWriter.FlushAsync();
             }
         }
+        #endregion
+
+        #region HandleUserCommandAsync
         private async Task HandleUserCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string username)
         {
             if (UserCredentials.Count > 0)
@@ -721,6 +844,9 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 331, "Login as Anonymous");
             }
         }
+        #endregion
+
+        #region HandlePassCommandAsync
         private async Task HandlePassCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string password)
         {
             if (UserCredentials.Count > 0)
@@ -751,6 +877,9 @@ namespace BNet.FTPServer
                 await ReplyAsync(stream, writer, 230, "Login in proceed");
             }
         }
+        #endregion
+
+        #region ReplyAsync
         private async Task ReplyAsync(NetworkStream stream, StreamWriter writer, int code, string message)
         {
             var response = $"{code} {message}\r\n";
@@ -760,5 +889,33 @@ namespace BNet.FTPServer
             await writer.FlushAsync();
             Console.WriteLine("Server Reply : " + message + "\n");
         }
+        #endregion
+
+
+        private void CheckConnection()
+        {
+            if (_dataListener == null)
+            {
+                _dataListener = new TcpListener(IPAddress.Any, 0);
+                _dataListener.Start();
+            }
+        }
+
+        #region THIS CODES IS FOR LISTING ALL TCP CLIENTS TO GET CURRENT DIRECTORY
+        private string dictionaryCurrentDirectory(TcpClient client)
+        {
+            return TcpClientDictionary[client].ToString();
+        }
+        private void dictionaryTCPClientRemove(TcpClient client)
+        {
+            TcpClientDictionary.Remove(client);
+            _clients.TryRemove(client, out _);
+        }
+        private void dictionaryTCPClientUpdate(TcpClient client, string newDirectory)
+        {
+            TcpClientDictionary[client] = newDirectory;
+        }
+        #endregion
+
     }
 }
