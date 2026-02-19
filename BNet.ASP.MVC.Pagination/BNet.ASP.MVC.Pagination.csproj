@@ -24,23 +24,8 @@ This library is based on the WebForms GridView.</Description>
 	  <WarningLevel>4</WarningLevel>
 	</PropertyGroup>
 	<ItemGroup>
-	  <None Include="..\..\Users\admin\Music\BNet.ASP.MVC.Pagination\_License.txt">
-	    <Pack>True</Pack>
-	    <PackagePath>\</PackagePath>
-	  </None>
-	  <None Include="..\..\Users\admin\Music\BNet.ASP.MVC.Pagination\_README.md">
-	    <Pack>True</Pack>
-	    <PackagePath>\</PackagePath>
-	  </None>
+		<None Include="_License.txt" Pack="true" PackagePath="" />
+		<None Include="_README.md" Pack="true" PackagePath="" />
 	</ItemGroup>
-	<ItemGroup>
-	  <None Update="_License.txt">
-	    <Pack>True</Pack>
-	    <PackagePath>\</PackagePath>
-	  </None>
-	  <None Update="_README.md">
-	    <Pack>True</Pack>
-	    <PackagePath>\</PackagePath>
-	  </None>
-	</ItemGroup>
+
 </Project>

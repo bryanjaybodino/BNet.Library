@@ -39,13 +39,8 @@
 	  <WarningLevel>4</WarningLevel>
 	</PropertyGroup>
 	<ItemGroup>
-	  <None Include="..\..\Users\admin\Music\BNet.WebSocket.Server\_License.txt">
-	    <Pack>True</Pack>
-	    <PackagePath>\</PackagePath>
-	  </None>
-	  <None Include="..\..\Users\admin\Music\BNet.WebSocket.Server\_README.md">
-	    <Pack>True</Pack>
-	    <PackagePath>\</PackagePath>
-	  </None>
+		<None Include="_License.txt" Pack="true" PackagePath="" />
+		<None Include="_README.md" Pack="true" PackagePath="" />
 	</ItemGroup>
+
 </Project>
