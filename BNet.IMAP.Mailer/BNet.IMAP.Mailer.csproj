@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFrameworks>net451;net452;net4.6.1;net4.6.2;net4.7;net4.7.1;net4.7.2;net4.8;net4.8.1;net5.0;net6.0;net7.0;net8.0;netstandard2.0;netstandard2.1;netcoreapp2.0;netcoreapp2.1;netcoreapp2.2;netcoreapp3.0;netcoreapp3.1</TargetFrameworks>
+		<LangVersion>8.0</LangVersion>
+		<Nullable>enable</Nullable>
+		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+		<Title>BNet.IMAP.Mailer</Title>
+		<Description>Easy to use IMAP Mailer Get All Unread Messages and Mark As Read</Description>
+		<PackageProjectUrl>https://github.com/bryanjaybodino/BNet.Library</PackageProjectUrl>
+		<IncludeSymbols>False</IncludeSymbols>
+		<PackageReadmeFile>_README.md</PackageReadmeFile>
+		<RepositoryType>git</RepositoryType>
+		<RepositoryUrl>https://github.com/bryanjaybodino/BNet.Library</RepositoryUrl>
+		<PackAsTool>False</PackAsTool>
+		<PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
+		<PackageLicenseFile>_License.txt</PackageLicenseFile>
+		<Version>8.0.0</Version>
+		<IncludeLicenseFile>false</IncludeLicenseFile>
+		<OutputType>Library</OutputType>
+		<Authors>Bryan Jay Bodino</Authors>
+		<AutoGenerateBindingRedirects>False</AutoGenerateBindingRedirects>
+	</PropertyGroup>
+	<ItemGroup>
+		<None Include="_License.txt" Pack="true" PackagePath="" />
+		<None Include="_README.md" Pack="true" PackagePath="" />
+	</ItemGroup>
+
+
+</Project>
