@@ -15,12 +15,17 @@ namespace BNet.IMAP.Mailer
     {
         static void Main(string[] args)
         {
-
             string username = "zionstrategicnoreply@gmail.com";
             string password = "izlwwvhpeqvhbdrk";
 
             MailConfig mailConfig = new MailConfig();
             mailConfig.GetInbox(username, password);
+
+            //var list = mailConfig.ListMailboxes();
+            //for (int i =0; i < list.Count; i++)
+            //{
+            //    Console.WriteLine($"Mailbox {i + 1}: {list[i]}");
+            //}
 
             foreach (var mail in mailConfig.Messages)
             {
@@ -28,10 +33,14 @@ namespace BNet.IMAP.Mailer
                 Console.WriteLine($"From: {mail.From}");
                 Console.WriteLine($"Subject: {mail.Subject}");
                 Console.WriteLine($"Date: {mail.Date}");
-                Console.WriteLine($"Body: {mail.Body}");
+                Console.WriteLine($"BodyText: {mail.PlainTextBody}");
+                Console.WriteLine($"BodyHTML: {mail.HtmlBody}");
                 Console.WriteLine(new string('-', 60));
+
+                //[Gmail]/Trash
+                //mailConfig.DeleteMessage(mail.Id);
             }
         }
-        // ================= Helper Methods =================
+
     }
 }

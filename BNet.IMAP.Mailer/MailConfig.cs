@@ -1,40 +1,48 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Security.Claims;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
 
 namespace BNet.IMAP.Mailer
 {
+    public class MailMessage
+    {
+        public string Id;
+        public string From;
+        public string Subject;
+        public DateTime Date;
+        public string HtmlBody;
+        public string PlainTextBody;
+    }
+
     public class MailConfig
     {
         private TcpClient tcpClient;
         private SslStream sslStream;
         private StreamReader reader;
         private StreamWriter writer;
-
         private int tagCounter = 1;
 
         public List<MailMessage> Messages = new List<MailMessage>();
 
-        // ==============================
-        // CONNECT + FETCH UNSEEN
-        // ==============================
-        public void GetInbox(string username, string password,
-                             string host = "imap.gmail.com", int port = 993)
+        public enum ImapFlags
+        {
+            ALL,
+            SEEN,
+            UNSEEN,
+            DELETED,
+            UNDELETED,
+        }
+        public void GetInbox(string username, string password, ImapFlags imapFlags = ImapFlags.UNSEEN, string host = "imap.gmail.com", int port = 993)
         {
             tcpClient = new TcpClient(host, port);
-
-            sslStream = new SslStream(
-                tcpClient.GetStream(),
-                false,
+            sslStream = new SslStream(tcpClient.GetStream(), false,
                 (sender, cert, chain, errors) => true);
-
             sslStream.AuthenticateAsClient(host, null, SslProtocols.Tls12, false);
 
             reader = new StreamReader(sslStream);
@@ -52,56 +60,37 @@ namespace BNet.IMAP.Mailer
             writer.WriteLine($"{tagSelect} SELECT INBOX");
             EnsureOk(ReadResponse(tagSelect));
 
-            // UID SEARCH UNSEEN  (IMPORTANT)
+            // SEARCH UNSEEN
             string tagSearch = GetTag();
-            writer.WriteLine($"{tagSearch} UID SEARCH UNSEEN");
+            writer.WriteLine($"{tagSearch} UID SEARCH {imapFlags.ToString()}");
             string searchResponse = ReadResponse(tagSearch);
 
             string[] uids = ParseMessageIds(searchResponse);
 
             foreach (var uid in uids)
             {
+                if (string.IsNullOrWhiteSpace(uid)) continue;
+
                 var mail = new MailMessage { Id = uid };
 
-                // FETCH HEADER
-                string tagHeader = GetTag();
-                writer.WriteLine($"{tagHeader} UID FETCH {uid} BODY.PEEK[HEADER]");
-                string headerResponse = ReadResponse(tagHeader);
+                string tagFetch = GetTag();
+                writer.WriteLine($"{tagFetch} UID FETCH {uid} (BODY.PEEK[])"); // ✅ Correct parentheses
+
+                string fullMessage = ReadResponse(tagFetch);
 
 
-                mail.From = GetHeaderValue(headerResponse, "From");
-                mail.Subject = CleanSubject(GetHeaderValue(headerResponse, "Subject"));
-                mail.Date = ParseDate(GetHeaderValue(headerResponse, "Date"));
+                mail.From = GetHeaderValue(fullMessage, "From");
+                mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(fullMessage, "Subject"));
+                mail.Date = ParseDate(GetHeaderValue(fullMessage, "Date"));
 
-                // FETCH BODY
-                string tagBody = GetTag();
-                writer.WriteLine($"{tagBody} UID FETCH {uid} BODY.PEEK[TEXT]");
-                string bodyResponse = ReadResponse(tagBody);
+                ExtractBodies(fullMessage, out string html);
 
-                mail.Body = CleanBody(bodyResponse);
+                mail.PlainTextBody = HtmlToPlainText(html);
+                mail.HtmlBody = html;
 
                 Messages.Add(mail);
             }
         }
-
-        // ==============================
-        // MARK AS SEEN (WORKING)
-        // ==============================
-        public void MarkAsSeen(string uid)
-        {
-            if (writer == null)
-                throw new Exception("Not connected.");
-
-            string tag = GetTag();
-            writer.WriteLine($"{tag} UID STORE {uid} +FLAGS (\\Seen)");
-
-            string response = ReadResponse(tag);
-            EnsureOk(response);
-        }
-
-        // ==============================
-        // LOGOUT
-        // ==============================
         public void Logout()
         {
             if (writer != null)
@@ -110,320 +99,186 @@ namespace BNet.IMAP.Mailer
                 writer.WriteLine($"{tag} LOGOUT");
                 ReadResponse(tag);
             }
-
             reader?.Close();
             writer?.Close();
             sslStream?.Close();
             tcpClient?.Close();
         }
-
-        // ==============================
-        // HELPERS
-        // ==============================
-
-        private string GetTag()
+        public bool MarkAsSeen(string id)
         {
-            return "A" + tagCounter++;
+            if (writer == null)
+                throw new Exception("Not connected.");
+
+            string tag = GetTag();
+            writer.WriteLine($"{tag} UID STORE {id} +FLAGS (\\Seen)");
+
+            string response = ReadResponse(tag);
+            return EnsureOk(response);
         }
-
-        private string ReadLine()
+        public bool DeleteMessage(string id)
         {
-            return reader.ReadLine();
+            if (writer == null)
+                throw new Exception("Not connected.");
+
+            string tag = GetTag();
+            writer.WriteLine($"{tag} UID STORE {id} +FLAGS (\\Deleted)");
+
+            string response = ReadResponse(tag);
+            EnsureOk(response);
+
+            // Permanently remove messages marked as \Deleted
+            tag = GetTag();
+            writer.WriteLine($"{tag} EXPUNGE");
+
+            response = ReadResponse(tag);
+            return EnsureOk(response);
         }
-
-        private string ReadResponse(string tag)
+        public bool MoveToFolder(string id, string folder)
         {
-            StringBuilder sb = new StringBuilder();
-            string line;
+            if (writer == null)
+                throw new Exception("Not connected.");
 
-            while ((line = reader.ReadLine()) != null)
-            {
-                sb.AppendLine(line);
+            string tag = GetTag();
 
-                if (line.StartsWith(tag + " "))
-                    break;
-            }
+            writer.WriteLine($"{tag} UID MOVE {id} \"{folder}\"");
 
-            return sb.ToString();
+            string response = ReadResponse(tag);
+            return EnsureOk(response);
         }
-
-        private void EnsureOk(string response)
+        public List<string> ListMailboxes()
         {
-            if (!response.Contains("OK"))
-                throw new Exception("IMAP Error:\n" + response);
-        }
+            if (writer == null)
+                throw new Exception("Not connected.");
 
+            string tag = GetTag();
+            writer.WriteLine($"{tag} LIST \"\" \"*\"");
 
+            string response = ReadResponse(tag);
+            EnsureOk(response);
 
-        private string ReadResponse(StreamReader reader, string tag)
-        {
-            var sb = new StringBuilder();
-            string line;
+            var mailboxes = new List<string>();
+            var lines = response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
 
-            while ((line = reader.ReadLine()) != null)
-            {
-                sb.AppendLine(line);
-
-                if (line.EndsWith("}"))
-                {
-                    int idx1 = line.LastIndexOf('{');
-                    int idx2 = line.LastIndexOf('}');
-                    if (idx1 >= 0 && idx2 > idx1)
-                    {
-                        if (int.TryParse(line.Substring(idx1 + 1, idx2 - idx1 - 1), out int bytesToRead))
-                        {
-                            char[] buffer = new char[bytesToRead];
-                            reader.Read(buffer, 0, bytesToRead);
-                            sb.Append(buffer);
-                        }
-                    }
-                }
-
-                if (line.StartsWith(tag))
-                    break;
-            }
-
-            return sb.ToString();
-        }
-
-        private string[] ParseMessageIds(string searchResponse)
-        {
-            string[] lines = searchResponse.Split(new string[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
             foreach (var line in lines)
             {
-                if (line.StartsWith("* SEARCH"))
+                if (line.StartsWith("* LIST"))
                 {
-                    string idsPart = line.Substring(8).Trim();
-                    if (string.IsNullOrEmpty(idsPart))
-                        return new string[0];
-                    return idsPart.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    int lastQuote = line.LastIndexOf("\"");
+                    int firstQuote = line.LastIndexOf("\"", lastQuote - 1);
+
+                    if (firstQuote >= 0 && lastQuote > firstQuote)
+                    {
+                        string mailbox = line.Substring(firstQuote + 1, lastQuote - firstQuote - 1);
+                        mailboxes.Add(mailbox);
+                    }
                 }
             }
-            return new string[0];
-        }
 
-        private string GetHeaderValue(string headers, string headerName)
+            return mailboxes;
+        }
+        #region Body Extraction
+
+        private void ExtractBodies(string message, out string html)
         {
-            foreach (var line in headers.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+
+            html = null;
+
+            // Remove IMAP FETCH headers
+            var fetchMatch = Regex.Match(message, @"\* \d+ FETCH .*?BODY\[\].*?\r?\n", RegexOptions.Singleline);
+            if (fetchMatch.Success)
+                message = message.Substring(fetchMatch.Length);
+
+            // Remove final OK line
+            message = Regex.Replace(message, @"\r?\nA\d+ OK.*$", "", RegexOptions.Multiline).Trim();
+
+            string boundary = GetBoundary(message);
+
+            if (!string.IsNullOrEmpty(boundary))
             {
-                if (line.StartsWith(headerName, StringComparison.OrdinalIgnoreCase))
-                    return line.Substring(headerName.Length + 1).Trim();
-            }
-            return "";
-        }
-
-        private string CleanSubject(string subject)
-        {
-            if (string.IsNullOrEmpty(subject)) return "";
-            return DecodeMimeEncodedWords(subject);
-        }
-
-        private DateTime ParseDate(string dateHeader)
-        {
-            if (DateTime.TryParse(dateHeader, out var dt))
-                return dt;
-            return DateTime.MinValue;
-        }
-        private string CleanBody(string response)
-        {
-            // Skip IMAP fetch line e.g. "* 6067 FETCH (BODY[TEXT] {123}"
-            int fetchIndex = response.IndexOf("* ");
-            int firstBlank = -1;
-            if (fetchIndex >= 0)
-            {
-                firstBlank = response.IndexOf("\n", fetchIndex);
-                if (firstBlank >= 0) firstBlank++;
-            }
-
-            string body = firstBlank >= 0
-                ? response.Substring(firstBlank).Trim()
-                : response.Trim();
-
-            // Check if multipart
-            bool isMultipart = body.Contains("Content-Type: multipart") ||
-                               (body.Contains("Content-Type:") && body.Contains("boundary="));
-
-            if (isMultipart)
-            {
-                string boundary = null;
-
-                var boundaryMatch = Regex.Match(
-                    body,
-                    @"boundary=""?([^""\r\n;]+)""?",
-                    RegexOptions.IgnoreCase);
-
-                if (boundaryMatch.Success)
-                    boundary = boundaryMatch.Groups[1].Value.Trim();
-
-                if (boundary == null)
-                    return string.Empty;
-
-                string[] parts = body.Split(
-                    new[] { "--" + boundary },
-                    StringSplitOptions.RemoveEmptyEntries);
-
-                string plainText = null;
-                string htmlText = null;
+                var parts = message.Split(new[] { "--" + boundary }, StringSplitOptions.RemoveEmptyEntries);
 
                 foreach (var part in parts)
                 {
-                    string trimmedPart = part.Trim();
+                    if (part.StartsWith("--")) continue;
 
-                    if (string.IsNullOrWhiteSpace(trimmedPart) ||
-                        trimmedPart == "--" ||
-                        trimmedPart.StartsWith("--"))
-                        continue;
+                    string contentType = GetHeaderValue(part, "Content-Type")?.ToLower();
 
-                    int partBodyStart = part.IndexOf("\r\n\r\n");
-                    if (partBodyStart < 0)
-                        partBodyStart = part.IndexOf("\n\n");
+                    html = DecodePart(part);
 
-                    if (partBodyStart < 0)
-                        continue;
-
-                    string partHeaders = part.Substring(0, partBodyStart);
-                    string partBody = part.Substring(partBodyStart).Trim();
-
-                    // Remove hard boundary cut
-                    int hardCut = partBody.IndexOf("\n--");
-                    if (hardCut >= 0)
-                        partBody = partBody.Substring(0, hardCut).Trim();
-
-                    string encoding = GetHeaderValue(partHeaders, "Content-Transfer-Encoding").ToLower();
-                    string charset = GetCharset(partHeaders) ?? "UTF-8";
-
-                    string decoded = DecodeBodyPart(partBody, encoding, charset);
-                    decoded = RemoveMimeBoundaries(decoded);
-
-                    if (partHeaders.Contains("Content-Type: text/plain") && plainText == null)
-                    {
-                        if (!string.IsNullOrWhiteSpace(decoded))
-                            plainText = decoded;
-                    }
-                    else if (partHeaders.Contains("Content-Type: text/html") && htmlText == null)
-                    {
-                        string stripped = StripHtmlToText(decoded);
-                        if (!string.IsNullOrWhiteSpace(stripped))
-                            htmlText = stripped;
-                    }
                 }
-
-                if (!string.IsNullOrWhiteSpace(plainText))
-                    return plainText;
-
-                if (!string.IsNullOrWhiteSpace(htmlText))
-                    return htmlText;
-
-                return string.Empty;
             }
             else
             {
-                // Single-part email
-                int bodyStart = body.IndexOf("\r\n\r\n");
-                if (bodyStart < 0)
-                    bodyStart = body.IndexOf("\n\n");
+                // Single-part fallback
+                string singleType = GetHeaderValue(message, "Content-Type")?.ToLower();
+                html = DecodePart(message);
+            }
 
-                string headers = bodyStart >= 0
-                    ? body.Substring(0, bodyStart)
-                    : "";
+            html = html.Replace("\r\n\r\n)", "");
+            try
+            {
 
-                string rawBody = bodyStart >= 0
-                    ? body.Substring(bodyStart).Trim()
-                    : body.Trim();
+                byte[] bytes = Convert.FromBase64String(html);
+                html = Encoding.UTF8.GetString(bytes);
+            }
+            catch
+            {
+              
+            }
 
-                string encoding = GetHeaderValue(headers, "Content-Transfer-Encoding").ToLower();
-                string charset = GetCharset(headers) ?? "UTF-8";
+        }
 
-                bool isHtml = headers.Contains("Content-Type: text/html");
-                bool isPlain = headers.Contains("Content-Type: text/plain") ||
-                               !headers.Contains("Content-Type:");
-
-                // Remove IMAP status lines
-                rawBody = Regex.Replace(
-                    rawBody,
-                    @"\r?\nA\d+ OK[^\r\n]*$",
-                    "",
-                    RegexOptions.Multiline).Trim();
-
-                rawBody = rawBody.TrimEnd(')', '\r', '\n', ' ');
-
-                string decoded = DecodeBodyPart(rawBody, encoding, charset);
-
-                decoded = RemoveMimeSections(decoded);
-
-                if (isHtml)
-                    return StripHtmlToText(decoded);
-
-                if (isPlain)
-                    return decoded;
-
+        public string DecodePart(string part)
+        {
+            if (string.IsNullOrWhiteSpace(part))
                 return string.Empty;
-            }
-        }
-        private string RemoveMimeSections(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-                return text;
 
-            // Find first MIME boundary marker
-            var boundaryMatch = Regex.Match(text, @"\r?\n--[A-Za-z0-9]{10,}");
+            // --- Split headers and body safely ---
+            int bodyIndex = part.IndexOf("\r\n\r\n");
+            int separatorLength = 4;
 
-            if (boundaryMatch.Success)
+            if (bodyIndex < 0)
             {
-                // Keep only content before boundary
-                text = text.Substring(0, boundaryMatch.Index);
+                bodyIndex = part.IndexOf("\n\n");
+                separatorLength = 2;
             }
 
-            return text.Trim();
-        }
+            string headers = bodyIndex >= 0
+                ? part.Substring(0, bodyIndex)
+                : "";
 
-        private string RemoveMimeBoundaries(string text)
-        {
-            if (string.IsNullOrEmpty(text))
-                return text;
+            string body = bodyIndex >= 0
+                ? part.Substring(bodyIndex + separatorLength)
+                : part;
 
-            // Remove boundary lines
-            text = Regex.Replace(
-                text,
-                @"(?m)^--[A-Za-z0-9'()+_,-./:=?]{10,}--?\s*$",
-                "");
+            body = body.Trim();
 
-            // Remove stray Content-Type headers
-            text = Regex.Replace(
-                text,
-                @"(?im)^Content-Type:.*\r?\n",
-                "");
+            string encoding = GetHeaderValue(headers, "Content-Transfer-Encoding")?.ToLower() ?? "";
+            string charset = GetCharset(headers) ?? "UTF-8";
 
-            return text.Trim();
-        }
+            byte[] bytes;
 
-        private string DecodeBodyPart(string rawBody, string encoding, string charset)
-        {
-            byte[] bodyBytes;
-
-            if (encoding == "base64")
+            if (encoding.Contains("base64"))
             {
-                string cleaned = Regex.Replace(rawBody, @"[^A-Za-z0-9+/=]", "");
-                int pad = cleaned.Length % 4;
-                if (pad > 0)
-                    cleaned += new string('=', 4 - pad);
+                string cleaned = Regex.Replace(body, @"\s", "");
 
                 try
                 {
-                    bodyBytes = Convert.FromBase64String(cleaned);
+                    bytes = Convert.FromBase64String(cleaned);
                 }
                 catch
                 {
-                    return string.Empty;
+                    // Not valid base64 — return raw body
+                    return body;
                 }
             }
-            else if (encoding == "quoted-printable")
+            else if (encoding.Contains("quoted-printable"))
             {
-                bodyBytes = DecodeQuotedPrintable(rawBody);
+                bytes = DecodeQuotedPrintable(body);
             }
             else
             {
-                bodyBytes = Encoding.UTF8.GetBytes(rawBody);
+                bytes = Encoding.UTF8.GetBytes(body);
             }
 
             Encoding enc;
@@ -436,109 +291,211 @@ namespace BNet.IMAP.Mailer
                 enc = Encoding.UTF8;
             }
 
-            string result = enc.GetString(bodyBytes).Trim();
-            result = Regex.Replace(result, @"(\r?\n){3,}", "\n\n");
-
-            return result.Trim();
+            return enc.GetString(bytes).Trim();
         }
-        private string StripHtmlToText(string html)
+        private string HtmlToPlainText(string html)
         {
-            if (string.IsNullOrEmpty(html)) return string.Empty;
+            if (string.IsNullOrEmpty(html)) return "";
+            string text = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
+            text = Regex.Replace(text, @"<[^>]+>", "", RegexOptions.IgnoreCase);
+            text = System.Net.WebUtility.HtmlDecode(text);
+            return text.Trim();
+        }
 
-            // Replace block-level closing tags with newlines
-            html = System.Text.RegularExpressions.Regex.Replace(
-                html, @"<br\s*/?>", "\n",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            html = System.Text.RegularExpressions.Regex.Replace(
-                html, @"</(p|div|tr|li|h[1-6])>", "\n",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        private string GetBoundary(string message)
+        {
+            var match = Regex.Match(message, @"boundary=""?([^""\r\n;]+)""?", RegexOptions.IgnoreCase);
+            return match.Success ? match.Groups[1].Value : null;
+        }
 
-            // Strip all remaining tags
-            html = System.Text.RegularExpressions.Regex.Replace(html, @"<[^>]+>", string.Empty);
+        #endregion
 
-            // Decode common HTML entities
-            html = html.Replace("&nbsp;", " ")
-                       .Replace("&amp;", "&")
-                       .Replace("&lt;", "<")
-                       .Replace("&gt;", ">")
-                       .Replace("&quot;", "\"")
-                       .Replace("&#39;", "'");
+        #region Header & Utils
 
-            // Collapse excessive blank lines
-            html = System.Text.RegularExpressions.Regex.Replace(html, @"(\r?\n){3,}", "\n\n");
+        private string GetHeaderValue(string headers, string name)
+        {
+            if (string.IsNullOrEmpty(headers))
+                return null;
 
-            return html.Trim();
+            var lines = headers.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+
+            string currentHeader = null;
+
+            foreach (var line in lines)
+            {
+                // Continuation line
+                if ((line.StartsWith(" ") || line.StartsWith("\t")) && currentHeader != null)
+                {
+                    currentHeader += line.Trim();
+                    continue;
+                }
+
+                int colonIndex = line.IndexOf(':');
+                if (colonIndex <= 0)
+                    continue;
+
+                string headerName = line.Substring(0, colonIndex).Trim();
+                string headerValue = line.Substring(colonIndex + 1).Trim();
+
+                if (headerName.Equals(name, StringComparison.OrdinalIgnoreCase))
+                {
+                    currentHeader = headerValue;
+                    return currentHeader;
+                }
+            }
+
+            return null;
+        }
+
+        private DateTime ParseDate(string dateHeader)
+        {
+            DateTime.TryParse(dateHeader, out var dt);
+            return dt;
+        }
+
+        private string[] ParseMessageIds(string response)
+        {
+            var match = Regex.Match(response, @"\* SEARCH(.*)", RegexOptions.IgnoreCase);
+            if (!match.Success)
+                return new string[0];
+
+            var ids = match.Groups[1].Value
+                .Trim()
+                .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+
+            return ids;
+        }
+        private byte[] DecodeQuotedPrintable(string input)
+        {
+            if (string.IsNullOrEmpty(input))
+                return new byte[0];
+
+            // Remove soft line breaks
+            input = input.Replace("=\r\n", "").Replace("=\n", "");
+
+            var bytes = new List<byte>();
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                if (input[i] == '=' && i + 2 < input.Length)
+                {
+                    string hex = input.Substring(i + 1, 2);
+
+                    if (byte.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out byte b))
+                    {
+                        bytes.Add(b);
+                        i += 2;
+                    }
+                }
+                else
+                {
+                    bytes.Add((byte)input[i]);
+                }
+            }
+
+            return bytes.ToArray();
+        }
+        private string DecodeMimeEncodedWords(string input)
+        {
+            try
+            {
+                var match = Regex.Match(input, @"=\?(.+?)\?(B|Q)\?(.+?)\?=", RegexOptions.IgnoreCase);
+                if (!match.Success) return input;
+
+                string charset = match.Groups[1].Value;
+                string method = match.Groups[2].Value;
+                string encoded = match.Groups[3].Value;
+
+                if (method.ToUpper() == "B")
+                {
+                    var bytes = Convert.FromBase64String(encoded);
+                    return Encoding.GetEncoding(charset).GetString(bytes);
+                }
+
+                if (method.ToUpper() == "Q")
+                {
+                    encoded = encoded.Replace('_', ' ');
+                    return Encoding.GetEncoding(charset)
+                        .GetString(DecodeQuotedPrintable(encoded));
+                }
+            }
+            catch { }
+
+            return input;
         }
 
         private string GetCharset(string headers)
         {
             var contentType = GetHeaderValue(headers, "Content-Type");
-            if (contentType != null && contentType.Contains("charset="))
-            {
-                var parts = contentType.Split(new[] { "charset=" }, StringSplitOptions.None);
-                if (parts.Length > 1)
-                    return parts[1].Replace("\"", "").Trim();
-            }
-            return null;
+            if (contentType == null)
+                return null;
+
+            var match = Regex.Match(contentType, @"charset\s*=\s*[""']?(?<charset>[^;""']+)");
+            return match.Success ? match.Groups["charset"].Value : null;
         }
 
-        private byte[] DecodeQuotedPrintable(string input)
+
+        private string GetTag() => "A" + tagCounter++;
+
+        private string ReadLine() => reader.ReadLine();
+
+        private string ReadResponse(string tag)
         {
-            var bytes = new List<byte>();
-            for (int i = 0; i < input.Length; i++)
+            var sb = new StringBuilder();
+            string line;
+
+            while ((line = reader.ReadLine()) != null)
             {
-                if (input[i] == '=')
+                sb.AppendLine(line);
+
+                var literalMatch = Regex.Match(line, @"\{(\d+)\}$");
+                if (literalMatch.Success)
                 {
-                    if (i + 2 < input.Length)
+                    int bytesToRead = int.Parse(literalMatch.Groups[1].Value);
+                    char[] buffer = new char[bytesToRead];
+                    int read = 0;
+                    while (read < bytesToRead)
                     {
-                        string hex = input.Substring(i + 1, 2);
-                        try { bytes.Add(Convert.ToByte(hex, 16)); i += 2; continue; } catch { }
+                        int r = reader.Read(buffer, read, bytesToRead - read);
+                        if (r <= 0) break;
+                        read += r;
                     }
+                    sb.Append(buffer);
                 }
-                bytes.Add((byte)input[i]);
-            }
-            return bytes.ToArray();
-        }
 
-        private string DecodeMimeEncodedWords(string input)
+                if (line.StartsWith(tag + " ")) break;
+            }
+
+            return sb.ToString();
+        }
+        private bool EnsureOk(string response)
         {
+            if (!response.Contains("OK"))
+            {
+                throw new Exception("IMAP Error:\n" + response);
+            }
+            else
+            {
+                return true;
+            }
+        }
+        public static string SafeDecodeBase64(string base64)
+        {
+            if (string.IsNullOrWhiteSpace(base64))
+                return string.Empty;
+
+            base64 = Regex.Replace(base64, @"\s", "");
+
             try
             {
-                if (input.StartsWith("=?") && input.EndsWith("?="))
-                {
-                    var parts = input.Split('?');
-                    if (parts.Length == 5)
-                    {
-                        string encoding = parts[1];
-                        string method = parts[2];
-                        string encodedText = parts[3];
-
-                        if (method.Equals("B", StringComparison.OrdinalIgnoreCase))
-                        {
-                            byte[] bytes = Convert.FromBase64String(encodedText);
-                            return Encoding.GetEncoding(encoding).GetString(bytes);
-                        }
-                        else if (method.Equals("Q", StringComparison.OrdinalIgnoreCase))
-                        {
-                            encodedText = encodedText.Replace('_', ' ');
-                            var bytes = new List<byte>();
-                            for (int i = 0; i < encodedText.Length; i++)
-                            {
-                                if (encodedText[i] == '=' && i + 2 < encodedText.Length)
-                                {
-                                    string hex = encodedText.Substring(i + 1, 2);
-                                    bytes.Add(Convert.ToByte(hex, 16));
-                                    i += 2;
-                                }
-                                else { bytes.Add((byte)encodedText[i]); }
-                            }
-                            return Encoding.GetEncoding(encoding).GetString(bytes.ToArray());
-                        }
-                    }
-                }
+                byte[] bytes = Convert.FromBase64String(base64);
+                return Encoding.UTF8.GetString(bytes);
             }
-            catch { }
-            return input;
+            catch
+            {
+                return base64; // return original if invalid
+            }
         }
+        #endregion
     }
 }
