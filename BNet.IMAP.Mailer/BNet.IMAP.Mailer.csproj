@@ -6,7 +6,7 @@
 		<Nullable>enable</Nullable>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<Title>BNet.IMAP.Mailer</Title>
-		<Description>Easy to use IMAP Mailer Get All Unread Messages and Mark As Read</Description>
+		<Description>This is a lightweight custom IMAP client built in C# using TcpClient and SslStream to communicate securely over SSL (default: port 993). It is designed to connect to IMAP servers such as Gmail (imap.gmail.com) and provides essential email management functionality without relying on third-party IMAP libraries.</Description>
 		<PackageProjectUrl>https://github.com/bryanjaybodino/BNet.Library</PackageProjectUrl>
 		<IncludeSymbols>False</IncludeSymbols>
 		<PackageReadmeFile>_README.md</PackageReadmeFile>

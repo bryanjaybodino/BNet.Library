@@ -16,38 +16,48 @@ namespace BNet.IMAP.Mailer
     {
         static async Task Main(string[] args)
         {
-            string username = "zionstrategicnoreply@gmail.com";
-            string password = "izlwwvhpeqvhbdrk";
-            MailConfig mailConfig = new MailConfig(username, password);
-            var Inboxes = await mailConfig.GetInboxAsync(MailConfig.ImapFlags.UNSEEN);
+            var mail = new MailConfig("your-email@gmail.com", "your-password");
 
-            //var list = mailConfig.ListMailboxes();
-            //for (int i =0; i < list.Count; i++)
-            //{
-            //    Console.WriteLine($"Mailbox {i + 1}: {list[i]}");
-            //}
+            //GET ALL FOLDERS
+            var folders = await mail.ListMailboxesAsync();
 
-            foreach (var mail in Inboxes)
+            foreach (var folder in folders)
             {
-                Console.WriteLine($"ID: {mail.Id}");
-                Console.WriteLine($"From: {mail.From}");
-                Console.WriteLine($"Subject: {mail.Subject}");
-                Console.WriteLine($"Date: {mail.Date}");
-
-
-                //var a = await mailConfig.MoveToFolderAsync(mail.Id, "[Gmail]/Trash");
-                //Console.WriteLine(a);
-
-                //var message = mailConfig.GetFullMessage(mail.Id);
-
-                //Console.WriteLine($"BodyText: {message.PlainTextBody}");
-                //Console.WriteLine($"BodyHTML: {message.HtmlBody}");
-                Console.WriteLine(new string('-', 60));
-
-                //[Gmail]/Trash
-                //mailConfig.DeleteMessage(mail.Id);
+                Console.WriteLine(folder);
             }
+
+
+            var inbox = await mail.GetInboxAsync(MailConfig.ImapFlags.UNSEEN);
+
+            foreach (var message in inbox)
+            {
+                string id = message.Id;
+                Console.WriteLine($"From: {message.From}");
+                Console.WriteLine($"Subject: {message.Subject}");
+                Console.WriteLine($"Date: {message.Date}");
+
+
+                // GET FULL MESSAGE
+                var fullMessage = await mail.GetFullMessageAsync(id);
+                Console.WriteLine(fullMessage.Subject);
+                Console.WriteLine(fullMessage.PlainTextBody);
+
+                // MARK AS READ MESSAGE
+                bool isSuccess1 = await mail.MarkAsSeenAsync(id);
+
+
+                // DELETE MESSAGE
+                bool isSuccess2 = await mail.DeleteMessageAsync(id);
+
+
+                // MOVE TO FOLDER
+                bool isSuccess3 = await mail.MoveToFolderAsync(id, folders[0]);
+
+            }
+
+            await mail.Logout();
         }
+
 
     }
 }
