@@ -15,19 +15,19 @@ namespace BNet.IMAP.Mailer
 
     public class MailMessage
     {
-        public string Id;
-        public string From;
-        public string Subject;
-        public DateTime Date;
-        public string HtmlBody;
-        public string PlainTextBody;
+        public string Id { get; set; }
+        public string From { get; set; }
+        public string Subject { get; set; }
+        public DateTime Date { get; set; }
+        public string HtmlBody { get; set; }
+        public string PlainTextBody { get; set; }
     }
     public class MailInboxes
     {
-        public string Id;
-        public string From;
-        public string Subject;
-        public DateTime Date;
+        public string Id { get; set; }
+        public string From { get; set; }
+        public string Subject { get; set; }
+        public DateTime Date { get; set; }
     }
 
 
