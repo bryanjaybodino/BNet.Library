@@ -1,12 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Claims;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 
 namespace BNet.IMAP.Mailer
 {
@@ -38,73 +40,121 @@ namespace BNet.IMAP.Mailer
             DELETED,
             UNDELETED,
         }
-        public void GetInbox(string username, string password, ImapFlags imapFlags = ImapFlags.UNSEEN, string host = "imap.gmail.com", int port = 993)
+
+        public int PageSize = 50;
+        public int PageIndex = 0;
+
+        public async Task GetInboxAsync(
+            string username,
+            string password,
+            ImapFlags imapFlags = ImapFlags.UNSEEN,
+            string host = "imap.gmail.com",
+            int port = 993)
         {
-            tcpClient = new TcpClient(host, port);
+            tcpClient = new TcpClient();
+            await tcpClient.ConnectAsync(host, port);
+
             sslStream = new SslStream(tcpClient.GetStream(), false,
                 (sender, cert, chain, errors) => true);
-            sslStream.AuthenticateAsClient(host, null, SslProtocols.Tls12, false);
+
+            await sslStream.AuthenticateAsClientAsync(host);
 
             reader = new StreamReader(sslStream);
             writer = new StreamWriter(sslStream) { AutoFlush = true };
 
-            ReadLine(); // server greeting
+
 
             // LOGIN
             string tagLogin = GetTag();
-            writer.WriteLine($"{tagLogin} LOGIN {username} {password}");
-            EnsureOk(ReadResponse(tagLogin));
+            await writer.WriteLineAsync($"{tagLogin} LOGIN {username} {password}");
+            EnsureOk(await ReadResponseAsync(tagLogin));
 
             // SELECT INBOX
             string tagSelect = GetTag();
-            writer.WriteLine($"{tagSelect} SELECT INBOX");
-            EnsureOk(ReadResponse(tagSelect));
+            await writer.WriteLineAsync($"{tagSelect} SELECT INBOX");
+            EnsureOk(await ReadResponseAsync(tagSelect));
 
-            // SEARCH UNSEEN
+            // SEARCH
             string tagSearch = GetTag();
-            writer.WriteLine($"{tagSearch} UID SEARCH {imapFlags.ToString()}");
-            string searchResponse = ReadResponse(tagSearch);
+            await writer.WriteLineAsync($"{tagSearch} UID SEARCH {imapFlags}");
+            string searchResponse = await ReadResponseAsync(tagSearch);
 
             string[] uids = ParseMessageIds(searchResponse);
 
-            foreach (var uid in uids)
-            {
-                if (string.IsNullOrWhiteSpace(uid)) continue;
+            if (uids.Length == 0)
+                return;
 
+            Array.Reverse(uids);
+
+            int start = PageIndex * PageSize;
+
+            if (start >= uids.Length)
+                return;
+
+            var pageUids = uids
+                .Skip(start)
+                .Take(PageSize)
+                .ToArray();
+
+            if (pageUids.Length == 0)
+                return;
+
+            // FETCH HEADERS IN ONE REQUEST
+            string uidSet = string.Join(",", pageUids);
+
+            string tagFetch = GetTag();
+            await writer.WriteLineAsync(
+                $"{tagFetch} UID FETCH {uidSet} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])");
+
+            string response = await ReadResponseAsync(tagFetch);
+
+            foreach (var uid in pageUids)
+            {
                 var mail = new MailMessage { Id = uid };
 
-                string tagFetch = GetTag();
-                writer.WriteLine($"{tagFetch} UID FETCH {uid} (BODY.PEEK[])"); // ✅ Correct parentheses
+                string messageBlock = ExtractMessageBlock(response, uid);
 
-                string fullMessage = ReadResponse(tagFetch);
-
-
-                mail.From = GetHeaderValue(fullMessage, "From");
-                mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(fullMessage, "Subject"));
-                mail.Date = ParseDate(GetHeaderValue(fullMessage, "Date"));
-
-                ExtractBodies(fullMessage, out string html);
-
-                mail.PlainTextBody = HtmlToPlainText(html);
-                mail.HtmlBody = html;
+                mail.From = GetHeaderValue(messageBlock, "From");
+                mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject"));
+                mail.Date = ParseDate(GetHeaderValue(messageBlock, "Date"));
 
                 Messages.Add(mail);
             }
         }
-        public void Logout()
+        public async Task<MailMessage> GetFullMessageAsync(string id)
+        {
+            string tagFetch = GetTag();
+            writer.WriteLine($"{tagFetch} UID FETCH {id} (BODY.PEEK[])");
+
+            string fullMessage =await ReadResponseAsync(tagFetch);
+
+            var mail = new MailMessage { Id = id };
+
+            mail.From = GetHeaderValue(fullMessage, "From");
+            mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(fullMessage, "Subject"));
+            mail.Date = ParseDate(GetHeaderValue(fullMessage, "Date"));
+
+            ExtractBodies(fullMessage, out string html);
+
+            mail.HtmlBody = html;
+            mail.PlainTextBody = HtmlToPlainText(html);
+
+            return mail;
+        }
+        public async Task Logout()
         {
             if (writer != null)
             {
                 string tag = GetTag();
                 writer.WriteLine($"{tag} LOGOUT");
-                ReadResponse(tag);
+                await ReadResponseAsync(tag);
             }
             reader?.Close();
             writer?.Close();
             sslStream?.Close();
             tcpClient?.Close();
         }
-        public bool MarkAsSeen(string id)
+        public async Task<bool> MarkAsSeenAsync(string id)
         {
             if (writer == null)
                 throw new Exception("Not connected.");
@@ -112,10 +162,10 @@ namespace BNet.IMAP.Mailer
             string tag = GetTag();
             writer.WriteLine($"{tag} UID STORE {id} +FLAGS (\\Seen)");
 
-            string response = ReadResponse(tag);
+            string response = await ReadResponseAsync(tag);
             return EnsureOk(response);
         }
-        public bool DeleteMessage(string id)
+        public async Task<bool> DeleteMessageAsync(string id)
         {
             if (writer == null)
                 throw new Exception("Not connected.");
@@ -123,17 +173,17 @@ namespace BNet.IMAP.Mailer
             string tag = GetTag();
             writer.WriteLine($"{tag} UID STORE {id} +FLAGS (\\Deleted)");
 
-            string response = ReadResponse(tag);
+            string response = await ReadResponseAsync(tag);
             EnsureOk(response);
 
             // Permanently remove messages marked as \Deleted
             tag = GetTag();
             writer.WriteLine($"{tag} EXPUNGE");
 
-            response = ReadResponse(tag);
+            response = await ReadResponseAsync(tag);
             return EnsureOk(response);
         }
-        public bool MoveToFolder(string id, string folder)
+        public async Task<bool> MoveToFolderAsync(string id, string folder)
         {
             if (writer == null)
                 throw new Exception("Not connected.");
@@ -142,10 +192,10 @@ namespace BNet.IMAP.Mailer
 
             writer.WriteLine($"{tag} UID MOVE {id} \"{folder}\"");
 
-            string response = ReadResponse(tag);
+            string response = await ReadResponseAsync(tag);
             return EnsureOk(response);
         }
-        public List<string> ListMailboxes()
+        public async Task<List<string>> ListMailboxesAsync()
         {
             if (writer == null)
                 throw new Exception("Not connected.");
@@ -153,7 +203,7 @@ namespace BNet.IMAP.Mailer
             string tag = GetTag();
             writer.WriteLine($"{tag} LIST \"\" \"*\"");
 
-            string response = ReadResponse(tag);
+            string response = await ReadResponseAsync(tag);
             EnsureOk(response);
 
             var mailboxes = new List<string>();
@@ -177,7 +227,35 @@ namespace BNet.IMAP.Mailer
             return mailboxes;
         }
         #region Body Extraction
+        private string ExtractMessageBlock(string response, string uid)
+        {
+            string marker = $"UID {uid}";
+            int uidIndex = response.IndexOf(marker);
 
+            if (uidIndex == -1)
+                return string.Empty;
+
+            int start = response.LastIndexOf("*", uidIndex);
+            if (start == -1)
+                start = uidIndex;
+
+            int depth = 0;
+            for (int i = start; i < response.Length; i++)
+            {
+                if (response[i] == '(')
+                    depth++;
+                else if (response[i] == ')')
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        return response.Substring(start, i - start + 1);
+                    }
+                }
+            }
+
+            return string.Empty;
+        }
         private void ExtractBodies(string message, out string html)
         {
 
@@ -223,12 +301,12 @@ namespace BNet.IMAP.Mailer
             }
             catch
             {
-              
+
             }
 
         }
 
-        public string DecodePart(string part)
+        private string DecodePart(string part)
         {
             if (string.IsNullOrWhiteSpace(part))
                 return string.Empty;
@@ -437,33 +515,44 @@ namespace BNet.IMAP.Mailer
 
         private string GetTag() => "A" + tagCounter++;
 
-        private string ReadLine() => reader.ReadLine();
+        private async Task<string> ReadLineAsync()
+        {
+            return await reader.ReadLineAsync();
+        }
 
-        private string ReadResponse(string tag)
+        private async Task<string> ReadResponseAsync(string tag)
         {
             var sb = new StringBuilder();
             string line;
 
-            while ((line = reader.ReadLine()) != null)
+            while ((line = await reader.ReadLineAsync()) != null)
             {
                 sb.AppendLine(line);
 
+                // Check for literal size at end of line: {123}
                 var literalMatch = Regex.Match(line, @"\{(\d+)\}$");
                 if (literalMatch.Success)
                 {
                     int bytesToRead = int.Parse(literalMatch.Groups[1].Value);
                     char[] buffer = new char[bytesToRead];
                     int read = 0;
+
                     while (read < bytesToRead)
                     {
-                        int r = reader.Read(buffer, read, bytesToRead - read);
-                        if (r <= 0) break;
+                        int r = await reader.ReadAsync(buffer, read, bytesToRead - read);
+                        if (r <= 0) break; // connection closed
                         read += r;
                     }
-                    sb.Append(buffer);
+
+                    sb.Append(buffer, 0, read);
+
+                    // After literal, server sends a CRLF, read it
+                    await reader.ReadLineAsync();
                 }
 
-                if (line.StartsWith(tag + " ")) break;
+                // End of response
+                if (line.StartsWith(tag + " "))
+                    break;
             }
 
             return sb.ToString();
