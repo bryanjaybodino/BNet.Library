@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 
 namespace BNet.IMAP.Mailer
 {
+
     public class MailMessage
     {
         public string Id;
@@ -21,6 +22,15 @@ namespace BNet.IMAP.Mailer
         public string HtmlBody;
         public string PlainTextBody;
     }
+    public class MailInboxes
+    {
+        public string Id;
+        public string From;
+        public string Subject;
+        public DateTime Date;
+    }
+
+
 
     public class MailConfig
     {
@@ -29,27 +39,19 @@ namespace BNet.IMAP.Mailer
         private StreamReader reader;
         private StreamWriter writer;
         private int tagCounter = 1;
-
-        public List<MailMessage> Messages = new List<MailMessage>();
-
-        public enum ImapFlags
+        private string host = "imap.gmail.com";
+        private int port = 993;
+        private string username = "";
+        private string password = "";
+        public MailConfig(string username, string password, string host = "imap.gmail.com", int port = 993)
         {
-            ALL,
-            SEEN,
-            UNSEEN,
-            DELETED,
-            UNDELETED,
+            this.username = username;
+            this.password = password;
+            this.host = host;
+            this.port = port;
         }
-
-        public int PageSize = 50;
-        public int PageIndex = 0;
-
-        public async Task GetInboxAsync(
-            string username,
-            string password,
-            ImapFlags imapFlags = ImapFlags.UNSEEN,
-            string host = "imap.gmail.com",
-            int port = 993)
+        public enum ImapFlags { ALL, SEEN, UNSEEN, DELETED, UNDELETED }
+        public async Task<List<MailInboxes>> GetInboxAsync(ImapFlags imapFlags = ImapFlags.UNSEEN, int PageSize = 50, int PageIndex = 0)
         {
             tcpClient = new TcpClient();
             await tcpClient.ConnectAsync(host, port);
@@ -61,8 +63,6 @@ namespace BNet.IMAP.Mailer
 
             reader = new StreamReader(sslStream);
             writer = new StreamWriter(sslStream) { AutoFlush = true };
-
-
 
             // LOGIN
             string tagLogin = GetTag();
@@ -82,14 +82,14 @@ namespace BNet.IMAP.Mailer
             string[] uids = ParseMessageIds(searchResponse);
 
             if (uids.Length == 0)
-                return;
+                return null;
 
             Array.Reverse(uids);
 
             int start = PageIndex * PageSize;
 
             if (start >= uids.Length)
-                return;
+                return null;
 
             var pageUids = uids
                 .Skip(start)
@@ -97,36 +97,33 @@ namespace BNet.IMAP.Mailer
                 .ToArray();
 
             if (pageUids.Length == 0)
-                return;
+                return null;
 
             // FETCH HEADERS IN ONE REQUEST
             string uidSet = string.Join(",", pageUids);
 
             string tagFetch = GetTag();
-            await writer.WriteLineAsync(
-                $"{tagFetch} UID FETCH {uidSet} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])");
+            await writer.WriteLineAsync($"{tagFetch} UID FETCH {uidSet} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])");
 
             string response = await ReadResponseAsync(tagFetch);
-
+            List<MailInboxes> mailInboxes = new List<MailInboxes>();
             foreach (var uid in pageUids)
             {
-                var mail = new MailMessage { Id = uid };
-
-                string messageBlock = ExtractMessageBlock(response, uid);
-
+                var mail = new MailInboxes { Id = uid };
+                string messageBlock = ExtractHeaderFields(response, uid);
                 mail.From = GetHeaderValue(messageBlock, "From");
                 mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject"));
                 mail.Date = ParseDate(GetHeaderValue(messageBlock, "Date"));
-
-                Messages.Add(mail);
+                mailInboxes.Add(mail);
             }
+            return mailInboxes;
         }
         public async Task<MailMessage> GetFullMessageAsync(string id)
         {
             string tagFetch = GetTag();
             writer.WriteLine($"{tagFetch} UID FETCH {id} (BODY.PEEK[])");
 
-            string fullMessage =await ReadResponseAsync(tagFetch);
+            string fullMessage = await ReadResponseAsync(tagFetch);
 
             var mail = new MailMessage { Id = id };
 
@@ -227,34 +224,35 @@ namespace BNet.IMAP.Mailer
             return mailboxes;
         }
         #region Body Extraction
-        private string ExtractMessageBlock(string response, string uid)
+        private string ExtractHeaderFields(string response, string uid)
         {
-            string marker = $"UID {uid}";
+            string marker = $"UID {uid} BODY[HEADER.FIELDS";
             int uidIndex = response.IndexOf(marker);
 
             if (uidIndex == -1)
                 return string.Empty;
 
-            int start = response.LastIndexOf("*", uidIndex);
-            if (start == -1)
-                start = uidIndex;
+            // Find the start of the literal
+            int literalStart = response.IndexOf("{", uidIndex);
+            int literalEnd = response.IndexOf("}", literalStart);
+            if (literalStart == -1 || literalEnd == -1)
+                return string.Empty;
 
-            int depth = 0;
-            for (int i = start; i < response.Length; i++)
-            {
-                if (response[i] == '(')
-                    depth++;
-                else if (response[i] == ')')
-                {
-                    depth--;
-                    if (depth == 0)
-                    {
-                        return response.Substring(start, i - start + 1);
-                    }
-                }
-            }
+            // Parse the length of the literal
+            string lengthStr = response.Substring(literalStart + 1, literalEnd - literalStart - 1);
+            if (!int.TryParse(lengthStr, out int literalLength))
+                return string.Empty;
 
-            return string.Empty;
+            // The actual header starts after \r\n following the }
+            int headerStart = response.IndexOf("\r\n", literalEnd) + 2;
+            if (headerStart == -1)
+                return string.Empty;
+
+            if (headerStart + literalLength > response.Length)
+                return string.Empty;
+
+            string headerBlock = response.Substring(headerStart, literalLength);
+            return headerBlock.Trim();
         }
         private void ExtractBodies(string message, out string html)
         {
@@ -514,12 +512,6 @@ namespace BNet.IMAP.Mailer
 
 
         private string GetTag() => "A" + tagCounter++;
-
-        private async Task<string> ReadLineAsync()
-        {
-            return await reader.ReadLineAsync();
-        }
-
         private async Task<string> ReadResponseAsync(string tag)
         {
             var sb = new StringBuilder();

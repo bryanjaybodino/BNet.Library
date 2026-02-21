@@ -18,13 +18,8 @@ namespace BNet.IMAP.Mailer
         {
             string username = "zionstrategicnoreply@gmail.com";
             string password = "izlwwvhpeqvhbdrk";
-
-            MailConfig mailConfig = new MailConfig();
-
-            mailConfig.PageSize = 1;
-            mailConfig.PageIndex = 0;
-
-            await mailConfig.GetInboxAsync(username, password, MailConfig.ImapFlags.UNSEEN);
+            MailConfig mailConfig = new MailConfig(username, password);
+            var Inboxes = await mailConfig.GetInboxAsync(MailConfig.ImapFlags.UNSEEN);
 
             //var list = mailConfig.ListMailboxes();
             //for (int i =0; i < list.Count; i++)
@@ -32,7 +27,7 @@ namespace BNet.IMAP.Mailer
             //    Console.WriteLine($"Mailbox {i + 1}: {list[i]}");
             //}
 
-            foreach (var mail in mailConfig.Messages)
+            foreach (var mail in Inboxes)
             {
                 Console.WriteLine($"ID: {mail.Id}");
                 Console.WriteLine($"From: {mail.From}");
