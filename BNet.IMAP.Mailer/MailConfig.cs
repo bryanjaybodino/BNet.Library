@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Mail;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
@@ -65,7 +66,7 @@ namespace BNet.IMAP.Mailer
 
 
         public enum ImapFlags { ALL, SEEN, UNSEEN, DELETED, UNDELETED }
-        public async Task<List<MailInboxes>> GetInboxAsync(ImapFlags imapFlags = ImapFlags.UNSEEN, int PageSize = 50, int PageIndex = 0)
+        public async Task<List<MailInboxes>> GetInboxAsync(ImapFlags imapFlags = ImapFlags.UNSEEN, string EmailFilter = "", int PageSize = 50,int PageIndex = 0) // <-- new parameter
         {
             // LOGIN
             string tagLogin = GetTag();
@@ -79,7 +80,15 @@ namespace BNet.IMAP.Mailer
 
             // SEARCH
             string tagSearch = GetTag();
-            await writer.WriteLineAsync($"{tagSearch} UID SEARCH {imapFlags}");
+
+            // Build the SEARCH command
+            string searchCommand = $"{imapFlags}";
+            if (!string.IsNullOrEmpty(EmailFilter))
+            {
+                searchCommand = $"FROM \"{EmailFilter}\" {imapFlags}";
+            }
+
+            await writer.WriteLineAsync($"{tagSearch} UID SEARCH {searchCommand}");
             string searchResponse = await ReadResponseAsync(tagSearch);
 
             string[] uids = ParseMessageIds(searchResponse);
@@ -427,7 +436,28 @@ namespace BNet.IMAP.Mailer
                 if (headerName.Equals(name, StringComparison.OrdinalIgnoreCase))
                 {
                     currentHeader = headerValue;
-                    return currentHeader;
+                    // Use regex to extract the email inside <>
+                    var match = Regex.Match(currentHeader, @"<([^>]+)>");
+
+                    string emailOnly;
+
+                    if (match.Success)
+                    {
+                        emailOnly = match.Groups[1].Value; // EMAIL INSIDE <>
+                    }
+                    else
+                    {
+                        // fallback: if no <>, maybe it's just the email
+                        emailOnly = currentHeader.Trim();
+                    }
+
+                    // Optional: simple validation
+                    if (!Regex.IsMatch(emailOnly, @"^[^@\s]+@[^@\s]+\.[^@\s]+$"))
+                    {
+                        emailOnly = null; // invalid email
+                    }
+
+                    return emailOnly;
                 }
             }
 
@@ -571,7 +601,7 @@ namespace BNet.IMAP.Mailer
                 return true;
             }
         }
-        public static string SafeDecodeBase64(string base64)
+        private static string SafeDecodeBase64(string base64)
         {
             if (string.IsNullOrWhiteSpace(base64))
                 return string.Empty;
