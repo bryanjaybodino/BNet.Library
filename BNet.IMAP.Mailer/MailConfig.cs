@@ -432,32 +432,21 @@ namespace BNet.IMAP.Mailer
 
                 string headerName = line.Substring(0, colonIndex).Trim();
                 string headerValue = line.Substring(colonIndex + 1).Trim();
-
                 if (headerName.Equals(name, StringComparison.OrdinalIgnoreCase))
                 {
-                    currentHeader = headerValue;
+                     currentHeader = headerValue;
+
                     // Use regex to extract the email inside <>
                     var match = Regex.Match(currentHeader, @"<([^>]+)>");
+                    string extracted = match.Success ? match.Groups[1].Value : currentHeader.Trim();
 
-                    string emailOnly;
+                    // Validate if it is a proper email
+                    bool isValidEmail = Regex.IsMatch(
+                        extracted,
+                        @"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+                    );
 
-                    if (match.Success)
-                    {
-                        emailOnly = match.Groups[1].Value; // EMAIL INSIDE <>
-                    }
-                    else
-                    {
-                        // fallback: if no <>, maybe it's just the email
-                        emailOnly = currentHeader.Trim();
-                    }
-
-                    // Optional: simple validation
-                    if (!Regex.IsMatch(emailOnly, @"^[^@\s]+@[^@\s]+\.[^@\s]+$"))
-                    {
-                        emailOnly = null; // invalid email
-                    }
-
-                    return emailOnly;
+                    return isValidEmail ? extracted : currentHeader; // return email if valid, else original
                 }
             }
 
