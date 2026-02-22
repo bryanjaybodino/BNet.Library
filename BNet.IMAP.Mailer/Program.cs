@@ -16,7 +16,15 @@ namespace BNet.IMAP.Mailer
     {
         static async Task Main(string[] args)
         {
-            var mail = new MailConfig("your-email@gmail.com", "your-password");
+            string userEmail = "no-reply@zionserve.com";
+            string userPassword = "";
+            string hostname = "mail.zionserve.com";
+
+            var mail = new MailConfig();
+            await mail.ConnectAsync(userEmail, userPassword, hostname);
+
+
+            var inbox = await mail.GetInboxAsync(MailConfig.ImapFlags.UNSEEN,1);
 
             //GET ALL FOLDERS
             var folders = await mail.ListMailboxesAsync();
@@ -26,9 +34,6 @@ namespace BNet.IMAP.Mailer
                 Console.WriteLine(folder);
             }
 
-
-            var inbox = await mail.GetInboxAsync(MailConfig.ImapFlags.UNSEEN);
-
             foreach (var message in inbox)
             {
                 string id = message.Id;
@@ -37,21 +42,21 @@ namespace BNet.IMAP.Mailer
                 Console.WriteLine($"Date: {message.Date}");
 
 
-                // GET FULL MESSAGE
-                var fullMessage = await mail.GetFullMessageAsync(id);
-                Console.WriteLine(fullMessage.Subject);
-                Console.WriteLine(fullMessage.PlainTextBody);
+                //// GET FULL MESSAGE
+                //var fullMessage = await mail.GetFullMessageAsync(id);
+                //Console.WriteLine(fullMessage.Subject);
+                //Console.WriteLine(fullMessage.PlainTextBody);
 
-                // MARK AS READ MESSAGE
-                bool isSuccess1 = await mail.MarkAsSeenAsync(id);
-
-
-                // DELETE MESSAGE
-                bool isSuccess2 = await mail.DeleteMessageAsync(id);
+                //// MARK AS READ MESSAGE
+                //bool isSuccess1 = await mail.MarkAsSeenAsync(id);
 
 
-                // MOVE TO FOLDER
-                bool isSuccess3 = await mail.MoveToFolderAsync(id, folders[0]);
+                //// DELETE MESSAGE
+                //bool isSuccess2 = await mail.DeleteMessageAsync(id);
+
+
+                //// MOVE TO FOLDER
+                //bool isSuccess3 = await mail.MoveToFolderAsync(id, folders[0]);
 
             }
 

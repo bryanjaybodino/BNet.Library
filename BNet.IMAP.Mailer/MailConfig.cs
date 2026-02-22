@@ -43,27 +43,30 @@ namespace BNet.IMAP.Mailer
         private int port = 993;
         private string username = "";
         private string password = "";
-        public MailConfig(string username, string password, string host = "imap.gmail.com", int port = 993)
+        public async Task ConnectAsync(string username, string password, string host = "imap.gmail.com", int port = 993)
         {
             this.username = username;
             this.password = password;
             this.host = host;
             this.port = port;
-        }
-        public enum ImapFlags { ALL, SEEN, UNSEEN, DELETED, UNDELETED }
-        public async Task<List<MailInboxes>> GetInboxAsync(ImapFlags imapFlags = ImapFlags.UNSEEN, int PageSize = 50, int PageIndex = 0)
-        {
-            tcpClient = new TcpClient();
-            await tcpClient.ConnectAsync(host, port);
 
-            sslStream = new SslStream(tcpClient.GetStream(), false,
+            tcpClient = new TcpClient(host, port);
+
+            sslStream = new SslStream(
+                tcpClient.GetStream(),
+                false,
                 (sender, cert, chain, errors) => true);
 
-            await sslStream.AuthenticateAsClientAsync(host);
+            await sslStream.AuthenticateAsClientAsync(host, null, SslProtocols.Tls12, false);
 
             reader = new StreamReader(sslStream);
             writer = new StreamWriter(sslStream) { AutoFlush = true };
+        }
 
+
+        public enum ImapFlags { ALL, SEEN, UNSEEN, DELETED, UNDELETED }
+        public async Task<List<MailInboxes>> GetInboxAsync(ImapFlags imapFlags = ImapFlags.UNSEEN, int PageSize = 50, int PageIndex = 0)
+        {
             // LOGIN
             string tagLogin = GetTag();
             await writer.WriteLineAsync($"{tagLogin} LOGIN {username} {password}");
@@ -206,18 +209,26 @@ namespace BNet.IMAP.Mailer
             var mailboxes = new List<string>();
             var lines = response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
 
+            // Regex to match: * LIST (flags) "delimiter" mailbox
+            var regex = new Regex(@"^\* LIST \([^\)]*\) ""[^""]*"" (.+)$");
+
             foreach (var line in lines)
             {
-                if (line.StartsWith("* LIST"))
-                {
-                    int lastQuote = line.LastIndexOf("\"");
-                    int firstQuote = line.LastIndexOf("\"", lastQuote - 1);
+                if (!line.StartsWith("* LIST"))
+                    continue;
 
-                    if (firstQuote >= 0 && lastQuote > firstQuote)
+                var match = regex.Match(line);
+                if (match.Success)
+                {
+                    string mailbox = match.Groups[1].Value.Trim();
+
+                    // Remove quotes if mailbox name is quoted
+                    if (mailbox.StartsWith("\"") && mailbox.EndsWith("\""))
                     {
-                        string mailbox = line.Substring(firstQuote + 1, lastQuote - firstQuote - 1);
-                        mailboxes.Add(mailbox);
+                        mailbox = mailbox.Substring(1, mailbox.Length - 2);
                     }
+
+                    mailboxes.Add(mailbox);
                 }
             }
 
