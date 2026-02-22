@@ -17,14 +17,14 @@ namespace BNet.IMAP.Mailer
         static async Task Main(string[] args)
         {
             string userEmail = "no-reply@zionserve.com";
-            string userPassword = "";
+            string userPassword = "dOUal[vDJjT&Ynp[";
             string hostname = "mail.zionserve.com";
 
             var mail = new MailConfig();
             await mail.ConnectAsync(userEmail, userPassword, hostname);
 
 
-            var inbox = await mail.GetInboxAsync(MailConfig.ImapFlags.UNSEEN,1);
+            var inbox = await mail.GetInboxAsync(MailConfig.ImapFlags.UNSEEN,"",10);
 
             //GET ALL FOLDERS
             var folders = await mail.ListMailboxesAsync();

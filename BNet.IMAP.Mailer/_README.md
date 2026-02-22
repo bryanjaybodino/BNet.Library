@@ -39,7 +39,8 @@ dotnet add package BNet.IMAP.Mailer
 ### Initialize Mail Client
 
 ```csharp
-var mail = new MailConfig("your-email@gmail.com", "your-password");
+var mail = new MailConfig();
+await mail.ConnectAsync(userEmail, userPassword, hostname);
 ```
 
 ---
@@ -115,13 +116,6 @@ await mail.Logout();
 
 ---
 
-## ⚙️ Constructor
-
-```csharp
-public MailConfig(string username, string password, 
-                  string host = "imap.gmail.com", 
-                  int port = 993)
-```
 
 You can connect to any IMAP server by specifying a custom host and port.
 
