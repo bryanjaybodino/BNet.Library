@@ -44,34 +44,43 @@ namespace BNet.IMAP.Mailer
         private int port = 993;
         private string username = "";
         private string password = "";
-        public async Task ConnectAsync(string username, string password, string host = "imap.gmail.com", int port = 993)
+        private bool isConnected = true;
+        public async Task<bool> ConnectAsync(string username, string password, string host = "imap.gmail.com", int port = 993)
         {
-            this.username = username;
-            this.password = password;
-            this.host = host;
-            this.port = port;
+            try
+            {
+                this.username = username;
+                this.password = password;
+                this.host = host;
+                this.port = port;
 
-            tcpClient = new TcpClient(host, port);
+                tcpClient = new TcpClient(host, port);
 
-            sslStream = new SslStream(
-                tcpClient.GetStream(),
-                false,
-                (sender, cert, chain, errors) => true);
+                sslStream = new SslStream(
+                    tcpClient.GetStream(),
+                    false,
+                    (sender, cert, chain, errors) => true);
 
-            await sslStream.AuthenticateAsClientAsync(host, null, SslProtocols.Tls12, false);
+                await sslStream.AuthenticateAsClientAsync(host, null, SslProtocols.Tls12, false);
 
-            reader = new StreamReader(sslStream);
-            writer = new StreamWriter(sslStream) { AutoFlush = true };
+                reader = new StreamReader(sslStream);
+                writer = new StreamWriter(sslStream) { AutoFlush = true };
+
+                // LOGIN
+                string tagLogin = GetTag();
+                await writer.WriteLineAsync($"{tagLogin} LOGIN {username} {password}");
+                EnsureOk(await ReadResponseAsync(tagLogin));
+                return isConnected;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
-
         public enum ImapFlags { ALL, SEEN, UNSEEN, DELETED, UNDELETED }
-        public async Task<List<MailInboxes>> GetInboxAsync(ImapFlags imapFlags = ImapFlags.UNSEEN, string EmailFilter = "", int PageSize = 50,int PageIndex = 0) // <-- new parameter
+        public async Task<List<MailInboxes>> GetInboxAsync(ImapFlags imapFlags = ImapFlags.UNSEEN, string EmailFilter = "", int PageSize = 50, int PageIndex = 0) // <-- new parameter
         {
-            // LOGIN
-            string tagLogin = GetTag();
-            await writer.WriteLineAsync($"{tagLogin} LOGIN {username} {password}");
-            EnsureOk(await ReadResponseAsync(tagLogin));
 
             // SELECT INBOX
             string tagSelect = GetTag();
@@ -434,7 +443,7 @@ namespace BNet.IMAP.Mailer
                 string headerValue = line.Substring(colonIndex + 1).Trim();
                 if (headerName.Equals(name, StringComparison.OrdinalIgnoreCase))
                 {
-                     currentHeader = headerValue;
+                    currentHeader = headerValue;
 
                     // Use regex to extract the email inside <>
                     var match = Regex.Match(currentHeader, @"<([^>]+)>");
@@ -549,6 +558,10 @@ namespace BNet.IMAP.Mailer
 
             while ((line = await reader.ReadLineAsync()) != null)
             {
+                if (line.ToUpper().Contains("A1 NO"))
+                {
+                    isConnected = false;
+                }
                 sb.AppendLine(line);
 
                 // Check for literal size at end of line: {123}
