@@ -12,19 +12,58 @@ using System.Threading.Tasks;
 
 namespace BNet.IMAP.Mailer
 {
+    // ─────────────────────────────────────────────────────────────────────────
+    //  ATTACHMENT  — one file extracted from a multipart email
+    // ─────────────────────────────────────────────────────────────────────────
+    public class MailAttachment
+    {
+        public string FileName { get; set; }       // "invoice.pdf"
+        public string ContentType { get; set; }    // "application/pdf"
+        public string ContentId { get; set; }      // inline CID reference e.g. "image001@mail" (may be null)
+        public bool IsInline { get; set; }         // true = embedded image in HTML body
+        public long SizeBytes { get; set; }        // decoded file size
+        public byte[] Data { get; set; }           // raw decoded bytes — use to download/save
+
+        // Convenience: base64 string ready for <img src="data:..."> or <a download>
+        public string Base64Data => Data != null ? Convert.ToBase64String(Data) : null;
+
+        // Convenience: data URI ready to embed directly in HTML
+        public string DataUri => Data != null ? $"data:{ContentType};base64,{Base64Data}" : null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  MAIL MESSAGE  — full email with body + attachments
+    // ─────────────────────────────────────────────────────────────────────────
     public class MailMessage
     {
         public List<string> To { get; set; }
         public List<string> CC { get; set; }
         public List<string> BCC { get; set; }
         public string Id { get; set; }
-        public string From { get; set; }
+
+        // From broken into 3 parts
+        public string From { get; set; }      // raw original header value
+        public string FromName { get; set; }  // "John Doe"  (falls back to email local part if no display name)
+        public string FromEmail { get; set; } // "john@example.com"
+        public string FromImage { get; set; } // ready-to-render <span> initials avatar
+
         public string Subject { get; set; }
         public DateTime Date { get; set; }
         public string HtmlBody { get; set; }
         public string PlainTextBody { get; set; }
+
+        // ✅ Attachments — both inline (embedded images) and regular file attachments
+        public List<MailAttachment> Attachments { get; set; } = new List<MailAttachment>();
+
+        // Convenience shortcuts
+        public List<MailAttachment> FileAttachments => Attachments?.Where(a => !a.IsInline).ToList();
+        public List<MailAttachment> InlineAttachments => Attachments?.Where(a => a.IsInline).ToList();
+        public bool HasAttachments => FileAttachments?.Count > 0;
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    //  MAIL INBOXES  — lightweight list-view entry (headers only, no body)
+    // ─────────────────────────────────────────────────────────────────────────
     public class MailInboxes
     {
         public int TotalEmail { get; set; }
@@ -33,13 +72,24 @@ namespace BNet.IMAP.Mailer
         public List<string> CC { get; set; }
         public List<string> BCC { get; set; }
         public string Id { get; set; }
+
+        // From broken into 3 parts
         public string From { get; set; }
+        public string FromName { get; set; }
+        public string FromEmail { get; set; }
+        public string FromImage { get; set; }
+
         public string Subject { get; set; }
-        public string Folder { get; set; } // INBOX, Sent, etc.
+        public string Folder { get; set; }
         public DateTime Date { get; set; }
-        List<MailInboxes> Submail { get; set; }
+
+        // Thread: other emails in the same conversation (same normalized subject)
+        public List<MailMessage> Submail { get; set; }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    //  MAIL CONFIG  — IMAP client
+    // ─────────────────────────────────────────────────────────────────────────
     public class MailConfig
     {
         private TcpClient tcpClient;
@@ -75,8 +125,7 @@ namespace BNet.IMAP.Mailer
                 reader = new StreamReader(sslStream, Encoding.UTF8, false, 65536);
                 writer = new StreamWriter(sslStream, Encoding.UTF8) { AutoFlush = true };
 
-                // Read server greeting
-                await reader.ReadLineAsync();
+                await reader.ReadLineAsync(); // server greeting
 
                 string tagLogin = GetTag();
                 await writer.WriteLineAsync($"{tagLogin} LOGIN {username} {password}");
@@ -91,19 +140,13 @@ namespace BNet.IMAP.Mailer
 
         public enum ImapFlags
         {
-            ALL,
-            SEEN,
-            UNSEEN,
-            ANSWERED,
-            UNANSWERED,
-            FLAGGED,
-            UNFLAGGED,
-            DELETED,
-            UNDELETED,
-            DRAFT,
-            UNDRAFT
+            ALL, SEEN, UNSEEN, ANSWERED, UNANSWERED,
+            FLAGGED, UNFLAGGED, DELETED, UNDELETED, DRAFT, UNDRAFT
         }
 
+        // ─────────────────────────────────────────────────────────────────────
+        //  GET INBOX  (list view — headers only, no body)
+        // ─────────────────────────────────────────────────────────────────────
         public async Task<List<MailInboxes>> GetInboxAsync(
             string folder = "INBOX",
             ImapFlags imapFlags = ImapFlags.UNSEEN,
@@ -129,8 +172,7 @@ namespace BNet.IMAP.Mailer
                 string searchResponse = await ReadResponseAsync(tagSearch);
 
                 string[] uids = ParseMessageIds(searchResponse);
-                if (uids.Length == 0)
-                    return new List<MailInboxes>();
+                if (uids.Length == 0) return new List<MailInboxes>();
 
                 Array.Reverse(uids);
 
@@ -138,31 +180,42 @@ namespace BNet.IMAP.Mailer
                 int totalPages = (int)Math.Ceiling(totalEmails / (double)pageSize);
                 int start = pageIndex * pageSize;
 
-                if (start >= totalEmails)
-                    return new List<MailInboxes>();
+                if (start >= totalEmails) return new List<MailInboxes>();
 
                 var pageUids = uids.Skip(start).Take(pageSize).ToArray();
-                if (pageUids.Length == 0)
-                    return new List<MailInboxes>();
+                if (pageUids.Length == 0) return new List<MailInboxes>();
 
                 string uidSet = string.Join(",", pageUids);
                 string tagFetch = GetTag();
-                await writer.WriteLineAsync($"{tagFetch} UID FETCH {uidSet} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])");
+                await writer.WriteLineAsync($"{tagFetch} UID FETCH {uidSet} (BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])");
                 string response = await ReadResponseAsync(tagFetch);
 
-                List<MailInboxes> mailInboxes = new List<MailInboxes>();
+                var mailInboxes = new List<MailInboxes>();
                 foreach (var uid in pageUids)
                 {
                     string messageBlock = ExtractHeaderFields(response, uid);
+                    string rawFrom = GetHeaderValue(messageBlock, "From");
+
+                    ParseFrom(rawFrom, out string fromName, out string fromEmail);
+
                     var mail = new MailInboxes
                     {
                         Id = uid,
-                        From = GetHeaderValue(messageBlock, "From"),
+                        Folder = folder,
+                        From = rawFrom,
+                        FromName = fromName,
+                        FromEmail = fromEmail,
+                        FromImage = BuildInitialsSpan(fromName ?? fromEmail),
+                        To = ParseAddressList(GetHeaderValue(messageBlock, "To")),
+                        CC = ParseAddressList(GetHeaderValue(messageBlock, "CC")),
+                        BCC = ParseAddressList(GetHeaderValue(messageBlock, "BCC")),
                         Subject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject")),
                         Date = ParseDate(GetHeaderValue(messageBlock, "Date")),
                         TotalEmail = totalEmails,
-                        TotalPagination = totalPages
+                        TotalPagination = totalPages,
+                        Submail = new List<MailMessage>()
                     };
+
                     mailInboxes.Add(mail);
                 }
 
@@ -174,6 +227,93 @@ namespace BNet.IMAP.Mailer
             }
         }
 
+        // ─────────────────────────────────────────────────────────────────────
+        //  GET FULL MESSAGE  (single email with full body + attachments)
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<MailMessage> GetFullMessageAsync(string id, string folder = "INBOX")
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                return await FetchFullMessageInternalAsync(id, folder);
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  GET THREAD  (email + all related emails in same conversation)
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<MailInboxes> GetThreadAsync(string id, string folder = "INBOX")
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+
+                string tagSelect = GetTag();
+                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
+                EnsureOk(await ReadResponseAsync(tagSelect));
+
+                string tagFetch = GetTag();
+                await writer.WriteLineAsync($"{tagFetch} UID FETCH {id} (BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])");
+                string headerResponse = await ReadResponseAsync(tagFetch);
+
+                string messageBlock = ExtractHeaderFields(headerResponse, id);
+                string rawSubject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject")) ?? "";
+                string rawFrom = GetHeaderValue(messageBlock, "From");
+
+                ParseFrom(rawFrom, out string fromName, out string fromEmail);
+
+                string normalizedSubject = NormalizeSubject(rawSubject);
+
+                var primary = new MailInboxes
+                {
+                    Id = id,
+                    Folder = folder,
+                    From = rawFrom,
+                    FromName = fromName,
+                    FromEmail = fromEmail,
+                    FromImage = BuildInitialsSpan(fromName ?? fromEmail),
+                    To = ParseAddressList(GetHeaderValue(messageBlock, "To")),
+                    CC = ParseAddressList(GetHeaderValue(messageBlock, "CC")),
+                    BCC = ParseAddressList(GetHeaderValue(messageBlock, "BCC")),
+                    Subject = rawSubject,
+                    Date = ParseDate(GetHeaderValue(messageBlock, "Date")),
+                    Submail = new List<MailMessage>()
+                };
+
+                string tagSearch = GetTag();
+                await writer.WriteLineAsync($"{tagSearch} UID SEARCH ALL SUBJECT \"{EscapeImapString(normalizedSubject)}\"");
+                string searchResponse = await ReadResponseAsync(tagSearch);
+
+                string[] relatedUids = ParseMessageIds(searchResponse);
+
+                var threadUids = relatedUids
+                    .Where(u => u != id)
+                    .OrderBy(u => long.TryParse(u, out long n) ? n : 0)
+                    .ToArray();
+
+                foreach (var uid in threadUids)
+                {
+                    var threadMessage = await FetchFullMessageInternalAsync(uid, folder, skipSelect: true);
+                    if (threadMessage != null)
+                        primary.Submail.Add(threadMessage);
+                }
+
+                return primary;
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  GET EMAIL COUNTS BY FLAGS
+        // ─────────────────────────────────────────────────────────────────────
         public async Task<Dictionary<ImapFlags, int>> GetEmailCountsByFlagsAsync(string folder = "INBOX")
         {
             await _lock.WaitAsync();
@@ -190,11 +330,9 @@ namespace BNet.IMAP.Mailer
                 foreach (ImapFlags flag in Enum.GetValues(typeof(ImapFlags)))
                 {
                     string searchCommand = flag == ImapFlags.ALL ? "ALL" : flag.ToString();
-
                     string tagSearch = GetTag();
                     await writer.WriteLineAsync($"{tagSearch} UID SEARCH {searchCommand}");
                     string searchResponse = await ReadResponseAsync(tagSearch);
-
                     string[] uids = ParseMessageIds(searchResponse);
                     counts[flag] = uids.Length;
                 }
@@ -207,41 +345,81 @@ namespace BNet.IMAP.Mailer
             }
         }
 
-        public async Task<MailMessage> GetFullMessageAsync(string id, string folder = "INBOX")
+        // ─────────────────────────────────────────────────────────────────────
+        //  MARK AS SEEN / DELETE / MOVE / LIST MAILBOXES / LOGOUT
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> MarkAsSeenAsync(string id)
         {
             await _lock.WaitAsync();
             try
             {
-                // SELECT folder first
-                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
-                await ReadResponseAsync(tagSelect);
-
-                // FETCH full message body
-                string tagFetch = GetTag();
-                await writer.WriteLineAsync($"{tagFetch} UID FETCH {id} (BODY[])");
-                await writer.FlushAsync();
-
-                string fullMessage = await ReadResponseAsync(tagFetch);
-
-                var mail = new MailMessage { Id = id };
-                mail.From = GetHeaderValue(fullMessage, "From");
-                mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(fullMessage, "Subject"));
-                mail.Date = ParseDate(GetHeaderValue(fullMessage, "Date"));
-
-                ExtractBodies(fullMessage, out string html, out string plainText);
-                // ✅ Inject !important to all inline styles so email renders correctly in webform
-                mail.HtmlBody = InjectImportant(html);
-
-                mail.PlainTextBody = !string.IsNullOrEmpty(plainText) ? plainText : HtmlToPlainText(html);
-
-                return mail;
+                if (writer == null) throw new Exception("Not connected.");
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Seen)");
+                return EnsureOk(await ReadResponseAsync(tag));
             }
-            finally
+            finally { _lock.Release(); }
+        }
+
+        public async Task<bool> DeleteMessageAsync(string id)
+        {
+            await _lock.WaitAsync();
+            try
             {
-                _lock.Release();
+                if (writer == null) throw new Exception("Not connected.");
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Deleted)");
+                EnsureOk(await ReadResponseAsync(tag));
+                tag = GetTag();
+                await writer.WriteLineAsync($"{tag} EXPUNGE");
+                return EnsureOk(await ReadResponseAsync(tag));
             }
+            finally { _lock.Release(); }
+        }
+
+        public async Task<bool> MoveToFolderAsync(string id, string folder)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                if (writer == null) throw new Exception("Not connected.");
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} UID MOVE {id} \"{folder}\"");
+                return EnsureOk(await ReadResponseAsync(tag));
+            }
+            finally { _lock.Release(); }
+        }
+
+        public async Task<List<string>> ListMailboxesAsync()
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                if (writer == null) throw new Exception("Not connected.");
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} LIST \"\" \"*\"");
+                string response = await ReadResponseAsync(tag);
+                EnsureOk(response);
+
+                var mailboxes = new List<string>();
+                var lines = response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+                var regex = new Regex(@"^\* LIST \([^\)]*\) ""[^""]*"" (.+)$");
+
+                foreach (var line in lines)
+                {
+                    if (!line.StartsWith("* LIST")) continue;
+                    var match = regex.Match(line);
+                    if (match.Success)
+                    {
+                        string mailbox = match.Groups[1].Value.Trim();
+                        if (mailbox.StartsWith("\"") && mailbox.EndsWith("\""))
+                            mailbox = mailbox.Substring(1, mailbox.Length - 2);
+                        mailboxes.Add(mailbox);
+                    }
+                }
+                return mailboxes;
+            }
+            finally { _lock.Release(); }
         }
 
         public async Task Logout()
@@ -266,100 +444,55 @@ namespace BNet.IMAP.Mailer
             }
         }
 
-        public async Task<bool> MarkAsSeenAsync(string id)
+        #region Internal Fetch
+
+        /// <summary>
+        /// Core method: fetches a full email by UID, extracts body + attachments.
+        /// skipSelect = true when folder is already selected (used inside GetThreadAsync).
+        /// </summary>
+        private async Task<MailMessage> FetchFullMessageInternalAsync(string id, string folder, bool skipSelect = false)
         {
-            await _lock.WaitAsync();
-            try
+            if (!skipSelect)
             {
-                if (writer == null) throw new Exception("Not connected.");
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Seen)");
-                string response = await ReadResponseAsync(tag);
-                return EnsureOk(response);
+                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                string tagSelect = GetTag();
+                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
+                await ReadResponseAsync(tagSelect);
             }
-            finally
-            {
-                _lock.Release();
-            }
+
+            string tagFetch = GetTag();
+            await writer.WriteLineAsync($"{tagFetch} UID FETCH {id} (BODY[])");
+            await writer.FlushAsync();
+
+            string fullMessage = await ReadResponseAsync(tagFetch);
+
+            string rawFrom = GetHeaderValue(fullMessage, "From");
+            ParseFrom(rawFrom, out string fromName, out string fromEmail);
+
+            var mail = new MailMessage { Id = id };
+            mail.From = rawFrom;
+            mail.FromName = fromName;
+            mail.FromEmail = fromEmail;
+            mail.FromImage = BuildInitialsSpan(fromName ?? fromEmail);
+            mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(fullMessage, "Subject"));
+            mail.Date = ParseDate(GetHeaderValue(fullMessage, "Date"));
+            mail.To = ParseAddressList(GetHeaderValue(fullMessage, "To"));
+            mail.CC = ParseAddressList(GetHeaderValue(fullMessage, "CC"));
+            mail.BCC = ParseAddressList(GetHeaderValue(fullMessage, "BCC"));
+
+            // ✅ Extract body AND attachments in one pass
+            ExtractBodies(fullMessage, out string html, out string plainText, out List<MailAttachment> attachments);
+
+            mail.HtmlBody = InjectImportant(ReplaceCidWithDataUri(html, attachments));
+            mail.PlainTextBody = !string.IsNullOrEmpty(plainText) ? plainText : HtmlToPlainText(html);
+            mail.Attachments = attachments;
+
+            return mail;
         }
 
-        public async Task<bool> DeleteMessageAsync(string id)
-        {
-            await _lock.WaitAsync();
-            try
-            {
-                if (writer == null) throw new Exception("Not connected.");
+        #endregion
 
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Deleted)");
-                EnsureOk(await ReadResponseAsync(tag));
-
-                tag = GetTag();
-                await writer.WriteLineAsync($"{tag} EXPUNGE");
-                return EnsureOk(await ReadResponseAsync(tag));
-            }
-            finally
-            {
-                _lock.Release();
-            }
-        }
-
-        public async Task<bool> MoveToFolderAsync(string id, string folder)
-        {
-            await _lock.WaitAsync();
-            try
-            {
-                if (writer == null) throw new Exception("Not connected.");
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID MOVE {id} \"{folder}\"");
-                return EnsureOk(await ReadResponseAsync(tag));
-            }
-            finally
-            {
-                _lock.Release();
-            }
-        }
-
-        public async Task<List<string>> ListMailboxesAsync()
-        {
-            await _lock.WaitAsync();
-            try
-            {
-                if (writer == null) throw new Exception("Not connected.");
-
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} LIST \"\" \"*\"");
-                string response = await ReadResponseAsync(tag);
-                EnsureOk(response);
-
-                var mailboxes = new List<string>();
-                var lines = response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-                var regex = new Regex(@"^\* LIST \([^\)]*\) ""[^""]*"" (.+)$");
-
-                foreach (var line in lines)
-                {
-                    if (!line.StartsWith("* LIST")) continue;
-
-                    var match = regex.Match(line);
-                    if (match.Success)
-                    {
-                        string mailbox = match.Groups[1].Value.Trim();
-                        if (mailbox.StartsWith("\"") && mailbox.EndsWith("\""))
-                            mailbox = mailbox.Substring(1, mailbox.Length - 2);
-                        mailboxes.Add(mailbox);
-                    }
-                }
-
-                return mailboxes;
-            }
-            finally
-            {
-                _lock.Release();
-            }
-        }
-
-        #region Body Extraction
-
+        #region Body & Attachment Extraction
         private string ExtractHeaderFields(string response, string uid)
         {
             string marker = $"UID {uid} BODY[HEADER.FIELDS";
@@ -379,31 +512,27 @@ namespace BNet.IMAP.Mailer
 
             return response.Substring(headerStart, literalLength).Trim();
         }
-
-        private void ExtractBodies(string message, out string html, out string plainText)
+        private void ExtractBodies(string message, out string html, out string plainText, out List<MailAttachment> attachments)
         {
             html = null;
             plainText = null;
+            attachments = new List<MailAttachment>();
 
-            // Remove IMAP FETCH header line
             var fetchMatch = Regex.Match(message, @"\* \d+ FETCH \(.*?\r?\n", RegexOptions.Singleline);
             if (fetchMatch.Success)
                 message = message.Substring(fetchMatch.Index + fetchMatch.Length);
 
-            // Remove trailing closing paren + OK line
             message = Regex.Replace(message, @"\)\r?\nA\d+ OK.*$", "", RegexOptions.Multiline).Trim();
             message = Regex.Replace(message, @"\r?\nA\d+ OK.*$", "", RegexOptions.Multiline).Trim();
 
-            // ✅ Recursively extract bodies
-            ExtractFromPart(message, ref html, ref plainText);
+            ExtractFromPart(message, ref html, ref plainText, attachments);
 
             if (html == null) html = string.Empty;
             if (plainText == null) plainText = string.Empty;
         }
 
-        private void ExtractFromPart(string part, ref string html, ref string plainText, int depth = 0)
+        private void ExtractFromPart(string part, ref string html, ref string plainText, List<MailAttachment> attachments, int depth = 0)
         {
-            // ✅ Prevent infinite recursion
             if (depth > 10) return;
 
             string boundary = GetBoundary(part);
@@ -418,13 +547,41 @@ namespace BNet.IMAP.Mailer
                     if (string.IsNullOrWhiteSpace(subPart)) continue;
 
                     string contentType = GetRawHeaderValue(subPart, "Content-Type")?.ToLower() ?? "";
+                    string contentDisposition = GetRawHeaderValue(subPart, "Content-Disposition")?.ToLower() ?? "";
+                    string contentId = GetRawHeaderValue(subPart, "Content-ID") ?? "";
+
+                    // Clean up Content-ID angle brackets  <image001@mail> → image001@mail
+                    contentId = contentId.Trim().Trim('<', '>');
+
+                    bool isAttachment = contentDisposition.Contains("attachment");
+                    bool isInline = contentDisposition.Contains("inline") && !contentType.Contains("text/");
 
                     if (contentType.Contains("multipart/"))
-                        ExtractFromPart(subPart, ref html, ref plainText, depth + 1); // ✅ pass depth
+                    {
+                        ExtractFromPart(subPart, ref html, ref plainText, attachments, depth + 1);
+                    }
+                    else if (isAttachment || isInline || (!contentType.Contains("text/") && !string.IsNullOrEmpty(contentId)))
+                    {
+                        // ✅ This part is an attachment or inline embedded file
+                        var attachment = ExtractAttachment(subPart, contentType, contentDisposition, contentId);
+                        if (attachment != null)
+                            attachments.Add(attachment);
+                    }
                     else if (contentType.Contains("text/html") && html == null)
+                    {
                         html = DecodePart(subPart);
+                    }
                     else if (contentType.Contains("text/plain") && plainText == null)
+                    {
                         plainText = DecodePart(subPart);
+                    }
+                    else if (!contentType.Contains("text/") && !string.IsNullOrEmpty(contentType))
+                    {
+                        // Binary part without explicit disposition — treat as attachment
+                        var attachment = ExtractAttachment(subPart, contentType, contentDisposition, contentId);
+                        if (attachment != null)
+                            attachments.Add(attachment);
+                    }
                 }
             }
             else
@@ -465,47 +622,146 @@ namespace BNet.IMAP.Mailer
             if (html == null && plainText != null)
                 html = $"<pre>{System.Net.WebUtility.HtmlEncode(plainText)}</pre>";
         }
+
+        /// <summary>
+        /// Extracts a single attachment part into a MailAttachment object.
+        /// Handles base64 and quoted-printable encoded attachments.
+        /// </summary>
+        private MailAttachment ExtractAttachment(string part, string contentType, string contentDisposition, string contentId)
+        {
+            try
+            {
+                int bodyIndex = part.IndexOf("\r\n\r\n");
+                int separatorLength = 4;
+                if (bodyIndex < 0) { bodyIndex = part.IndexOf("\n\n"); separatorLength = 2; }
+
+                string headers = bodyIndex >= 0 ? part.Substring(0, bodyIndex) : "";
+                string body = bodyIndex >= 0 ? part.Substring(bodyIndex + separatorLength) : part;
+                body = body.Trim();
+
+                // Extract filename from Content-Disposition or Content-Type
+                string fileName = ExtractFileName(headers);
+
+                // Extract full content-type (with charset etc.) from raw headers
+                string fullContentType = GetRawHeaderValue(headers, "Content-Type") ?? contentType;
+                // Strip parameters — keep just "image/png" not "image/png; name=foo.png"
+                string mimeType = fullContentType.Split(';')[0].Trim();
+
+                string encoding = GetRawHeaderValue(headers, "Content-Transfer-Encoding")?.ToLower() ?? "";
+
+                byte[] data;
+                if (encoding.Contains("base64"))
+                {
+                    string cleaned = Regex.Replace(body, @"\s", "");
+                    data = Convert.FromBase64String(cleaned);
+                }
+                else if (encoding.Contains("quoted-printable"))
+                {
+                    data = DecodeQuotedPrintable(body);
+                }
+                else
+                {
+                    data = Encoding.UTF8.GetBytes(body);
+                }
+
+                bool isInline = !string.IsNullOrEmpty(contentId) ||
+                                contentDisposition.Contains("inline");
+
+                return new MailAttachment
+                {
+                    FileName = string.IsNullOrEmpty(fileName) ? $"attachment_{Guid.NewGuid():N}.bin" : fileName,
+                    ContentType = string.IsNullOrEmpty(mimeType) ? "application/octet-stream" : mimeType,
+                    ContentId = string.IsNullOrEmpty(contentId) ? null : contentId,
+                    IsInline = isInline,
+                    SizeBytes = data.LongLength,
+                    Data = data
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Extracts filename from Content-Disposition or Content-Type headers.
+        /// Handles both filename= and name= parameters, and MIME encoded filenames.
+        /// </summary>
+        private string ExtractFileName(string headers)
+        {
+            // Try Content-Disposition: attachment; filename="foo.pdf"
+            string disposition = GetRawHeaderValue(headers, "Content-Disposition") ?? "";
+            var filenameMatch = Regex.Match(disposition, @"filename\*?=""?([^""\r\n;]+)""?", RegexOptions.IgnoreCase);
+            if (filenameMatch.Success)
+                return DecodeMimeEncodedWords(filenameMatch.Groups[1].Value.Trim());
+
+            // Try Content-Type: application/pdf; name="foo.pdf"
+            string contentType = GetRawHeaderValue(headers, "Content-Type") ?? "";
+            var nameMatch = Regex.Match(contentType, @"name\*?=""?([^""\r\n;]+)""?", RegexOptions.IgnoreCase);
+            if (nameMatch.Success)
+                return DecodeMimeEncodedWords(nameMatch.Groups[1].Value.Trim());
+
+            return null;
+        }
+
+        /// <summary>
+        /// Replaces cid: references in HTML body with inline data URIs.
+        /// This makes embedded images (logos, signatures) visible in the browser
+        /// without needing a separate download endpoint.
+        ///
+        /// e.g. src="cid:image001@mail" → src="data:image/png;base64,iVBOR..."
+        /// </summary>
+        private string ReplaceCidWithDataUri(string html, List<MailAttachment> attachments)
+        {
+            if (string.IsNullOrEmpty(html) || attachments == null || attachments.Count == 0)
+                return html;
+
+            return Regex.Replace(html, @"cid:([^\s""'>]+)", m =>
+            {
+                string cid = m.Groups[1].Value.Trim();
+
+                // Match by ContentId (with or without angle brackets)
+                var match = attachments.FirstOrDefault(a =>
+                    a.ContentId != null &&
+                    (a.ContentId.Equals(cid, StringComparison.OrdinalIgnoreCase) ||
+                     a.ContentId.Equals($"<{cid}>", StringComparison.OrdinalIgnoreCase)));
+
+                return match?.DataUri ?? m.Value; // replace with data URI or leave as-is
+            }, RegexOptions.IgnoreCase);
+        }
+
         private string InjectImportant(string html)
         {
             if (string.IsNullOrEmpty(html)) return html;
 
-            // Find every style="..." attribute and add !important to each property
             return Regex.Replace(html, @"style=""([^""]*)""", m =>
             {
                 string styleContent = m.Groups[1].Value;
-
-                // Split into individual CSS properties
                 var properties = styleContent.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
-
                 var result = new StringBuilder();
+
                 foreach (var prop in properties)
                 {
-                    string trimmed = prop.Trim();
-                    if (string.IsNullOrEmpty(trimmed)) continue;
+                    string trimmedProp = prop.Trim();
+                    if (string.IsNullOrEmpty(trimmedProp)) continue;
 
-                    // Only add !important if not already there
-                    if (!trimmed.EndsWith("!important", StringComparison.OrdinalIgnoreCase))
-                        result.Append(trimmed + " !important;");
+                    if (!trimmedProp.EndsWith("!important", StringComparison.OrdinalIgnoreCase))
+                        result.Append(trimmedProp + " !important;");
                     else
-                        result.Append(trimmed + ";");
+                        result.Append(trimmedProp + ";");
                 }
 
                 return $"style=\"{result}\"";
             }, RegexOptions.IgnoreCase);
         }
+
         private string DecodePart(string part)
         {
-            if (string.IsNullOrWhiteSpace(part))
-                return string.Empty;
+            if (string.IsNullOrWhiteSpace(part)) return string.Empty;
 
             int bodyIndex = part.IndexOf("\r\n\r\n");
             int separatorLength = 4;
-
-            if (bodyIndex < 0)
-            {
-                bodyIndex = part.IndexOf("\n\n");
-                separatorLength = 2;
-            }
+            if (bodyIndex < 0) { bodyIndex = part.IndexOf("\n\n"); separatorLength = 2; }
 
             string headers = bodyIndex >= 0 ? part.Substring(0, bodyIndex) : "";
             string body = bodyIndex >= 0 ? part.Substring(bodyIndex + separatorLength) : part;
@@ -515,18 +771,11 @@ namespace BNet.IMAP.Mailer
             string charset = GetCharset(headers) ?? "UTF-8";
 
             byte[] bytes;
-
             if (encoding.Contains("base64"))
             {
                 string cleaned = Regex.Replace(body, @"\s", "");
-                try
-                {
-                    bytes = Convert.FromBase64String(cleaned);
-                }
-                catch
-                {
-                    return body;
-                }
+                try { bytes = Convert.FromBase64String(cleaned); }
+                catch { return body; }
             }
             else if (encoding.Contains("quoted-printable"))
             {
@@ -547,23 +796,13 @@ namespace BNet.IMAP.Mailer
         private string HtmlToPlainText(string html)
         {
             if (string.IsNullOrEmpty(html)) return "";
-
             string text = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
             text = Regex.Replace(text, @"<[^>]+>", "", RegexOptions.IgnoreCase);
             text = System.Net.WebUtility.HtmlDecode(text);
-
-            // Remove MIME boundary lines
             text = Regex.Replace(text, @"--[a-f0-9]{20,}.*", "", RegexOptions.IgnoreCase);
-
-            // Remove leftover MIME headers
             text = Regex.Replace(text, @"^Content-\w+:.*$", "", RegexOptions.Multiline | RegexOptions.IgnoreCase);
-
-            // Normalize line endings
             text = text.Replace("\r\n", "\n").Replace("\r", "\n");
-
-            // Remove multiple blank lines
             text = Regex.Replace(text, @"\n{3,}", "\n\n");
-
             return text.Trim();
         }
 
@@ -577,16 +816,122 @@ namespace BNet.IMAP.Mailer
 
         #region Header & Utils
 
+        private string NormalizeSubject(string subject)
+        {
+            if (string.IsNullOrEmpty(subject)) return subject;
+            string normalized = Regex.Replace(subject, @"^\s*(Re|Fwd|Fw)\s*:\s*", "", RegexOptions.IgnoreCase);
+            while (Regex.IsMatch(normalized, @"^\s*(Re|Fwd|Fw)\s*:\s*", RegexOptions.IgnoreCase))
+                normalized = Regex.Replace(normalized, @"^\s*(Re|Fwd|Fw)\s*:\s*", "", RegexOptions.IgnoreCase);
+            return normalized.Trim();
+        }
+
+        private string EscapeImapString(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return input;
+            return input.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        private void ParseFrom(string rawFrom, out string fromName, out string fromEmail)
+        {
+            fromName = null;
+            fromEmail = null;
+
+            if (string.IsNullOrWhiteSpace(rawFrom))
+            {
+                fromName = "?";
+                fromEmail = string.Empty;
+                return;
+            }
+
+            rawFrom = rawFrom.Trim();
+
+            var angleMatch = Regex.Match(rawFrom, @"^""?([^""<]*?)""?\s*<([^>]+)>$");
+            if (angleMatch.Success)
+            {
+                string name = angleMatch.Groups[1].Value.Trim();
+                string email = angleMatch.Groups[2].Value.Trim();
+                fromEmail = email;
+                fromName = string.IsNullOrEmpty(name) ? ExtractLocalPart(email) : name;
+                return;
+            }
+
+            if (Regex.IsMatch(rawFrom, @"^[^@\s]+@[^@\s]+\.[^@\s]+$"))
+            {
+                fromEmail = rawFrom;
+                fromName = ExtractLocalPart(rawFrom);
+                return;
+            }
+
+            fromName = rawFrom;
+            fromEmail = string.Empty;
+        }
+
+        private string ExtractLocalPart(string email)
+        {
+            if (string.IsNullOrEmpty(email)) return "?";
+            int atIndex = email.IndexOf('@');
+            string local = atIndex > 0 ? email.Substring(0, atIndex) : email;
+            return local.Length > 0 ? char.ToUpper(local[0]) + local.Substring(1) : local;
+        }
+
+        private string BuildInitialsSpan(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input)) input = "?";
+
+            var words = input.Trim().Split(new[] { ' ', '.', '_', '-' }, StringSplitOptions.RemoveEmptyEntries);
+            string initials = words.Length >= 2
+                ? $"{words[0][0]}{words[words.Length - 1][0]}"
+                : words[0].Substring(0, Math.Min(2, words[0].Length));
+
+            initials = initials.ToUpper();
+            string color = GetColorForLetter(initials);
+
+            return $"<span class=\"rounded-circle text-white fw-bold d-inline-flex align-items-center justify-content-center flex-shrink-0\" " +
+                   $"style=\"width:34px; height:34px; font-size:.7rem; background-color:{color}\">" +
+                   $"{initials}" +
+                   $"</span>";
+        }
+
+        private string GetColorForLetter(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return "#6c757d";
+            char firstChar = char.ToUpper(input[0]);
+            string[] colors = new[]
+            {
+                "#e74c3c", "#3498db", "#2ecc71", "#f1c40f",
+                "#9b59b6", "#e67e22", "#1abc9c", "#34495e"
+            };
+            return colors[firstChar % colors.Length];
+        }
+
+        private List<string> ParseAddressList(string headerValue)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(headerValue)) return result;
+
+            var addresses = Regex.Split(headerValue, @",(?=(?:[^""]*""[^""]*"")*[^""]*$)");
+            foreach (var addr in addresses)
+            {
+                string trimmed = addr.Trim();
+                if (string.IsNullOrEmpty(trimmed)) continue;
+                var match = Regex.Match(trimmed, @"<([^>]+)>");
+                if (match.Success)
+                    result.Add(match.Groups[1].Value.Trim());
+                else if (Regex.IsMatch(trimmed, @"^[^@\s]+@[^@\s]+\.[^@\s]+$"))
+                    result.Add(trimmed);
+                else
+                    result.Add(trimmed);
+            }
+            return result;
+        }
+
         private string GetRawHeaderValue(string block, string name)
         {
             if (string.IsNullOrEmpty(block)) return null;
 
-            // ✅ Limit block size to headers only — stop at blank line
             int headerEnd = block.IndexOf("\r\n\r\n");
             if (headerEnd < 0) headerEnd = block.IndexOf("\n\n");
             if (headerEnd > 0) block = block.Substring(0, headerEnd);
-
-            // ✅ Hard limit — never parse more than 4KB of headers
             if (block.Length > 4096) block = block.Substring(0, 4096);
 
             var lines = block.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
@@ -595,7 +940,6 @@ namespace BNet.IMAP.Mailer
 
             foreach (var line in lines)
             {
-                // Continuation line (starts with space or tab)
                 if ((line.StartsWith(" ") || line.StartsWith("\t")) && current != null)
                 {
                     current += " " + line.Trim();
@@ -619,7 +963,7 @@ namespace BNet.IMAP.Mailer
                 }
                 else if (current != null)
                 {
-                    return current; // past our header
+                    return current;
                 }
             }
 
@@ -649,13 +993,9 @@ namespace BNet.IMAP.Mailer
 
                 if (headerName.Equals(name, StringComparison.OrdinalIgnoreCase))
                 {
+                    // ✅ Always return full raw value — let ParseFrom / ParseAddressList handle splitting
                     currentHeader = headerValue;
-
-                    var match = Regex.Match(currentHeader, @"<([^>]+)>");
-                    string extracted = match.Success ? match.Groups[1].Value : currentHeader.Trim();
-
-                    bool isValidEmail = Regex.IsMatch(extracted, @"^[^@\s]+@[^@\s]+\.[^@\s]+$");
-                    return isValidEmail ? extracted : currentHeader;
+                    return currentHeader;
                 }
             }
 
@@ -672,19 +1012,14 @@ namespace BNet.IMAP.Mailer
         {
             var match = Regex.Match(response, @"\* SEARCH(.*)", RegexOptions.IgnoreCase);
             if (!match.Success) return new string[0];
-
-            return match.Groups[1].Value
-                .Trim()
-                .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            return match.Groups[1].Value.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
         }
 
         private byte[] DecodeQuotedPrintable(string input)
         {
             if (string.IsNullOrEmpty(input)) return new byte[0];
-
             input = input.Replace("=\r\n", "").Replace("=\n", "");
             var bytes = new List<byte>();
-
             for (int i = 0; i < input.Length; i++)
             {
                 if (input[i] == '=' && i + 2 < input.Length)
@@ -701,7 +1036,6 @@ namespace BNet.IMAP.Mailer
                     bytes.Add((byte)input[i]);
                 }
             }
-
             return bytes.ToArray();
         }
 
@@ -722,7 +1056,6 @@ namespace BNet.IMAP.Mailer
                     var bytes = Convert.FromBase64String(encoded);
                     return Encoding.GetEncoding(charset).GetString(bytes);
                 }
-
                 if (method == "Q")
                 {
                     encoded = encoded.Replace('_', ' ');
@@ -730,7 +1063,6 @@ namespace BNet.IMAP.Mailer
                 }
             }
             catch { }
-
             return input;
         }
 
@@ -738,7 +1070,6 @@ namespace BNet.IMAP.Mailer
         {
             var contentType = GetRawHeaderValue(headers, "Content-Type");
             if (contentType == null) return null;
-
             var match = Regex.Match(contentType, @"charset\s*=\s*[""']?(?<charset>[^;""'\s]+)");
             return match.Success ? match.Groups["charset"].Value : null;
         }
@@ -772,7 +1103,6 @@ namespace BNet.IMAP.Mailer
                     int bytesToRead = int.Parse(literalMatch.Groups[1].Value);
                     Console.WriteLine($"[IMAP] Reading literal {bytesToRead} bytes...");
 
-                    // ✅ Read directly from SslStream as raw bytes — avoids StreamReader stall
                     byte[] rawBuffer = new byte[bytesToRead];
                     int totalRead = 0;
 
@@ -792,11 +1122,9 @@ namespace BNet.IMAP.Mailer
 
                     string literalContent = Encoding.UTF8.GetString(rawBuffer, 0, totalRead);
                     sb.Append(literalContent);
-
                     Console.WriteLine($"[IMAP] Literal read complete: {totalRead} bytes");
 
-                    // Read trailing CRLF
-                    await reader.ReadLineAsync();
+                    await reader.ReadLineAsync(); // trailing CRLF
                 }
 
                 if (line.StartsWith(tag + " "))
