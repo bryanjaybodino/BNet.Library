@@ -25,6 +25,8 @@ namespace BNet.IMAP.Mailer
     }
     public class MailInboxes
     {
+        public int TotalEmail { get; set; }
+        public int TotalPagination { get; set; }
         public string Id { get; set; }
         public string From { get; set; }
         public string Subject { get; set; }
@@ -78,67 +80,130 @@ namespace BNet.IMAP.Mailer
             }
         }
 
-        public enum ImapFlags { ALL, SEEN, UNSEEN, DELETED, UNDELETED }
-        public async Task<List<MailInboxes>> GetInboxAsync(ImapFlags imapFlags = ImapFlags.UNSEEN, string EmailFilter = "", int PageSize = 50, int PageIndex = 0) // <-- new parameter
+        public enum ImapFlags
         {
+            ALL,        // All messages
+            SEEN,       // Read messages
+            UNSEEN,     // Unread messages
+            ANSWERED,   // Replied messages
+            UNANSWERED, // Not replied messages
+            FLAGGED,    // Starred / important messages
+            UNFLAGGED,  // Not starred
+            DELETED,    // Marked for deletion
+            UNDELETED,  // Not marked for deletion
+            DRAFT,      // Draft messages
+            UNDRAFT     // Not drafts
+        }
 
-            // SELECT INBOX
+        public async Task<List<MailInboxes>> GetInboxAsync(
+         string folder = "INBOX",
+         ImapFlags imapFlags = ImapFlags.UNSEEN,
+         string emailFilter = "",
+         int pageSize = 50,
+         int pageIndex = 0)
+        {
+            // Ensure folder name is quoted if it contains spaces
+            string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+
+            // 1️⃣ SELECT FOLDER
             string tagSelect = GetTag();
-            await writer.WriteLineAsync($"{tagSelect} SELECT INBOX");
+            await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
             EnsureOk(await ReadResponseAsync(tagSelect));
 
-            // SEARCH
-            string tagSearch = GetTag();
-
-            // Build the SEARCH command
-            string searchCommand = $"{imapFlags}";
-            if (!string.IsNullOrEmpty(EmailFilter))
+            // 2️⃣ BUILD SEARCH COMMAND
+            string searchCommand = imapFlags.ToString(); // Convert enum to IMAP string
+            if (!string.IsNullOrEmpty(emailFilter))
             {
-                searchCommand = $"FROM \"{EmailFilter}\" {imapFlags}";
+                // Use FROM filter + flags
+                searchCommand = $"FROM \"{emailFilter}\" {imapFlags}";
             }
 
+            // 3️⃣ SEARCH UIDs
+            string tagSearch = GetTag();
             await writer.WriteLineAsync($"{tagSearch} UID SEARCH {searchCommand}");
             string searchResponse = await ReadResponseAsync(tagSearch);
 
             string[] uids = ParseMessageIds(searchResponse);
-
             if (uids.Length == 0)
-                return null;
+                return new List<MailInboxes>();
 
+            // Reverse for most recent first
             Array.Reverse(uids);
 
-            int start = PageIndex * PageSize;
+            // 4️⃣ PAGINATION
+            int totalEmails = uids.Length;
+            int totalPages = (int)Math.Ceiling(totalEmails / (double)pageSize);
 
-            if (start >= uids.Length)
-                return null;
+            int start = pageIndex * pageSize;
+            if (start >= totalEmails)
+                return new List<MailInboxes>();
 
-            var pageUids = uids
-                .Skip(start)
-                .Take(PageSize)
-                .ToArray();
-
+            var pageUids = uids.Skip(start).Take(pageSize).ToArray();
             if (pageUids.Length == 0)
-                return null;
+                return new List<MailInboxes>();
 
-            // FETCH HEADERS IN ONE REQUEST
+            // 5️⃣ FETCH HEADERS
             string uidSet = string.Join(",", pageUids);
-
             string tagFetch = GetTag();
             await writer.WriteLineAsync($"{tagFetch} UID FETCH {uidSet} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])");
-
             string response = await ReadResponseAsync(tagFetch);
+
+            // 6️⃣ PARSE MESSAGES
             List<MailInboxes> mailInboxes = new List<MailInboxes>();
             foreach (var uid in pageUids)
             {
-                var mail = new MailInboxes { Id = uid };
                 string messageBlock = ExtractHeaderFields(response, uid);
-                mail.From = GetHeaderValue(messageBlock, "From");
-                mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject"));
-                mail.Date = ParseDate(GetHeaderValue(messageBlock, "Date"));
+
+                var mail = new MailInboxes
+                {
+                    Id = uid,
+                    From = GetHeaderValue(messageBlock, "From"),
+                    Subject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject")),
+                    Date = ParseDate(GetHeaderValue(messageBlock, "Date")),
+                    TotalEmail = totalEmails,
+                    TotalPagination = totalPages
+                };
+
                 mailInboxes.Add(mail);
             }
+
             return mailInboxes;
         }
+        public async Task<Dictionary<ImapFlags, int>> GetEmailCountsByFlagsAsync(string folder = "INBOX")
+        {
+            // 1️⃣ Quote folder if needed
+            string safeFolder = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+
+            // 2️⃣ Select folder
+            string tagSelect = GetTag();
+            await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolder}");
+            EnsureOk(await ReadResponseAsync(tagSelect));
+
+            // 3️⃣ Prepare dictionary to store counts
+            var counts = new Dictionary<ImapFlags, int>();
+
+            // 4️⃣ Loop through all enum values
+            foreach (ImapFlags flag in Enum.GetValues(typeof(ImapFlags)))
+            {
+                string searchCommand = flag.ToString();
+
+                // Special case: ALL should return all messages
+                if (flag == ImapFlags.ALL)
+                    searchCommand = "ALL";
+
+                string tagSearch = GetTag();
+                await writer.WriteLineAsync($"{tagSearch} UID SEARCH {searchCommand}");
+                string searchResponse = await ReadResponseAsync(tagSearch);
+
+                string[] uids = ParseMessageIds(searchResponse);
+                counts[flag] = uids.Length;
+            }
+
+            return counts;
+        }
+
+
+
         public async Task<MailMessage> GetFullMessageAsync(string id)
         {
             string tagFetch = GetTag();

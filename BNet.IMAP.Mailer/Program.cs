@@ -16,15 +16,46 @@ namespace BNet.IMAP.Mailer
     {
         static async Task Main(string[] args)
         {
-            string userEmail = "no-reply@zionserve.com";
-            string userPassword = "dOUal[vDJjT&Ynp[";
-            string hostname = "mail.zionserve.com";
+            string userEmail = "";
+            string userPassword = "";
+            string hostname = "";
 
             var mail = new MailConfig();
             await mail.ConnectAsync(userEmail, userPassword, hostname);
 
 
-            var inbox = await mail.GetInboxAsync(MailConfig.ImapFlags.UNSEEN,"",10);
+            var inbox = await mail.GetInboxAsync("INBOX", MailConfig.ImapFlags.UNSEEN);
+
+            var count = await mail.GetEmailCountsByFlagsAsync("INBOX");
+
+            int TotalAll = count[MailConfig.ImapFlags.ALL];
+            int TotalSeen = count[MailConfig.ImapFlags.SEEN];
+            int TotalUnseen = count[MailConfig.ImapFlags.UNSEEN];
+            int TotalAnswered = count[MailConfig.ImapFlags.ANSWERED];
+            int TotalUnanswered = count[MailConfig.ImapFlags.UNANSWERED];
+            int TotalFlagged = count[MailConfig.ImapFlags.FLAGGED];
+            int TotalUnflagged = count[MailConfig.ImapFlags.UNFLAGGED];
+            int TotalDeleted = count[MailConfig.ImapFlags.DELETED];
+            int TotalUndeleted = count[MailConfig.ImapFlags.UNDELETED];
+            int TotalDraft = count[MailConfig.ImapFlags.DRAFT];
+            int TotalUndraft = count[MailConfig.ImapFlags.UNDRAFT];
+
+            Console.WriteLine("\n=== Individual Counts ===");
+            Console.WriteLine($"TotalAll: {TotalAll}");
+            Console.WriteLine($"TotalSeen: {TotalSeen}");
+            Console.WriteLine($"TotalUnseen: {TotalUnseen}");
+            Console.WriteLine($"TotalAnswered: {TotalAnswered}");
+            Console.WriteLine($"TotalUnanswered: {TotalUnanswered}");
+            Console.WriteLine($"TotalFlagged: {TotalFlagged}");
+            Console.WriteLine($"TotalUnflagged: {TotalUnflagged}");
+            Console.WriteLine($"TotalDeleted: {TotalDeleted}");
+            Console.WriteLine($"TotalUndeleted: {TotalUndeleted}");
+            Console.WriteLine($"TotalDraft: {TotalDraft}");
+            Console.WriteLine($"TotalUndraft: {TotalUndraft}");
+
+
+
+
 
             //GET ALL FOLDERS
             var folders = await mail.ListMailboxesAsync();
@@ -37,6 +68,8 @@ namespace BNet.IMAP.Mailer
             foreach (var message in inbox)
             {
                 string id = message.Id;
+                Console.WriteLine($"Total: {message.TotalEmail}");
+                Console.WriteLine($"Pagination: {message.TotalPagination}");
                 Console.WriteLine($"From: {message.From}");
                 Console.WriteLine($"Subject: {message.Subject}");
                 Console.WriteLine($"Date: {message.Date}");
