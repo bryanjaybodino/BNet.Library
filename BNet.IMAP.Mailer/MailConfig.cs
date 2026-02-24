@@ -97,10 +97,6 @@ namespace BNet.IMAP.Mailer
         private StreamReader reader;
         private StreamWriter writer;
         private int tagCounter = 1;
-        private string host = "imap.gmail.com";
-        private int port = 993;
-        private string username = "";
-        private string password = "";
         private bool isConnected = true;
         private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
 
@@ -108,13 +104,7 @@ namespace BNet.IMAP.Mailer
         {
             try
             {
-                this.username = username;
-                this.password = password;
-                this.host = host;
-                this.port = port;
-
                 tcpClient = new TcpClient(host, port);
-
                 sslStream = new SslStream(
                     tcpClient.GetStream(),
                     false,
@@ -134,6 +124,45 @@ namespace BNet.IMAP.Mailer
             }
             catch
             {
+                return false;
+            }
+        }
+
+        public async Task<bool> XOAuth2Async(string username, string accessToken, string host = "outlook.office365.com", int port = 993)
+        {
+            try
+            {
+                tcpClient = new TcpClient(host, port);
+                sslStream = new SslStream(
+                    tcpClient.GetStream(),
+                    false,
+                    (sender, cert, chain, errors) => true);
+
+                await sslStream.AuthenticateAsClientAsync(host, null, SslProtocols.Tls12, false);
+
+                reader = new StreamReader(sslStream, Encoding.UTF8, false, 65536);
+                writer = new StreamWriter(sslStream, Encoding.UTF8) { AutoFlush = true };
+
+                // Read server greeting
+                await reader.ReadLineAsync();
+
+                // Build XOAUTH2 string
+                string authString = $"user={username}\x01auth=Bearer {accessToken}\x01\x01";
+                string base64Auth = Convert.ToBase64String(Encoding.ASCII.GetBytes(authString));
+
+                // Send AUTHENTICATE XOAUTH2
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} AUTHENTICATE XOAUTH2 {base64Auth}");
+
+                string response = await ReadResponseAsync(tag);
+                EnsureOk(response);
+
+                isConnected = true;
+                return isConnected;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("❌ XOAUTH2 Connect Failed: " + ex.Message);
                 return false;
             }
         }
