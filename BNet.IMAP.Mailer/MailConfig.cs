@@ -113,13 +113,11 @@ namespace BNet.IMAP.Mailer
                 await sslStream.AuthenticateAsClientAsync(host, null, SslProtocols.Tls12, false);
 
                 reader = new StreamReader(sslStream, Encoding.UTF8, false, 65536);
-                writer = new StreamWriter(sslStream, Encoding.UTF8) { AutoFlush = true };
+                writer = new StreamWriter(sslStream, new UTF8Encoding(false)) { AutoFlush = true };
 
-                await reader.ReadLineAsync(); // server greeting
-
-                string tagLogin = GetTag();
-                await writer.WriteLineAsync($"{tagLogin} LOGIN {username} {password}");
-                EnsureOk(await ReadResponseAsync(tagLogin));
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} LOGIN {username} {password}");
+                EnsureOk(await ReadResponseAsync(tag));
                 return isConnected;
             }
             catch
@@ -141,10 +139,7 @@ namespace BNet.IMAP.Mailer
                 await sslStream.AuthenticateAsClientAsync(host, null, SslProtocols.Tls12, false);
 
                 reader = new StreamReader(sslStream, Encoding.UTF8, false, 65536);
-                writer = new StreamWriter(sslStream, Encoding.UTF8) { AutoFlush = true };
-
-                // Read server greeting
-                await reader.ReadLineAsync();
+                writer = new StreamWriter(sslStream, new UTF8Encoding(false)) { AutoFlush = true };
 
                 // Build XOAUTH2 string
                 string authString = $"user={username}\x01auth=Bearer {accessToken}\x01\x01";
@@ -1132,28 +1127,28 @@ namespace BNet.IMAP.Mailer
                     int bytesToRead = int.Parse(literalMatch.Groups[1].Value);
                     Console.WriteLine($"[IMAP] Reading literal {bytesToRead} bytes...");
 
-                    byte[] rawBuffer = new byte[bytesToRead];
+                    // ✅ Use StreamReader — it owns the internal read buffer, NOT sslStream directly
+                    char[] charBuffer = new char[bytesToRead];
                     int totalRead = 0;
 
                     while (totalRead < bytesToRead)
                     {
                         int remaining = bytesToRead - totalRead;
-                        int chunkSize = Math.Min(65536, remaining);
+                        var readCharsTask = reader.ReadAsync(charBuffer, totalRead, remaining);
 
-                        var readBytesTask = sslStream.ReadAsync(rawBuffer, totalRead, chunkSize);
-                        if (await Task.WhenAny(readBytesTask, Task.Delay(60000)) != readBytesTask)
+                        if (await Task.WhenAny(readCharsTask, Task.Delay(60000)) != readCharsTask)
                             throw new TimeoutException($"Timeout reading literal body at {totalRead}/{bytesToRead}");
 
-                        int r = await readBytesTask;
+                        int r = await readCharsTask;
                         if (r <= 0) break;
                         totalRead += r;
                     }
 
-                    string literalContent = Encoding.UTF8.GetString(rawBuffer, 0, totalRead);
+                    string literalContent = new string(charBuffer, 0, totalRead);
                     sb.Append(literalContent);
-                    Console.WriteLine($"[IMAP] Literal read complete: {totalRead} bytes");
+                    Console.WriteLine($"[IMAP] Literal read complete: {totalRead} chars");
 
-                    await reader.ReadLineAsync(); // trailing CRLF
+                    await reader.ReadLineAsync(); // consume trailing CRLF
                 }
 
                 if (line.StartsWith(tag + " "))

@@ -1,12 +1,12 @@
 ﻿# BNet.IMAP.Mailer
 
-Lightweight, dependency-free IMAP client for .NET to fetch, read, move, and manage emails over secure SSL (supports Gmail and other IMAP servers).
+Lightweight, dependency-free IMAP client for .NET to fetch, read, move, and manage emails over secure SSL (supports Gmail, Outlook, and other IMAP servers).
 
 ---
 
 ## ✨ Features
 
-- 🔐 Secure SSL/TLS IMAP connection
+- 🔐 Secure SSL/TLS IMAP connection (username/password **and** OAuth2/XOAUTH2)
 - 📥 Get unread, seen, deleted, or all messages with pagination
 - 📊 Get email counts by flags (All, Seen, Unseen, Answered, Flagged, Deleted, Draft, etc.)
 - 📄 Fetch full email (HTML + Plain Text)
@@ -18,7 +18,7 @@ Lightweight, dependency-free IMAP client for .NET to fetch, read, move, and mana
 - 🗑 Delete and expunge messages
 - 📂 Move messages to another folder
 - 📋 List all mailboxes
-- ⚡ Async/await support with thread-safe SemaphoreSlim
+- ⚡ Async/await support with thread-safe `SemaphoreSlim`
 - 📦 No third-party IMAP dependencies
 
 ---
@@ -113,10 +113,16 @@ public class MailInboxes
 
 ## 🚀 Quick Start
 
-### Initialize Mail Client
+### Connect (Username / Password)
 ```csharp
 var mail = new MailConfig();
-await mail.ConnectAsync(userEmail, userPassword, hostname);
+bool ok = await mail.ConnectAsync("you@gmail.com", "your-app-password");
+```
+
+### Connect (OAuth2 / XOAUTH2)
+```csharp
+var mail = new MailConfig();
+bool ok = await mail.XOAuth2Async("you@outlook.com", accessToken, "outlook.office365.com");
 ```
 
 ---
@@ -131,7 +137,6 @@ foreach (var message in inbox)
     Console.WriteLine($"Pages:      {message.TotalPagination}");
     Console.WriteLine($"FromName:   {message.FromName}");
     Console.WriteLine($"FromEmail:  {message.FromEmail}");
-    Console.WriteLine($"FromImage:  {message.FromImage}");
     Console.WriteLine($"Subject:    {message.Subject}");
     Console.WriteLine($"Date:       {message.Date}");
     Console.WriteLine($"Folder:     {message.Folder}");
@@ -167,80 +172,64 @@ var filtered = await mail.GetInboxAsync(
 
 ### 📊 Get Email Counts by Flags
 ```csharp
-var count = await mail.GetEmailCountsByFlagsAsync("INBOX");
+var counts = await mail.GetEmailCountsByFlagsAsync("INBOX");
 
-int TotalAll        = count[MailConfig.ImapFlags.ALL];
-int TotalSeen       = count[MailConfig.ImapFlags.SEEN];
-int TotalUnseen     = count[MailConfig.ImapFlags.UNSEEN];
-int TotalAnswered   = count[MailConfig.ImapFlags.ANSWERED];
-int TotalUnanswered = count[MailConfig.ImapFlags.UNANSWERED];
-int TotalFlagged    = count[MailConfig.ImapFlags.FLAGGED];
-int TotalUnflagged  = count[MailConfig.ImapFlags.UNFLAGGED];
-int TotalDeleted    = count[MailConfig.ImapFlags.DELETED];
-int TotalUndeleted  = count[MailConfig.ImapFlags.UNDELETED];
-int TotalDraft      = count[MailConfig.ImapFlags.DRAFT];
-int TotalUndraft    = count[MailConfig.ImapFlags.UNDRAFT];
-
-Console.WriteLine($"TotalAll:        {TotalAll}");
-Console.WriteLine($"TotalSeen:       {TotalSeen}");
-Console.WriteLine($"TotalUnseen:     {TotalUnseen}");
-Console.WriteLine($"TotalAnswered:   {TotalAnswered}");
-Console.WriteLine($"TotalUnanswered: {TotalUnanswered}");
-Console.WriteLine($"TotalFlagged:    {TotalFlagged}");
-Console.WriteLine($"TotalUnflagged:  {TotalUnflagged}");
-Console.WriteLine($"TotalDeleted:    {TotalDeleted}");
-Console.WriteLine($"TotalUndeleted:  {TotalUndeleted}");
-Console.WriteLine($"TotalDraft:      {TotalDraft}");
-Console.WriteLine($"TotalUndraft:    {TotalUndraft}");
+Console.WriteLine($"All:        {counts[MailConfig.ImapFlags.ALL]}");
+Console.WriteLine($"Unread:     {counts[MailConfig.ImapFlags.UNSEEN]}");
+Console.WriteLine($"Read:       {counts[MailConfig.ImapFlags.SEEN]}");
+Console.WriteLine($"Answered:   {counts[MailConfig.ImapFlags.ANSWERED]}");
+Console.WriteLine($"Unanswered: {counts[MailConfig.ImapFlags.UNANSWERED]}");
+Console.WriteLine($"Flagged:    {counts[MailConfig.ImapFlags.FLAGGED]}");
+Console.WriteLine($"Unflagged:  {counts[MailConfig.ImapFlags.UNFLAGGED]}");
+Console.WriteLine($"Deleted:    {counts[MailConfig.ImapFlags.DELETED]}");
+Console.WriteLine($"Undeleted:  {counts[MailConfig.ImapFlags.UNDELETED]}");
+Console.WriteLine($"Draft:      {counts[MailConfig.ImapFlags.DRAFT]}");
+Console.WriteLine($"Undraft:    {counts[MailConfig.ImapFlags.UNDRAFT]}");
 ```
 
-Returns a dictionary keyed by `MailConfig.ImapFlags`, giving you the count of emails matching each flag in the specified mailbox.
+Returns a `Dictionary<ImapFlags, int>` keyed by flag.
 
 ---
 
 ### 📄 Get Full Message
 ```csharp
-var fullMessage = await mail.GetFullMessageAsync("MESSAGE_UID");
+var msg = await mail.GetFullMessageAsync("MESSAGE_UID", "INBOX");
 
-Console.WriteLine($"Id:           {fullMessage.Id}");
-Console.WriteLine($"FromName:     {fullMessage.FromName}");
-Console.WriteLine($"FromEmail:    {fullMessage.FromEmail}");
-Console.WriteLine($"FromImage:    {fullMessage.FromImage}");
-Console.WriteLine($"To:           {string.Join(", ", fullMessage.To)}");
-Console.WriteLine($"CC:           {string.Join(", ", fullMessage.CC)}");
-Console.WriteLine($"BCC:          {string.Join(", ", fullMessage.BCC)}");
-Console.WriteLine($"Subject:      {fullMessage.Subject}");
-Console.WriteLine($"Date:         {fullMessage.Date}");
-Console.WriteLine($"HtmlBody:     {fullMessage.HtmlBody}");
-Console.WriteLine($"PlainText:    {fullMessage.PlainTextBody}");
-Console.WriteLine($"Attachments:  {fullMessage.HasAttachments}");
+Console.WriteLine($"Id:        {msg.Id}");
+Console.WriteLine($"FromName:  {msg.FromName}");
+Console.WriteLine($"FromEmail: {msg.FromEmail}");
+Console.WriteLine($"To:        {string.Join(", ", msg.To)}");
+Console.WriteLine($"CC:        {string.Join(", ", msg.CC)}");
+Console.WriteLine($"Subject:   {msg.Subject}");
+Console.WriteLine($"Date:      {msg.Date:g}");
+Console.WriteLine($"PlainText: {msg.PlainTextBody}");
+Console.WriteLine($"HtmlBody:  {msg.HtmlBody}");
 ```
 
 ---
 
 ### 📎 Working with Attachments
 ```csharp
-var fullMessage = await mail.GetFullMessageAsync("MESSAGE_UID");
+var msg = await mail.GetFullMessageAsync("MESSAGE_UID", "INBOX");
 
-if (fullMessage.HasAttachments)
+if (msg.HasAttachments)
 {
-    foreach (var file in fullMessage.FileAttachments)
+    foreach (var file in msg.FileAttachments)
     {
         Console.WriteLine($"FileName:    {file.FileName}");
         Console.WriteLine($"ContentType: {file.ContentType}");
-        Console.WriteLine($"SizeBytes:   {file.SizeBytes}");
-        Console.WriteLine($"IsInline:    {file.IsInline}");
+        Console.WriteLine($"Size:        {file.SizeBytes / 1024.0:0.0} KB");
 
         // Save to disk
         File.WriteAllBytes(file.FileName, file.Data);
 
-        // Or use DataUri directly in HTML
-        // <a href="@file.DataUri" download="@file.FileName">Download</a>
+        // Or use DataUri directly in HTML: file.DataUri
+        // e.g. <a href="@file.DataUri" download="@file.FileName">Download</a>
     }
 }
 ```
 
-> **Inline images** embedded in `HtmlBody` with `cid:` references are automatically replaced with `data:` URIs — no extra handling needed. Just render `HtmlBody` and images will appear.
+> **Inline images** in `HtmlBody` with `cid:` references are automatically replaced with `data:` URIs — just render `HtmlBody` and images appear with no extra requests.
 
 ---
 
@@ -248,32 +237,26 @@ if (fullMessage.HasAttachments)
 ```csharp
 var thread = await mail.GetThreadAsync("MESSAGE_UID", "INBOX");
 
-// Primary email (header info)
-Console.WriteLine($"Id:        {thread.Id}");
-Console.WriteLine($"FromName:  {thread.FromName}");
-Console.WriteLine($"FromEmail: {thread.FromEmail}");
-Console.WriteLine($"Subject:   {thread.Subject}");
-Console.WriteLine($"Date:      {thread.Date}");
+// Primary email (header info — use GetFullMessageAsync for body + attachments)
+Console.WriteLine($"Subject: {thread.Subject}");
+Console.WriteLine($"From:    {thread.FromName} <{thread.FromEmail}>");
+Console.WriteLine($"Date:    {thread.Date:g}");
+Console.WriteLine($"Replies: {thread.Submail?.Count ?? 0}");
 
-// Related emails in thread — full MailMessage with body + attachments
-Console.WriteLine($"Thread count: {thread.Submail.Count}");
-
-foreach (var reply in thread.Submail)
+// Thread replies — already full MailMessage with body + attachments
+foreach (var reply in thread.Submail ?? new())
 {
-    Console.WriteLine($"--- Reply ---");
-    Console.WriteLine($"FromName:  {reply.FromName}");
-    Console.WriteLine($"FromEmail: {reply.FromEmail}");
-    Console.WriteLine($"Date:      {reply.Date}");
-    Console.WriteLine($"Subject:   {reply.Subject}");
-    Console.WriteLine($"HtmlBody:  {reply.HtmlBody}");
+    Console.WriteLine($"  [{reply.Id}] {reply.Subject}");
+    Console.WriteLine($"         From: {reply.FromName} <{reply.FromEmail}>");
+    Console.WriteLine($"         Date: {reply.Date:g}");
 
     if (reply.HasAttachments)
-    {
         foreach (var file in reply.FileAttachments)
-            Console.WriteLine($"  Attachment: {file.FileName} ({file.SizeBytes / 1024}kb)");
-    }
+            Console.WriteLine($"   Attachment: {file.FileName} ({file.SizeBytes / 1024.0:0.0} KB)");
 }
 ```
+
+> **Note:** `GetThreadAsync` returns the primary email as `MailInboxes` (headers only). Call `GetFullMessageAsync` separately for its body and attachments.
 
 Thread subject normalization — all of the below map to the same thread:
 
@@ -318,15 +301,13 @@ await mail.MoveToFolderAsync("MESSAGE_UID", "[Gmail]/All Mail");
 ```csharp
 var folders = await mail.ListMailboxesAsync();
 foreach (var folder in folders)
-{
     Console.WriteLine(folder);
-    // INBOX
-    // [Gmail]/Sent Mail
-    // [Gmail]/Trash
-    // [Gmail]/All Mail
-    // [Gmail]/Drafts
-    // [Gmail]/Starred
-}
+// INBOX
+// [Gmail]/Sent Mail
+// [Gmail]/Trash
+// [Gmail]/All Mail
+// [Gmail]/Drafts
+// [Gmail]/Starred
 ```
 
 ---
@@ -356,116 +337,123 @@ await mail.Logout();
 
 ---
 
-## 🌐 WebForms Usage
+## 💻 Sample Console App
 
-### Display Inbox
+A complete working example covering every feature.
 
-**.aspx**
-```aspx
-<asp:Repeater ID="rptInbox" runat="server">
-    <ItemTemplate>
-        <%# Eval("FromImage") %>
-        <strong><%# Eval("FromName") %></strong>
-        <span><%# Eval("Subject") %></span>
-        <small><%# Eval("Date") %></small>
-    </ItemTemplate>
-</asp:Repeater>
-```
-
-**.aspx.cs**
 ```csharp
-protected async void Page_Load(object sender, EventArgs e)
+using BNet.IMAP.Mailer;
+
+using var mail = new MailConfig();
+bool ok = await mail.ConnectAsync("you@gmail.com", "your-app-password");
+if (!ok) { Console.WriteLine("Connection failed."); return; }
+Console.WriteLine("Connected.\n");
+
+// ── List mailboxes ────────────────────────────────────────────────────────────
+Console.WriteLine("=== Mailboxes ===");
+var folders = await mail.ListMailboxesAsync();
+foreach (var f in folders)
+    Console.WriteLine($"  {f}");
+
+// ── Counts by flag ────────────────────────────────────────────────────────────
+Console.WriteLine("\n=== Counts ===");
+var counts = await mail.GetEmailCountsByFlagsAsync("INBOX");
+Console.WriteLine($"  All:     {counts[MailConfig.ImapFlags.ALL]}");
+Console.WriteLine($"  Unread:  {counts[MailConfig.ImapFlags.UNSEEN]}");
+Console.WriteLine($"  Read:    {counts[MailConfig.ImapFlags.SEEN]}");
+Console.WriteLine($"  Flagged: {counts[MailConfig.ImapFlags.FLAGGED]}");
+Console.WriteLine($"  Deleted: {counts[MailConfig.ImapFlags.DELETED]}");
+Console.WriteLine($"  Draft:   {counts[MailConfig.ImapFlags.DRAFT]}");
+
+// ── Inbox (page 1, 10 per page, unread only) ──────────────────────────────────
+Console.WriteLine("\n=== Inbox (Unread, Page 1) ===");
+var inbox = await mail.GetInboxAsync("INBOX", MailConfig.ImapFlags.UNSEEN, pageSize: 10, pageIndex: 0);
+Console.WriteLine($"  Total emails : {(inbox.Count > 0 ? inbox[0].TotalEmail : 0)}");
+Console.WriteLine($"  Total pages  : {(inbox.Count > 0 ? inbox[0].TotalPagination : 0)}\n");
+
+foreach (var msg in inbox)
 {
-    if (!IsPostBack)
-    {
-        var mail = new MailConfig();
-        await mail.ConnectAsync("you@gmail.com", "app-password");
-
-        var inbox = await mail.GetInboxAsync("INBOX", MailConfig.ImapFlags.UNSEEN);
-        rptInbox.DataSource = inbox;
-        rptInbox.DataBind();
-
-        await mail.Logout();
-    }
+    Console.WriteLine($"  [{msg.Id}] {msg.Subject}");
+    Console.WriteLine($"         From : {msg.FromName} <{msg.FromEmail}>");
+    Console.WriteLine($"         Date : {msg.Date:g}");
+    Console.WriteLine($"       Folder : {msg.Folder}");
+    Console.WriteLine();
 }
-```
 
----
-
-### Display Full Email
-
-**.aspx**
-```aspx
-<asp:Literal ID="litAvatar"  runat="server" />
-<asp:Literal ID="litSubject" runat="server" />
-<asp:Literal ID="litBody"    runat="server" />
-
-<asp:Repeater ID="rptAttachments" runat="server">
-    <ItemTemplate>
-        <a href='DownloadAttachment.ashx?uid=<%# Request.QueryString["uid"] %>&index=<%# Container.ItemIndex %>'>
-            <%# Eval("FileName") %> (<%# ((long)Eval("SizeBytes") / 1024) %>kb)
-        </a>
-    </ItemTemplate>
-</asp:Repeater>
-```
-
-**.aspx.cs**
-```csharp
-protected async void Page_Load(object sender, EventArgs e)
+// ── Full message + attachments ────────────────────────────────────────────────
+if (inbox.Count > 0)
 {
-    if (!IsPostBack)
+    string uid = inbox[0].Id;
+
+    Console.WriteLine($"=== Full Message (UID {uid}) ===");
+    var full = await mail.GetFullMessageAsync(uid, "INBOX");
+
+    Console.WriteLine($"  Subject    : {full.Subject}");
+    Console.WriteLine($"  From       : {full.FromName} <{full.FromEmail}>");
+    Console.WriteLine($"  To         : {string.Join(", ", full.To ?? new List<string>())}");
+    Console.WriteLine($"  CC         : {string.Join(", ", full.CC ?? new List<string>())}");
+    Console.WriteLine($"  Date       : {full.Date:g}");
+    Console.WriteLine($"  PlainText  : {full.PlainTextBody?[..Math.Min(200, full.PlainTextBody?.Length ?? 0)]}...");
+    Console.WriteLine($"  Attachments: {full.FileAttachments?.Count ?? 0}");
+
+    if (full.HasAttachments)
     {
-        string uid  = Request.QueryString["uid"];
-        var mail    = new MailConfig();
-        await mail.ConnectAsync("you@gmail.com", "app-password");
-
-        var full = await mail.GetFullMessageAsync(uid, "INBOX");
-        await mail.MarkAsSeenAsync(uid);
-        await mail.Logout();
-
-        // Store in session for download handler
-        Session[$"attachments_{uid}"] = full.FileAttachments;
-
-        litAvatar.Text  = full.FromImage;
-        litSubject.Text = full.Subject;
-        litBody.Text    = full.HtmlBody;
-
-        rptAttachments.DataSource = full.FileAttachments
-            .Select((a, i) => new { a.FileName, a.SizeBytes, Index = i }).ToList();
-        rptAttachments.DataBind();
-    }
-}
-```
-
----
-
-### Download Attachment Handler
-
-**DownloadAttachment.ashx**
-```csharp
-public class DownloadAttachment : IHttpHandler
-{
-    public void ProcessRequest(HttpContext context)
-    {
-        string uid = context.Request.QueryString["uid"];
-        int index  = int.Parse(context.Request.QueryString["index"] ?? "0");
-
-        var attachments = context.Session[$"attachments_{uid}"] as List<MailAttachment>;
-        if (attachments == null || index >= attachments.Count)
+        Console.WriteLine("\n  --- Attachments ---");
+        foreach (var file in full.FileAttachments)
         {
-            context.Response.StatusCode = 404;
-            return;
+            Console.WriteLine($"    {file.FileName}  ({file.SizeBytes / 1024.0:0.0} KB)  [{file.ContentType}]");
+            File.WriteAllBytes(file.FileName, file.Data);
+            Console.WriteLine($"    Saved → {file.FileName}");
         }
-
-        var file = attachments[index];
-        context.Response.ContentType = file.ContentType;
-        context.Response.AddHeader("Content-Disposition", $"attachment; filename=\"{file.FileName}\"");
-        context.Response.BinaryWrite(file.Data);
-        context.Response.End();
     }
 
-    public bool IsReusable => false;
+    // ── Mark as read ──────────────────────────────────────────────────────
+    await mail.MarkAsSeenAsync(uid);
+    Console.WriteLine($"\n  Marked UID {uid} as read.");
+
+    // ── Thread ────────────────────────────────────────────────────────────
+    Console.WriteLine($"\n=== Thread for UID {uid} ===");
+    var thread = await mail.GetThreadAsync(uid, "INBOX");
+    Console.WriteLine($"  Subject : {thread.Subject}");
+    Console.WriteLine($"  Replies : {thread.Submail?.Count ?? 0}");
+
+    foreach (var reply in thread.Submail ?? new List<MailMessage>())
+    {
+        Console.WriteLine($"\n    [{reply.Id}] {reply.Subject}");
+        Console.WriteLine($"           From : {reply.FromName} <{reply.FromEmail}>");
+        Console.WriteLine($"           Date : {reply.Date:g}");
+
+        if (reply.HasAttachments)
+            foreach (var f in reply.FileAttachments)
+                Console.WriteLine($"     Attachment : {f.FileName} ({f.SizeBytes / 1024.0:0.0} KB)");
+    }
+
+    // ── Move (uncomment to use) ───────────────────────────────────────────
+    // await mail.MoveToFolderAsync(uid, "[Gmail]/All Mail");
+    // Console.WriteLine($"Moved UID {uid} to All Mail.");
+
+    // ── Delete (uncomment to use) ─────────────────────────────────────────
+    // await mail.DeleteMessageAsync(uid);
+    // Console.WriteLine($"Deleted UID {uid}.");
 }
+
+await mail.Logout();
+Console.WriteLine("\nLogged out.");
+```
+
+---
+
+### OAuth2 / XOAUTH2 (Outlook / Microsoft 365)
+
+```csharp
+using var mail = new MailConfig();
+bool ok = await mail.XOAuth2Async("you@outlook.com", accessToken, "outlook.office365.com");
+if (!ok) { Console.WriteLine("OAuth2 connection failed."); return; }
+
+var inbox = await mail.GetInboxAsync("INBOX", MailConfig.ImapFlags.UNSEEN);
+// ... same API as above
+
+await mail.Logout();
 ```
 
 ---
@@ -474,9 +462,20 @@ public class DownloadAttachment : IHttpHandler
 
 - Ensure IMAP is enabled in your email provider settings.
 - For Gmail, use an **App Password** if 2FA is enabled. Generate one at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
-- Default connection uses SSL on port 993.
-- `MailConfig` is thread-safe — a single instance serializes all async calls via `SemaphoreSlim`.
-- Always call `Logout()` when done to cleanly close the connection.
+- Default connection uses SSL on port **993**.
+- `MailConfig` is **thread-safe** — a single instance serializes all async calls via `SemaphoreSlim`.
+- The `StreamWriter` uses **UTF-8 without BOM** internally. This is required for IMAP protocol compliance — servers reject commands that begin with a byte-order mark.
+- Literal message bodies are read via `StreamReader` (not the raw `SslStream`) to avoid timeouts caused by internal read-ahead buffering.
+
+---
+
+## 🐛 Known Issues Fixed
+
+| Issue | Fix |
+|---|---|
+| `TimeoutException: Timeout reading literal body at 0/N` | Literal bodies now read from `StreamReader.ReadAsync` instead of `SslStream.ReadAsync`. The `StreamReader` buffers ahead; reading from the raw stream would find 0 bytes and stall. |
+| `BAD invalid tag` on first command | `StreamWriter` now uses `new UTF8Encoding(false)` (no BOM). The default `Encoding.UTF8` emits a 3-byte BOM (`0xEF 0xBB 0xBF`) before the first command, which the IMAP server cannot parse as a tag. |
+| MIME encoded display names not decoded (e.g. `=?UTF-8?B?...?=`) | `ParseFrom` now calls `DecodeMimeEncodedWords` before parsing, and `DecodeMimeEncodedWords` handles multiple encoded-word tokens in a single header. |
 
 ---
 
