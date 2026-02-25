@@ -1,12 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
-using System.Security.Cryptography;
+// X509Certificates not needed - removed with SslClientAuthenticationOptions
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -15,218 +14,293 @@ using System.Threading.Tasks;
 namespace BNet.IMAP.Mailer
 {
     // ─────────────────────────────────────────────────────────────────────────
-    //  ATTACHMENT  — one file extracted from a multipart email
+    //  MAIL CONFIG  — full IMAP client
+    //
+    //  Features:
+    //    • SSL/TLS with proper certificate validation
+    //    • XOAUTH2 (Office 365, Gmail)
+    //    • CAPABILITY negotiation
+    //    • BODYSTRUCTURE-based selective fetch (bandwidth-efficient)
+    //    • IDLE push notifications (RFC 2177)
+    //    • Full attachment + inline image extraction
+    //    • Thread-safe SemaphoreSlim lock
+    //    • Auto-reconnect
+    //    • Create/Delete/Rename folders
+    //    • Full flag management (Seen, Flagged, Answered, Deleted, Draft)
+    //    • Move / Copy messages
+    //    • Fluent search queries
+    //    • Pagination
+    //    • Initials avatar builder
     // ─────────────────────────────────────────────────────────────────────────
-    public class MailAttachment
+    public class MailConfig : IDisposable
     {
-        public string FileName { get; set; }       // "invoice.pdf"
-        public string ContentType { get; set; }    // "application/pdf"
-        public string ContentId { get; set; }      // inline CID reference e.g. "image001@mail" (may be null)
-        public bool IsInline { get; set; }         // true = embedded image in HTML body
-        public long SizeBytes { get; set; }        // decoded file size
-        public byte[] Data { get; set; }           // raw decoded bytes — use to download/save
-
-        // Convenience: base64 string ready for <img src="data:..."> or <a download>
-        public string Base64Data => Data != null ? Convert.ToBase64String(Data) : null;
-
-        // Convenience: data URI ready to embed directly in HTML
-        public string DataUri => Data != null ? $"data:{ContentType};base64,{Base64Data}" : null;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  MAIL MESSAGE  — full email with body + attachments
-    // ─────────────────────────────────────────────────────────────────────────
-    public class MailMessage
-    {
-        public List<string> To { get; set; }
-        public List<string> CC { get; set; }
-        public List<string> BCC { get; set; }
-        public List<string> Flags { get; set; } = new List<string>();
-        public string Id { get; set; }
-
-        // From broken into 3 parts
-        public string From { get; set; }      // raw original header value
-        public string FromName { get; set; }  // "John Doe"  (falls back to email local part if no display name)
-        public string FromEmail { get; set; } // "john@example.com"
-        public string FromImage { get; set; } // ready-to-render <span> initials avatar
-
-        public string Subject { get; set; }
-        public DateTime Date { get; set; }
-        public string HtmlBody { get; set; }
-        public string PlainTextBody { get; set; }
-
-        // ✅ Attachments — both inline (embedded images) and regular file attachments
-        public List<MailAttachment> Attachments { get; set; } = new List<MailAttachment>();
-
-        // Convenience shortcuts
-        public List<MailAttachment> FileAttachments => Attachments?.Where(a => !a.IsInline).ToList();
-        public List<MailAttachment> InlineAttachments => Attachments?.Where(a => a.IsInline).ToList();
-        public bool HasAttachments => FileAttachments?.Count > 0;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  MAIL INBOXES  — lightweight list-view entry (headers only, no body)
-    // ─────────────────────────────────────────────────────────────────────────
-    public class MailInboxes
-    {
-        public int TotalEmail { get; set; }
-        public int TotalPagination { get; set; }
-        public List<string> To { get; set; }
-        public List<string> CC { get; set; }
-        public List<string> BCC { get; set; }
-        public List<string> Flags { get; set; }
-        public string Id { get; set; }
-
-        // From broken into 3 parts
-        public string From { get; set; }
-        public string FromName { get; set; }
-        public string FromEmail { get; set; }
-        public string FromImage { get; set; }
-
-        public string Subject { get; set; }
-        public string Folder { get; set; }
-        public DateTime Date { get; set; }
-
-        // Thread: other emails in the same conversation (same normalized subject)
-        public List<MailMessage> Submail { get; set; }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  MAIL CONFIG  — IMAP client
-    // ─────────────────────────────────────────────────────────────────────────
-    public class MailConfig
-    {
-        private TcpClient tcpClient;
-        private SslStream sslStream;
-        private StreamReader reader;
-        private StreamWriter writer;
-        private int tagCounter = 1;
-        private bool isConnected = true;
+        // ── State ─────────────────────────────────────────────────────────────
+        private TcpClient _tcp;
+        private SslStream _ssl;
+        private StreamReader _reader;
+        private StreamWriter _writer;
+        private int _tag = 1;
         private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
+        private HashSet<string> _capabilities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        public async Task<bool> ConnectAsync(string username, string password, string host = "imap.gmail.com", int port = 993)
+        private string _host;
+        private int _port;
+        private string _username;
+        private string _password;
+        private string _accessToken;
+        private AuthMethod _authMethod;
+        private bool _validateCertificate = true;
+
+        private CancellationTokenSource _idleCts;
+        private Task _idleTask;
+
+        public bool IsConnected { get; private set; }
+
+        public enum AuthMethod { Plain, XOAuth2 }
+
+        // ── Events ────────────────────────────────────────────────────────────
+        /// <summary>
+        /// Fired when a new message arrives in the monitored folder.
+        /// The event args contain the full MailMessage so you can read
+        /// From, Subject, Body, Attachments immediately.
+        /// </summary>
+        public event Func<NewMailEventArgs, Task> OnNewMailAsync;
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  CONNECT  — plain LOGIN
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> ConnectAsync(
+            string username,
+            string password,
+            string host = "imap.gmail.com",
+            int port = 993,
+            bool validateSslCert = true,
+            CancellationToken ct = default)
         {
-            try
-            {
-                tcpClient = new TcpClient(host, port);
-                sslStream = new SslStream(
-                    tcpClient.GetStream(),
-                    false,
-                    (sender, cert, chain, errors) => true);
+            _host = host;
+            _port = port;
+            _username = username;
+            _password = password;
+            _authMethod = AuthMethod.Plain;
+            _validateCertificate = validateSslCert;
 
-                await sslStream.AuthenticateAsClientAsync(host, null, SslProtocols.Tls12, false);
-
-                reader = new StreamReader(sslStream, Encoding.UTF8, false, 65536);
-                writer = new StreamWriter(sslStream, new UTF8Encoding(false)) { AutoFlush = true };
-
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} LOGIN {username} {password}");
-                EnsureOk(await ReadResponseAsync(tag));
-                return isConnected;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        public async Task<bool> XOAuth2Async(string username, string accessToken, string host = "outlook.office365.com", int port = 993)
-        {
-            try
-            {
-                tcpClient = new TcpClient(host, port);
-                sslStream = new SslStream(
-                    tcpClient.GetStream(),
-                    false,
-                    (sender, cert, chain, errors) => true);
-
-                await sslStream.AuthenticateAsClientAsync(host, null, SslProtocols.Tls12, false);
-
-                reader = new StreamReader(sslStream, Encoding.UTF8, false, 65536);
-                writer = new StreamWriter(sslStream, new UTF8Encoding(false)) { AutoFlush = true };
-
-                // Build XOAUTH2 string
-                string authString = $"user={username}\x01auth=Bearer {accessToken}\x01\x01";
-                string base64Auth = Convert.ToBase64String(Encoding.ASCII.GetBytes(authString));
-
-                // Send AUTHENTICATE XOAUTH2
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} AUTHENTICATE XOAUTH2 {base64Auth}");
-
-                string response = await ReadResponseAsync(tag);
-                EnsureOk(response);
-
-                isConnected = true;
-                return isConnected;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("❌ XOAUTH2 Connect Failed: " + ex.Message);
-                return false;
-            }
-        }
-
-        public enum ImapFlags
-        {
-            ALL, SEEN, UNSEEN, ANSWERED, UNANSWERED,
-            FLAGGED, UNFLAGGED, DELETED, UNDELETED, DRAFT, UNDRAFT
+            return await ConnectCoreAsync(ct);
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  GET INBOX  (list view — headers only, no body)
+        //  CONNECT  — XOAUTH2 (Office 365 / Gmail OAuth)
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> XOAuth2Async(
+            string username,
+            string accessToken,
+            string host = "outlook.office365.com",
+            int port = 993,
+            bool validateSslCert = true,
+            CancellationToken ct = default)
+        {
+            _host = host;
+            _port = port;
+            _username = username;
+            _accessToken = accessToken;
+            _authMethod = AuthMethod.XOAuth2;
+            _validateCertificate = validateSslCert;
+
+            return await ConnectCoreAsync(ct);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  CORE CONNECT
+        // ─────────────────────────────────────────────────────────────────────
+        private async Task<bool> ConnectCoreAsync(CancellationToken ct)
+        {
+            try
+            {
+                _tcp = new TcpClient();
+                await _tcp.ConnectAsync(_host, _port);
+
+                _ssl = new SslStream(
+                    _tcp.GetStream(),
+                    false,
+                    (sender, cert, chain, errors) =>
+                        _validateCertificate ? errors == SslPolicyErrors.None : true);
+
+                await _ssl.AuthenticateAsClientAsync(_host, null, SslProtocols.Tls12, false);
+
+                _reader = new StreamReader(_ssl, new UTF8Encoding(false), false, 65536);
+                _writer = new StreamWriter(_ssl, new UTF8Encoding(false)) { AutoFlush = true };
+
+                // Read greeting
+                string greeting = await ReadLineAsync(ct);
+                Console.WriteLine($"[IMAP] {greeting}");
+
+                if (greeting.IndexOf("OK", StringComparison.OrdinalIgnoreCase) < 0)
+                    return false;
+
+                // Negotiate capabilities
+                await NegotiateCapabilitiesAsync(ct);
+
+                // Authenticate
+                if (_authMethod == AuthMethod.XOAuth2)
+                    await AuthenticateXOAuth2Async(ct);
+                else
+                    await AuthenticatePlainAsync(ct);
+
+                IsConnected = true;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Connect failed: {ex.Message}");
+                IsConnected = false;
+                return false;
+            }
+        }
+
+        private async Task NegotiateCapabilitiesAsync(CancellationToken ct)
+        {
+            string tag = Tag();
+            await SendAsync($"{tag} CAPABILITY", ct);
+            var resp = await ReadTaggedAsync(tag, ct);
+            foreach (var line in resp.Lines)
+            {
+                var m = Regex.Match(line, @"^\* CAPABILITY (.+)$", RegexOptions.IgnoreCase);
+                if (!m.Success) continue;
+                foreach (var cap in m.Groups[1].Value.Split(' '))
+                    _capabilities.Add(cap.Trim());
+            }
+        }
+
+        private async Task AuthenticatePlainAsync(CancellationToken ct)
+        {
+            string tag = Tag();
+            await SendAsync($"{tag} LOGIN {_username} {_password}", ct);
+            var resp = await ReadTaggedAsync(tag, ct);
+            resp.ThrowIfFailed("LOGIN");
+        }
+
+        private async Task AuthenticateXOAuth2Async(CancellationToken ct)
+        {
+            string authStr = $"user={_username}\x01auth=Bearer {_accessToken}\x01\x01";
+            string b64 = Convert.ToBase64String(Encoding.ASCII.GetBytes(authStr));
+            string tag = Tag();
+            await SendAsync($"{tag} AUTHENTICATE XOAUTH2 {b64}", ct);
+            var resp = await ReadTaggedAsync(tag, ct);
+            resp.ThrowIfFailed("XOAUTH2");
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  AUTO-RECONNECT
+        // ─────────────────────────────────────────────────────────────────────
+        private async Task<bool> EnsureConnectedAsync(CancellationToken ct)
+        {
+            if (IsConnected && await NoOpAsync(ct)) return true;
+            Console.WriteLine("[IMAP] Reconnecting…");
+            IsConnected = false;
+            return await ConnectCoreAsync(ct);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  NOOP  — keep-alive / connectivity check
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> NoOpAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                string tag = Tag();
+                await SendAsync($"{tag} NOOP", ct);
+                var resp = await ReadTaggedAsync(tag, ct);
+                return resp.IsOk;
+            }
+            catch { return false; }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  LOGOUT
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task LogoutAsync(CancellationToken ct = default)
+        {
+            await StopIdleAsync();
+            await _lock.WaitAsync(ct);
+            try
+            {
+                if (_writer != null)
+                {
+                    string tag = Tag();
+                    await SendAsync($"{tag} LOGOUT", ct);
+                    await ReadTaggedAsync(tag, ct);
+                }
+            }
+            catch { }
+            finally
+            {
+                _lock.Release();
+                Cleanup();
+            }
+        }
+
+        private void Cleanup()
+        {
+            IsConnected = false;
+            if (_reader != null) { _reader.Dispose(); _reader = null; }
+            if (_writer != null) { _writer.Dispose(); _writer = null; }
+            if (_ssl != null) { _ssl.Dispose(); _ssl = null; }
+            _tcp = null;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  GET INBOX  — paginated list with BODYSTRUCTURE-based has-attachment flag
         // ─────────────────────────────────────────────────────────────────────
         public async Task<List<MailInboxes>> GetInboxAsync(
             string folder = "INBOX",
             ImapFlags imapFlags = ImapFlags.UNSEEN,
             string emailFilter = "",
             int pageSize = 50,
-            int pageIndex = 0)
+            int pageIndex = 0,
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(folder, ct);
 
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
+                string search = BuildFlagSearch(imapFlags, emailFilter);
+                string[] uids = await SearchAsync(search, ct);
 
-                string searchCommand = imapFlags.ToString();
-                if (!string.IsNullOrEmpty(emailFilter))
-                    searchCommand = $"FROM \"{emailFilter}\" {imapFlags}";
-
-                string tagSearch = GetTag();
-                await writer.WriteLineAsync($"{tagSearch} UID SEARCH {searchCommand}");
-                string searchResponse = await ReadResponseAsync(tagSearch);
-
-                string[] uids = ParseMessageIds(searchResponse);
                 if (uids.Length == 0) return new List<MailInboxes>();
-
                 Array.Reverse(uids);
 
-                int totalEmails = uids.Length;
-                int totalPages = (int)Math.Ceiling(totalEmails / (double)pageSize);
+                int total = uids.Length;
+                int totalPages = (int)Math.Ceiling(total / (double)pageSize);
                 int start = pageIndex * pageSize;
-
-                if (start >= totalEmails) return new List<MailInboxes>();
+                if (start >= total) return new List<MailInboxes>();
 
                 var pageUids = uids.Skip(start).Take(pageSize).ToArray();
-                if (pageUids.Length == 0) return new List<MailInboxes>();
-
                 string uidSet = string.Join(",", pageUids);
-                string tagFetch = GetTag();
-                await writer.WriteLineAsync( $"{tagFetch} UID FETCH {uidSet} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])");
-                string response = await ReadResponseAsync(tagFetch);
 
-                var mailInboxes = new List<MailInboxes>();
-                foreach (var uid in pageUids)
+                // Fetch headers + FLAGS in one round-trip
+                string tagH = Tag();
+                await SendAsync(
+                    $"{tagH} UID FETCH {uidSet} (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE MESSAGE-ID)])", ct);
+                var headerResp = await ReadTaggedAsync(tagH, ct);
+
+                var result = new List<MailInboxes>();
+                foreach (string uid in pageUids)
                 {
-                    string messageBlock = ExtractHeaderFields(response, uid);
-                    string rawFrom = GetHeaderValue(messageBlock, "From");
+                    string block = ExtractFetchBlock(headerResp.Raw, uid);
+                    if (string.IsNullOrEmpty(block)) continue;
 
-                    ParseFrom(rawFrom, out string fromName, out string fromEmail);
+                    string rawHeaders = ExtractLiteralFromBlock(block, "HEADER.FIELDS");
+                    var headers = HeaderParser.Parse(rawHeaders);
 
-                    var mail = new MailInboxes
+                    string rawFrom = HeaderParser.GetRaw(headers, "From");
+                    AddressParser.ParseSingle(rawFrom, out string fromName, out string fromEmail);
+
+                    string bsRaw = ExtractField(block, "BODYSTRUCTURE");
+                    BodyPart bs = string.IsNullOrEmpty(bsRaw) ? null : BodyStructureParser.Parse(bsRaw);
+                    bool hasAtt = bs != null && BodyStructureParser.Flatten(bs).Any(p => p.IsAttachment);
+
+                    result.Add(new MailInboxes
                     {
                         Id = uid,
                         Folder = folder,
@@ -234,68 +308,70 @@ namespace BNet.IMAP.Mailer
                         FromName = fromName,
                         FromEmail = fromEmail,
                         FromImage = BuildInitialsSpan(fromName ?? fromEmail),
-                        To = ParseAddressList(GetHeaderValue(messageBlock, "To")),
-                        CC = ParseAddressList(GetHeaderValue(messageBlock, "CC")),
-                        BCC = ParseAddressList(GetHeaderValue(messageBlock, "BCC")),
-                        Subject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject")),
-                        Date = (DateTime)ParseDate(GetHeaderValue(messageBlock, "Date")),
-                        Flags = ExtractFlags(response, uid),
-                        TotalEmail = totalEmails,
+                        To = AddressParser.ParseList(HeaderParser.GetRaw(headers, "To")),
+                        CC = AddressParser.ParseList(HeaderParser.GetRaw(headers, "CC")),
+                        BCC = AddressParser.ParseList(HeaderParser.GetRaw(headers, "BCC")),
+                        Subject = HeaderParser.Get(headers, "Subject"),
+                        Date = MimeDecoder.ParseDate(HeaderParser.GetRaw(headers, "Date")) ?? DateTime.MinValue,
+                        Flags = ExtractFlagsFromBlock(block),
+                        HasAttachment = hasAtt,
+                        TotalEmail = total,
                         TotalPagination = totalPages,
                         Submail = new List<MailMessage>()
-                    };
-
-                    mailInboxes.Add(mail);
+                    });
                 }
 
-                return mailInboxes;
+                return result;
             }
-            finally
-            {
-                _lock.Release();
-            }
+            finally { _lock.Release(); }
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  GET FULL MESSAGE  (single email with full body + attachments)
+        //  GET FULL MESSAGE  — uses BODYSTRUCTURE to fetch only needed parts
         // ─────────────────────────────────────────────────────────────────────
-        public async Task<MailMessage> GetFullMessageAsync(string id, string folder = "INBOX")
+        public async Task<MailMessage> GetFullMessageAsync(
+            string id,
+            string folder = "INBOX",
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                return await FetchFullMessageInternalAsync(id, folder);
+                await EnsureConnectedAsync(ct);
+                return await FetchFullMessageAsync(id, folder, false, ct);
             }
-            finally
-            {
-                _lock.Release();
-            }
+            finally { _lock.Release(); }
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  GET THREAD  (email + all related emails in same conversation)
+        //  GET THREAD
         // ─────────────────────────────────────────────────────────────────────
-        public async Task<MailInboxes> GetThreadAsync(string id, string folder = "INBOX")
+        public async Task<MailInboxes> GetThreadAsync(
+            string id,
+            string folder = "INBOX",
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(folder, ct);
 
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
+                // Fetch primary headers
+                string tagH = Tag();
+                await SendAsync(
+                    $"{tagH} UID FETCH {id} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])", ct);
+                var hResp = await ReadTaggedAsync(tagH, ct);
 
-                string tagFetch = GetTag();
-                await writer.WriteLineAsync($"{tagFetch} UID FETCH {id} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])"); // ✅ id not uidSet
-                string headerResponse = await ReadResponseAsync(tagFetch);
+                string block = ExtractFetchBlock(hResp.Raw, id);
+                string rawHeaders = ExtractLiteralFromBlock(block, "HEADER.FIELDS");
+                var headers = HeaderParser.Parse(rawHeaders);
 
-                string messageBlock = ExtractHeaderFields(headerResponse, id);
-                string rawSubject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject")) ?? "";
-                string rawFrom = GetHeaderValue(messageBlock, "From");
+                string rawFrom = HeaderParser.GetRaw(headers, "From");
+                AddressParser.ParseSingle(rawFrom, out string fromName, out string fromEmail);
 
-                ParseFrom(rawFrom, out string fromName, out string fromEmail);
-                string normalizedSubject = NormalizeSubject(rawSubject);
+                string rawSubject = HeaderParser.Get(headers, "Subject") ?? "";
+                string normSubject = NormalizeSubject(rawSubject);
 
                 var primary = new MailInboxes
                 {
@@ -305,1020 +381,1374 @@ namespace BNet.IMAP.Mailer
                     FromName = fromName,
                     FromEmail = fromEmail,
                     FromImage = BuildInitialsSpan(fromName ?? fromEmail),
-                    To = ParseAddressList(GetHeaderValue(messageBlock, "To")),
-                    CC = ParseAddressList(GetHeaderValue(messageBlock, "CC")),
-                    BCC = ParseAddressList(GetHeaderValue(messageBlock, "BCC")),
+                    To = AddressParser.ParseList(HeaderParser.GetRaw(headers, "To")),
+                    CC = AddressParser.ParseList(HeaderParser.GetRaw(headers, "CC")),
+                    BCC = AddressParser.ParseList(HeaderParser.GetRaw(headers, "BCC")),
                     Subject = rawSubject,
-                    Date = (DateTime)ParseDate(GetHeaderValue(messageBlock, "Date")),
-                    Flags = ExtractFlags(headerResponse, id), // ✅ already correct
+                    Date = MimeDecoder.ParseDate(HeaderParser.GetRaw(headers, "Date")) ?? DateTime.MinValue,
+                    Flags = ExtractFlagsFromBlock(block),
                     Submail = new List<MailMessage>()
                 };
 
-                string tagSearch = GetTag();
-                await writer.WriteLineAsync($"{tagSearch} UID SEARCH ALL SUBJECT \"{EscapeImapString(normalizedSubject)}\"");
-                string searchResponse = await ReadResponseAsync(tagSearch);
+                // Search for related
+                string[] related = await SearchAsync($"SUBJECT \"{EscapeImap(normSubject)}\"", ct);
+                var others = related.Where(u => u != id)
+                                          .OrderBy(u => long.TryParse(u, out long n) ? n : 0)
+                                          .ToArray();
 
-                string[] relatedUids = ParseMessageIds(searchResponse);
-                var threadUids = relatedUids
-                    .Where(u => u != id)
-                    .OrderBy(u => long.TryParse(u, out long n) ? n : 0)
-                    .ToArray();
-
-                foreach (var uid in threadUids)
+                foreach (string uid in others)
                 {
-                    var threadMessage = await FetchFullMessageInternalAsync(uid, folder, skipSelect: true);
-                    if (threadMessage != null)
-                        primary.Submail.Add(threadMessage);
+                    var msg = await FetchFullMessageAsync(uid, folder, true, ct);
+                    if (msg != null) primary.Submail.Add(msg);
                 }
 
                 return primary;
             }
-            finally
-            {
-                _lock.Release();
-            }
+            finally { _lock.Release(); }
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  GET EMAIL COUNTS BY FLAGS
+        //  SEARCH  — fluent query support
         // ─────────────────────────────────────────────────────────────────────
-        public async Task<Dictionary<ImapFlags, int>> GetEmailCountsByFlagsAsync(string folder = "INBOX")
+        public async Task<string[]> SearchMessagesAsync(
+            ImapSearchQuery query,
+            string folder = "INBOX",
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                string safeFolder = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(folder, ct);
+                return await SearchAsync(query.Build(), ct);
+            }
+            finally { _lock.Release(); }
+        }
 
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolder}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
+        // ─────────────────────────────────────────────────────────────────────
+        //  EMAIL COUNTS BY FLAG
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<Dictionary<ImapFlags, int>> GetEmailCountsByFlagsAsync(
+            string folder = "INBOX",
+            CancellationToken ct = default)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(folder, ct);
 
                 var counts = new Dictionary<ImapFlags, int>();
-
                 foreach (ImapFlags flag in Enum.GetValues(typeof(ImapFlags)))
                 {
-                    string searchCommand = flag == ImapFlags.ALL ? "ALL" : flag.ToString();
-                    string tagSearch = GetTag();
-                    await writer.WriteLineAsync($"{tagSearch} UID SEARCH {searchCommand}");
-                    string searchResponse = await ReadResponseAsync(tagSearch);
-                    string[] uids = ParseMessageIds(searchResponse);
+                    string cmd = BuildFlagSearch(flag, "");
+                    string[] uids = await SearchAsync(cmd, ct);
                     counts[flag] = uids.Length;
                 }
-
                 return counts;
             }
-            finally
-            {
-                _lock.Release();
-            }
+            finally { _lock.Release(); }
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  MARK AS SEEN / DELETE / MOVE / LIST MAILBOXES / LOGOUT
+        //  FLAG OPERATIONS
         // ─────────────────────────────────────────────────────────────────────
-        public async Task<bool> MarkAsSeenAsync(string id, string folder = "INBOX")
+        public Task<bool> MarkAsSeenAsync(string id, string folder = "INBOX", CancellationToken ct = default)
+            => StoreFlagAsync(id, folder, "+FLAGS", "\\Seen", ct);
+
+        public Task<bool> MarkAsUnseenAsync(string id, string folder = "INBOX", CancellationToken ct = default)
+            => StoreFlagAsync(id, folder, "-FLAGS", "\\Seen", ct);
+
+        public Task<bool> MarkAsImportantAsync(string id, string folder = "INBOX", CancellationToken ct = default)
+            => StoreFlagAsync(id, folder, "+FLAGS", "\\Flagged", ct);
+
+        public Task<bool> MarkAsUnimportantAsync(string id, string folder = "INBOX", CancellationToken ct = default)
+            => StoreFlagAsync(id, folder, "-FLAGS", "\\Flagged", ct);
+
+        public Task<bool> MarkAsAnsweredAsync(string id, string folder = "INBOX", CancellationToken ct = default)
+            => StoreFlagAsync(id, folder, "+FLAGS", "\\Answered", ct);
+
+        public Task<bool> MarkAsDraftAsync(string id, string folder = "INBOX", CancellationToken ct = default)
+            => StoreFlagAsync(id, folder, "+FLAGS", "\\Draft", ct);
+
+        private async Task<bool> StoreFlagAsync(
+            string id, string folder, string op, string flag, CancellationToken ct)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                if (writer == null) throw new Exception("Not connected.");
-                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
-
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Seen)");
-                return EnsureOk(await ReadResponseAsync(tag));
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(folder, ct);
+                string tag = Tag();
+                await SendAsync($"{tag} UID STORE {id} {op} ({flag})", ct);
+                var resp = await ReadTaggedAsync(tag, ct);
+                return resp.IsOk;
             }
             finally { _lock.Release(); }
         }
 
-        public async Task<bool> MarkAsUnseenAsync(string id, string folder = "INBOX")
+        // ─────────────────────────────────────────────────────────────────────
+        //  DELETE
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> DeleteMessageAsync(
+            string id,
+            string folder = "INBOX",
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                if (writer == null) throw new Exception("Not connected.");
-                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(folder, ct);
 
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID STORE {id} -FLAGS (\\Seen)");
-                return EnsureOk(await ReadResponseAsync(tag));
+                string tagStore = Tag();
+                await SendAsync($"{tagStore} UID STORE {id} +FLAGS (\\Deleted)", ct);
+                (await ReadTaggedAsync(tagStore, ct)).ThrowIfFailed("STORE \\Deleted");
+
+                string tagExp = Tag();
+                await SendAsync($"{tagExp} EXPUNGE", ct);
+                var resp = await ReadTaggedAsync(tagExp, ct);
+                return resp.IsOk;
             }
             finally { _lock.Release(); }
         }
 
-        public async Task<bool> DeleteMessageAsync(string id, string folder = "INBOX")
+        // ─────────────────────────────────────────────────────────────────────
+        //  EMPTY FOLDER  — marks all messages deleted then expunges
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> EmptyFolderAsync(
+            string folder = "INBOX",
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                if (writer == null) throw new Exception("Not connected.");
-                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(folder, ct);
 
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Deleted)");
-                EnsureOk(await ReadResponseAsync(tag));
+                // Search all messages
+                string[] uids = await SearchAsync("ALL", ct);
+                if (uids.Length == 0) return true;
 
-                tag = GetTag();
-                await writer.WriteLineAsync($"{tag} EXPUNGE");
-                return EnsureOk(await ReadResponseAsync(tag));
-            }
-            finally { _lock.Release(); }
-        }
-        public async Task<bool> MoveToFolderAsync(string id, string sourceFolder = "INBOX", string destinationFolder = "INBOX")
-        {
-            await _lock.WaitAsync();
-            try
-            {
-                if (writer == null) throw new Exception("Not connected.");
-                string safeSource = sourceFolder.Contains(" ") ? $"\"{sourceFolder}\"" : sourceFolder;
-                string safeDestination = destinationFolder.Contains(" ") ? $"\"{destinationFolder}\"" : destinationFolder;
+                string uidSet = string.Join(",", uids);
 
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeSource}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
+                // Mark all \Deleted in one command
+                string tagStore = Tag();
+                await SendAsync($"{tagStore} UID STORE {uidSet} +FLAGS (\\Deleted)", ct);
+                (await ReadTaggedAsync(tagStore, ct)).ThrowIfFailed("STORE \\Deleted");
 
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID MOVE {id} {safeDestination}");
-                return EnsureOk(await ReadResponseAsync(tag));
-            }
-            finally { _lock.Release(); }
-        }
-        // ── Create Folder ──────────────────────────────────────────────────────────
-        public async Task<bool> CreateFolderAsync(string folderName)
-        {
-            await _lock.WaitAsync();
-            try
-            {
-                if (writer == null) throw new Exception("Not connected.");
-                string safeFolder = folderName.Contains(" ") ? $"\"{folderName}\"" : folderName;
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} CREATE {safeFolder}");
-                return EnsureOk(await ReadResponseAsync(tag));
+                // Expunge all at once
+                string tagExp = Tag();
+                await SendAsync($"{tagExp} EXPUNGE", ct);
+                var resp = await ReadTaggedAsync(tagExp, ct);
+                return resp.IsOk;
             }
             finally { _lock.Release(); }
         }
 
-        // ── Mark as Important (\Flagged) ───────────────────────────────────────────
-        public async Task<bool> MarkAsImportantAsync(string id, string folder = "INBOX")
+        // ─────────────────────────────────────────────────────────────────────
+        //  REPORT SPAM  — moves to Junk/Spam and marks \Flagged + \Seen
+        //
+        //  IMAP has no native spam command. The universal standard used by
+        //  Gmail, Outlook, Apple Mail is: move to Spam folder + mark Seen.
+        //
+        //  Common spam folder names by provider:
+        //    Gmail        → [Gmail]/Spam
+        //    Outlook/365  → Junk Email
+        //    Yahoo        → Bulk Mail
+        //    Generic IMAP → Junk  (RFC 6154 \Junk special-use attribute)
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> ReportSpamAsync(
+            string id,
+            string sourceFolder = "INBOX",
+            string spamFolder = "Junk",
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                if (writer == null) throw new Exception("Not connected.");
-                string safeFolder = folder.Contains(" ") ? $"\"{folder}\"" : folder;
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolder}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
+                await EnsureConnectedAsync(ct);
 
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Flagged)");
-                return EnsureOk(await ReadResponseAsync(tag));
+                // Auto-detect spam folder name if not overridden
+                string resolvedSpam = await ResolveSpecialFolderAsync(
+                    spamFolder,
+                    new[] { "Junk", "Junk Email", "[Gmail]/Spam", "Spam", "Bulk Mail", "Bulk" },
+                    ct);
+
+                await SelectFolderAsync(sourceFolder, ct);
+
+                // Mark as Seen (spam shouldn't stay unread)
+                string tagSeen = Tag();
+                await SendAsync(tagSeen + " UID STORE " + id + " +FLAGS (\\Seen)", ct);
+                await ReadTaggedAsync(tagSeen, ct);
+
+                // Move to spam folder
+                string dest = SafeFolder(resolvedSpam);
+                if (_capabilities.Contains("MOVE"))
+                {
+                    string tagMove = Tag();
+                    await SendAsync(tagMove + " UID MOVE " + id + " " + dest, ct);
+                    return (await ReadTaggedAsync(tagMove, ct)).IsOk;
+                }
+
+                // Fallback: COPY + DELETE + EXPUNGE
+                string tagCopy = Tag();
+                await SendAsync(tagCopy + " UID COPY " + id + " " + dest, ct);
+                (await ReadTaggedAsync(tagCopy, ct)).ThrowIfFailed("COPY to spam");
+
+                string tagDel = Tag();
+                await SendAsync(tagDel + " UID STORE " + id + " +FLAGS (\\Deleted)", ct);
+                (await ReadTaggedAsync(tagDel, ct)).ThrowIfFailed("STORE \\Deleted");
+
+                string tagExp = Tag();
+                await SendAsync(tagExp + " EXPUNGE", ct);
+                return (await ReadTaggedAsync(tagExp, ct)).IsOk;
             }
             finally { _lock.Release(); }
         }
 
-        // ── Unmark Important ──────────────────────────────────────────────────────
-        public async Task<bool> MarkAsUnimportantAsync(string id, string folder = "INBOX")
+        // ─────────────────────────────────────────────────────────────────────
+        //  REPORT PHISHING  — same as spam but moves to Phishing/Junk folder
+        //  and additionally marks with \Flagged so it stands out in the folder
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> ReportPhishingAsync(
+            string id,
+            string sourceFolder = "INBOX",
+            string spamFolder = "Junk",
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                if (writer == null) throw new Exception("Not connected.");
-                string safeFolder = folder.Contains(" ") ? $"\"{folder}\"" : folder;
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolder}");
-                EnsureOk(await ReadResponseAsync(tagSelect));
+                await EnsureConnectedAsync(ct);
 
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID STORE {id} -FLAGS (\\Flagged)");
-                return EnsureOk(await ReadResponseAsync(tag));
+                string resolvedSpam = await ResolveSpecialFolderAsync(
+                    spamFolder,
+                    new[] { "Junk", "Junk Email", "[Gmail]/Spam", "Spam", "Bulk Mail", "Bulk" },
+                    ct);
+
+                await SelectFolderAsync(sourceFolder, ct);
+
+                // Mark Seen + Flagged (phishing is high priority to review)
+                string tagFlags = Tag();
+                await SendAsync(tagFlags + " UID STORE " + id + " +FLAGS (\\Seen \\Flagged)", ct);
+                await ReadTaggedAsync(tagFlags, ct);
+
+                // Move to spam/junk folder
+                string dest = SafeFolder(resolvedSpam);
+                if (_capabilities.Contains("MOVE"))
+                {
+                    string tagMove = Tag();
+                    await SendAsync(tagMove + " UID MOVE " + id + " " + dest, ct);
+                    return (await ReadTaggedAsync(tagMove, ct)).IsOk;
+                }
+
+                string tagCopy = Tag();
+                await SendAsync(tagCopy + " UID COPY " + id + " " + dest, ct);
+                (await ReadTaggedAsync(tagCopy, ct)).ThrowIfFailed("COPY to junk");
+
+                string tagDel = Tag();
+                await SendAsync(tagDel + " UID STORE " + id + " +FLAGS (\\Deleted)", ct);
+                (await ReadTaggedAsync(tagDel, ct)).ThrowIfFailed("STORE \\Deleted");
+
+                string tagExp = Tag();
+                await SendAsync(tagExp + " EXPUNGE", ct);
+                return (await ReadTaggedAsync(tagExp, ct)).IsOk;
             }
             finally { _lock.Release(); }
         }
-        public async Task<List<string>> ListMailboxesAsync()
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  NOT SPAM  — moves message back to INBOX and removes \Flagged
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> NotSpamAsync(
+            string id,
+            string spamFolder = "Junk",
+            string destFolder = "INBOX",
+            CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                if (writer == null) throw new Exception("Not connected.");
-                string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} LIST \"\" \"*\"");
-                string response = await ReadResponseAsync(tag);
-                EnsureOk(response);
+                await EnsureConnectedAsync(ct);
+
+                string resolvedSpam = await ResolveSpecialFolderAsync(
+                    spamFolder,
+                    new[] { "Junk", "Junk Email", "[Gmail]/Spam", "Spam", "Bulk Mail", "Bulk" },
+                    ct);
+
+                await SelectFolderAsync(resolvedSpam, ct);
+
+                // Remove \Flagged (in case it was marked as phishing)
+                string tagFlag = Tag();
+                await SendAsync(tagFlag + " UID STORE " + id + " -FLAGS (\\Flagged)", ct);
+                await ReadTaggedAsync(tagFlag, ct);
+
+                // Move back to INBOX (or specified destination)
+                string dest = SafeFolder(destFolder);
+                if (_capabilities.Contains("MOVE"))
+                {
+                    string tagMove = Tag();
+                    await SendAsync(tagMove + " UID MOVE " + id + " " + dest, ct);
+                    return (await ReadTaggedAsync(tagMove, ct)).IsOk;
+                }
+
+                string tagCopy = Tag();
+                await SendAsync(tagCopy + " UID COPY " + id + " " + dest, ct);
+                (await ReadTaggedAsync(tagCopy, ct)).ThrowIfFailed("COPY to inbox");
+
+                string tagDel = Tag();
+                await SendAsync(tagDel + " UID STORE " + id + " +FLAGS (\\Deleted)", ct);
+                (await ReadTaggedAsync(tagDel, ct)).ThrowIfFailed("STORE \\Deleted");
+
+                string tagExp = Tag();
+                await SendAsync(tagExp + " EXPUNGE", ct);
+                return (await ReadTaggedAsync(tagExp, ct)).IsOk;
+            }
+            finally { _lock.Release(); }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  RESOLVE SPECIAL FOLDER  — finds the actual folder name on the server
+        //  Tries the preferred name first, then falls back through candidates
+        // ─────────────────────────────────────────────────────────────────────
+        private async Task<string> ResolveSpecialFolderAsync(
+            string preferred,
+            string[] candidates,
+            CancellationToken ct)
+        {
+            // List all mailboxes once
+            string tagList = Tag();
+            await SendAsync(tagList + " LIST \"\" \"*\"", ct);
+            var resp = await ReadTaggedAsync(tagList, ct);
+
+            var existing = new List<string>();
+            foreach (string line in resp.Lines)
+            {
+                var m = Regex.Match(line, @"^\* LIST \([^)]*\) ""[^""]*"" (.+)$", RegexOptions.IgnoreCase);
+                if (!m.Success) continue;
+                string name = m.Groups[1].Value.Trim().Trim('"');
+                existing.Add(name);
+            }
+
+            // Preferred name first
+            foreach (string e in existing)
+                if (e.Equals(preferred, StringComparison.OrdinalIgnoreCase))
+                    return e;
+
+            // Then try each candidate
+            foreach (string candidate in candidates)
+                foreach (string e in existing)
+                    if (e.Equals(candidate, StringComparison.OrdinalIgnoreCase))
+                        return e;
+
+            // Nothing found — create preferred folder and use it
+            string tagCreate = Tag();
+            await SendAsync(tagCreate + " CREATE " + SafeFolder(preferred), ct);
+            await ReadTaggedAsync(tagCreate, ct);
+            return preferred;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  MOVE  — uses MOVE extension if available, falls back to COPY+DELETE
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> MoveToFolderAsync(
+            string id,
+            string sourceFolder = "INBOX",
+            string destinationFolder = "INBOX",
+            CancellationToken ct = default)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(sourceFolder, ct);
+                string dest = SafeFolder(destinationFolder);
+
+                if (_capabilities.Contains("MOVE"))
+                {
+                    string tag = Tag();
+                    await SendAsync($"{tag} UID MOVE {id} {dest}", ct);
+                    return (await ReadTaggedAsync(tag, ct)).IsOk;
+                }
+
+                // Fallback: COPY + STORE \Deleted + EXPUNGE
+                string tagCopy = Tag();
+                await SendAsync($"{tagCopy} UID COPY {id} {dest}", ct);
+                (await ReadTaggedAsync(tagCopy, ct)).ThrowIfFailed("COPY");
+
+                string tagDel = Tag();
+                await SendAsync($"{tagDel} UID STORE {id} +FLAGS (\\Deleted)", ct);
+                (await ReadTaggedAsync(tagDel, ct)).ThrowIfFailed("STORE \\Deleted");
+
+                string tagExp = Tag();
+                await SendAsync($"{tagExp} EXPUNGE", ct);
+                return (await ReadTaggedAsync(tagExp, ct)).IsOk;
+            }
+            finally { _lock.Release(); }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  COPY
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> CopyToFolderAsync(
+            string id,
+            string sourceFolder = "INBOX",
+            string destinationFolder = "INBOX",
+            CancellationToken ct = default)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+                await SelectFolderAsync(sourceFolder, ct);
+
+                string tag = Tag();
+                await SendAsync($"{tag} UID COPY {id} {SafeFolder(destinationFolder)}", ct);
+                return (await ReadTaggedAsync(tag, ct)).IsOk;
+            }
+            finally { _lock.Release(); }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  FOLDER MANAGEMENT
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<List<string>> ListMailboxesAsync(CancellationToken ct = default)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+                string tag = Tag();
+                await SendAsync($"{tag} LIST \"\" \"*\"", ct);
+                var resp = await ReadTaggedAsync(tag, ct);
+                resp.ThrowIfFailed("LIST");
 
                 var mailboxes = new List<string>();
-                var lines = response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-                var regex = new Regex(@"^\* LIST \([^\)]*\) ""[^""]*"" (.+)$");
+                var regex = new Regex(@"^\* LIST \([^)]*\) ""[^""]*"" (.+)$", RegexOptions.IgnoreCase);
 
-                foreach (var line in lines)
+                foreach (string line in resp.Lines)
                 {
-                    if (!line.StartsWith("* LIST")) continue;
-                    var match = regex.Match(line);
-                    if (match.Success)
-                    {
-                        string mailbox = match.Groups[1].Value.Trim();
-                        if (mailbox.StartsWith("\"") && mailbox.EndsWith("\""))
-                            mailbox = mailbox.Substring(1, mailbox.Length - 2);
-                        mailboxes.Add(mailbox);
-                    }
+                    var m = regex.Match(line);
+                    if (!m.Success) continue;
+                    string mb = m.Groups[1].Value.Trim().Trim('"');
+                    mailboxes.Add(mb);
                 }
                 return mailboxes;
             }
             finally { _lock.Release(); }
         }
 
-        public async Task Logout()
+        public async Task<bool> CreateFolderAsync(string folderName, CancellationToken ct = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(ct);
             try
             {
-                if (writer != null)
-                {
-                    string tag = GetTag();
-                    await writer.WriteLineAsync($"{tag} LOGOUT");
-                    await ReadResponseAsync(tag);
-                }
+                await EnsureConnectedAsync(ct);
+                string tag = Tag();
+                await SendAsync($"{tag} CREATE {SafeFolder(folderName)}", ct);
+                return (await ReadTaggedAsync(tag, ct)).IsOk;
             }
-            finally
-            {
-                _lock.Release();
-                reader?.Close();
-                writer?.Close();
-                sslStream?.Close();
-                tcpClient?.Close();
-            }
+            finally { _lock.Release(); }
         }
 
-        #region Internal Fetch
-
-        // Fix the method to find FLAGS for a specific UID
-        private List<string> ExtractFlags(string response, string uid)
+        public async Task<bool> DeleteFolderAsync(string folderName, CancellationToken ct = default)
         {
-            // Find the FETCH line for this specific UID
-            var lines = response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-
-            foreach (var line in lines)
+            await _lock.WaitAsync(ct);
+            try
             {
-                // Match lines like: * 5 FETCH (UID 123 FLAGS (\Seen \Answered) ...
-                if (!line.Contains($"UID {uid}") && !line.Contains("FETCH")) continue;
+                await EnsureConnectedAsync(ct);
+                string tag = Tag();
+                await SendAsync($"{tag} DELETE {SafeFolder(folderName)}", ct);
+                return (await ReadTaggedAsync(tag, ct)).IsOk;
+            }
+            finally { _lock.Release(); }
+        }
 
-                var match = Regex.Match(line, @"FLAGS\s*\(([^)]*)\)");
-                if (match.Success)
-                {
-                    return match.Groups[1].Value
-                   .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)
-                   .Select(f => f.TrimStart('\\').ToUpperInvariant()) // Remove leading '\' and normalize
-                   .ToList();
-                }
+        public async Task<bool> RenameFolderAsync(string oldName, string newName, CancellationToken ct = default)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+                string tag = Tag();
+                await SendAsync($"{tag} RENAME {SafeFolder(oldName)} {SafeFolder(newName)}", ct);
+                return (await ReadTaggedAsync(tag, ct)).IsOk;
+            }
+            finally { _lock.Release(); }
+        }
+
+        public async Task<bool> SubscribeFolderAsync(string folderName, CancellationToken ct = default)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+                string tag = Tag();
+                await SendAsync($"{tag} SUBSCRIBE {SafeFolder(folderName)}", ct);
+                return (await ReadTaggedAsync(tag, ct)).IsOk;
+            }
+            finally { _lock.Release(); }
+        }
+
+        public async Task<bool> UnsubscribeFolderAsync(string folderName, CancellationToken ct = default)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+                string tag = Tag();
+                await SendAsync($"{tag} UNSUBSCRIBE {SafeFolder(folderName)}", ct);
+                return (await ReadTaggedAsync(tag, ct)).IsOk;
+            }
+            finally { _lock.Release(); }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  APPEND  — save a raw message to a folder (e.g. Sent)
+        // ─────────────────────────────────────────────────────────────────────
+        public async Task<bool> AppendMessageAsync(
+            string folder,
+            byte[] rawMessage,
+            string[] flags = null,
+            DateTime? internalDate = null,
+            CancellationToken ct = default)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+
+                string flagStr = flags != null && flags.Length > 0
+                    ? $"({string.Join(" ", flags)}) "
+                    : "";
+
+                string dateStr = internalDate.HasValue
+                    ? $"\"{internalDate.Value.ToString("dd-MMM-yyyy HH:mm:ss zzz")}\" "
+                    : "";
+
+                string tag = Tag();
+                await SendAsync(
+                    $"{tag} APPEND {SafeFolder(folder)} {flagStr}{dateStr}{{{rawMessage.Length}}}", ct);
+
+                // Server responds with + (continue)
+                string cont = await ReadLineAsync(ct);
+                if (!cont.StartsWith("+")) return false;
+
+                await _writer.BaseStream.WriteAsync(rawMessage, 0, rawMessage.Length, ct);
+                await _writer.WriteLineAsync();
+                await _writer.FlushAsync();
+
+                return (await ReadTaggedAsync(tag, ct)).IsOk;
+            }
+            finally { _lock.Release(); }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  IDLE  — RFC 2177 push notifications
+        //
+        //  Usage:
+        //    mail.OnNewMailAsync += async (args) => {
+        //        Console.WriteLine("New mail from: " + args.Message.FromName);
+        //        Console.WriteLine("Subject: "       + args.Message.Subject);
+        //    };
+        //    await mail.StartIdleAsync("INBOX");
+        //
+        //  Falls back to polling (every 30s) if server has no IDLE support.
+        // ─────────────────────────────────────────────────────────────────────
+        private string _idleFolder = "INBOX";
+
+        private async Task StartIdleAsync(string folder = "INBOX", CancellationToken ct = default)
+        {
+            _idleFolder = folder;
+            await StopIdleAsync();
+
+            Console.WriteLine("[IDLE] Capabilities: " + string.Join(", ", _capabilities));
+            Console.WriteLine("[IDLE] IDLE supported: " + _capabilities.Contains("IDLE"));
+
+            // Seed the last known UID before starting the loop
+            string lastKnownUid = await GetHighestUidAsync(folder, ct);
+            Console.WriteLine("[IDLE] Starting from lastKnownUid=" + lastKnownUid);
+
+            _idleCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+            if (_capabilities.Contains("IDLE"))
+            {
+                Console.WriteLine("[IDLE] Starting IDLE loop for folder: " + folder);
+                _idleTask = RunIdleLoopAsync(lastKnownUid, _idleCts.Token);
+            }
+            else
+            {
+                Console.WriteLine("[IDLE] Server has no IDLE — falling back to 30s polling.");
+                _idleTask = RunPollingLoopAsync(lastKnownUid, _idleCts.Token);
             }
 
-            return new List<string>();
+            Console.WriteLine("[IDLE] Background task started. Waiting for new mail…");
+        }
+
+        private async Task StopIdleAsync()
+        {
+            if (_idleCts == null) return;
+            _idleCts.Cancel();
+            try { if (_idleTask != null) await _idleTask; } catch { }
+            _idleCts = null;
+            _idleTask = null;
         }
 
         /// <summary>
-        /// Core method: fetches a full email by UID, extracts body + attachments.
-        /// skipSelect = true when folder is already selected (used inside GetThreadAsync).
+        /// Awaits the IDLE background loop — call this to keep your app alive
+        /// while waiting for new mail. Returns when StopIdleAsync() is called.
+        ///
+        /// Example:
+        ///   await mail.StartIdleAsync("INBOX");
+        ///   await mail.WaitForIdleAsync();  // blocks here until stopped
         /// </summary>
-        private async Task<MailMessage> FetchFullMessageInternalAsync(string id, string folder, bool skipSelect = false)
+        public async Task WaitForIdleAsync()
         {
-            if (!skipSelect)
+            if (_idleTask != null)
+                try { await _idleTask; } catch { }
+        }
+
+        /// <summary>
+        /// Combines StartIdleAsync + WaitForIdleAsync in one call.
+        /// Blocks until StopIdleAsync() is called or ct is cancelled.
+        ///
+        /// Usage:
+        ///   mail.OnNewMailAsync += async (args) => { ... };
+        ///   await mail.ListenAsync("INBOX");
+        /// </summary>
+        public async Task ListenAsync(string folder = "INBOX", CancellationToken ct = default)
+        {
+            await StartIdleAsync(folder, ct);
+            await WaitForIdleAsync();
+        }
+
+        // ── IDLE loop ─────────────────────────────────────────────────────────
+        private async Task RunIdleLoopAsync(string lastKnownUid, CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
             {
-                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
-                string tagSelect = GetTag();
-                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
-                await ReadResponseAsync(tagSelect);
+                try
+                {
+                    // Enter IDLE — send command while holding lock
+                    await _lock.WaitAsync(ct);
+                    bool lockHeld = true;
+                    try
+                    {
+                        string tag = Tag();
+                        await SendAsync(tag + " IDLE", ct);
+
+                        // Read the + continuation (still under lock)
+                        string cont = await ReadLineRawAsync(ct);
+                        Console.WriteLine("[IDLE] Server: " + cont);
+
+                        if (!cont.StartsWith("+"))
+                        {
+                            Console.WriteLine("[IDLE] Server rejected IDLE.");
+                            return;
+                        }
+
+                        // Release lock BEFORE blocking on server push lines
+                        _lock.Release();
+                        lockHeld = false;
+
+                        // ── Listen for server push — NO lock, NO timeout ──────
+                        bool gotExists = false;
+                        while (!ct.IsCancellationRequested)
+                        {
+                            // ReadLineRawAsync has NO internal timeout — reads until \n
+                            string line;
+                            try { line = await ReadLineRawAsync(ct); }
+                            catch (OperationCanceledException) { break; }
+
+                            Console.WriteLine("[IDLE PUSH] " + line);
+
+                            if (Regex.IsMatch(line, @"^\* \d+ EXISTS", RegexOptions.IgnoreCase))
+                            {
+                                gotExists = true;
+                                break; // respond immediately
+                            }
+
+                            // Server keepalive or other untagged — keep listening
+                        }
+
+                        // Re-acquire lock to send DONE
+                        await _lock.WaitAsync(ct);
+                        lockHeld = true;
+
+                        await _writer.WriteLineAsync("DONE");
+                        await _writer.FlushAsync();
+
+                        // Read until we get the tagged OK for IDLE
+                        await ReadTaggedAsync(tag, ct);
+
+                        if (gotExists)
+                        {
+                            await SelectFolderInternalAsync(_idleFolder, ct);
+                            lastKnownUid = await FetchAndFireNewMessagesInternalAsync(
+                                _idleFolder, lastKnownUid, ct);
+                        }
+                    }
+                    finally
+                    {
+                        if (lockHeld) _lock.Release();
+                    }
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[IDLE] Error: " + ex.Message + " — retry in 5s…");
+                    try { await Task.Delay(5000, ct); } catch { break; }
+
+                    await _lock.WaitAsync(ct);
+                    try
+                    {
+                        await EnsureConnectedAsync(ct);
+                        await SelectFolderInternalAsync(_idleFolder, ct);
+                    }
+                    finally { _lock.Release(); }
+                }
+            }
+        }
+
+        // ── Polling fallback ──────────────────────────────────────────────────
+        private async Task RunPollingLoopAsync(string lastKnownUid, CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30), ct);
+
+                    if (OnNewMailAsync != null)
+                    {
+                        await _lock.WaitAsync(ct);
+                        try
+                        {
+                            await EnsureConnectedAsync(ct);
+                            await SelectFolderInternalAsync(_idleFolder, ct);
+                            lastKnownUid = await FetchAndFireNewMessagesInternalAsync(
+                                _idleFolder, lastKnownUid, ct);
+                        }
+                        finally { _lock.Release(); }
+                    }
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[POLL] Error: " + ex.Message + " — reconnecting…");
+                    try { await Task.Delay(5000, ct); } catch { break; }
+
+                    await _lock.WaitAsync(ct);
+                    try { await EnsureConnectedAsync(ct); }
+                    finally { _lock.Release(); }
+                }
+            }
+        }
+
+        // ── Internal: fetch new messages and fire event — lock already held ───
+        private async Task<string> FetchAndFireNewMessagesInternalAsync(
+            string folder, string lastKnownUid, CancellationToken ct)
+        {
+            long lastLong;
+            if (!long.TryParse(lastKnownUid, out lastLong)) lastLong = 0;
+
+            // Search for ALL UIDs and filter client-side
+            // More reliable than UID N:* which some servers handle inconsistently
+            string[] allUids = await SearchAsync("ALL", ct);
+
+            var fresh = new List<string>();
+            foreach (string uid in allUids)
+            {
+                long u;
+                if (long.TryParse(uid, out u) && u > lastLong)
+                    fresh.Add(uid);
             }
 
-            // ✅ Fetch FLAGS separately to avoid corrupting the body literal parser
-            string tagFlags = GetTag();
-            await writer.WriteLineAsync($"{tagFlags} UID FETCH {id} (UID FLAGS)");
-            string flagsResponse = await ReadResponseAsync(tagFlags);
-            List<string> flags = ExtractFlags(flagsResponse, id);
+            Console.WriteLine("[IDLE] Found " + fresh.Count + " new message(s). lastKnownUid=" + lastKnownUid);
 
-            // Fetch full body
-            string tagFetch = GetTag();
-            await writer.WriteLineAsync($"{tagFetch} UID FETCH {id} (BODY[])");
-            await writer.FlushAsync();
-            string fullMessage = await ReadResponseAsync(tagFetch);
+            string newHighest = lastKnownUid;
 
-            string rawFrom = GetHeaderValue(fullMessage, "From");
-            ParseFrom(rawFrom, out string fromName, out string fromEmail);
+            foreach (string uid in fresh)
+            {
+                try
+                {
+                    Console.WriteLine("[IDLE] Fetching new message UID=" + uid);
+                    var msg = await FetchFullMessageAsync(uid, folder, true, ct);
 
-            var mail = new MailMessage { Id = id };
-            mail.Flags = flags; // ✅
+                    if (msg != null)
+                    {
+                        // Update highest before firing so handler sees correct state
+                        long u, h;
+                        if (long.TryParse(uid, out u) &&
+                            (string.IsNullOrEmpty(newHighest) ||
+                             (long.TryParse(newHighest, out h) && u > h)))
+                            newHighest = uid;
+
+                        if (OnNewMailAsync != null)
+                        {
+                            // Release lock so user can call GetInbox() etc. in handler
+                            _lock.Release();
+                            try
+                            {
+                                await OnNewMailAsync.Invoke(new NewMailEventArgs(msg, folder));
+                            }
+                            finally
+                            {
+                                await _lock.WaitAsync(ct);
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[IDLE] Failed to fetch UID " + uid + ": " + ex.Message);
+                }
+            }
+
+            return newHighest;
+        }
+
+        // ── Get highest UID — uses lock normally ──────────────────────────────
+        private async Task<string> GetHighestUidAsync(string folder, CancellationToken ct)
+        {
+            await _lock.WaitAsync(ct);
+            try
+            {
+                await EnsureConnectedAsync(ct);
+                await SelectFolderInternalAsync(folder, ct);
+                string[] uids = await SearchAsync("ALL", ct);
+                if (uids.Length == 0) return "0";
+
+                string highest = "0";
+                foreach (string uid in uids)
+                {
+                    long u, h;
+                    if (long.TryParse(uid, out u) &&
+                        long.TryParse(highest, out h) && u > h)
+                        highest = uid;
+                }
+                return highest;
+            }
+            finally { _lock.Release(); }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  INTERNAL FULL MESSAGE FETCH  (BODYSTRUCTURE-based)
+        // ─────────────────────────────────────────────────────────────────────
+        private async Task<MailMessage> FetchFullMessageAsync(
+            string id, string folder, bool skipSelect, CancellationToken ct)
+        {
+            if (!skipSelect)
+                await SelectFolderAsync(folder, ct);
+
+            // 1 — Fetch BODYSTRUCTURE + headers
+            string tagBS = Tag();
+            await SendAsync(
+                $"{tagBS} UID FETCH {id} (UID FLAGS BODYSTRUCTURE BODY.PEEK[HEADER])", ct);
+            var bsResp = await ReadTaggedAsync(tagBS, ct);
+
+            string rawHeaders = ExtractLiteralFromBlock(bsResp.Raw, "HEADER");
+            var headers = HeaderParser.Parse(rawHeaders ?? "");
+            var flags = ExtractFlagsFromResponse(bsResp.Raw, id);
+
+            string bsRaw = ExtractField(bsResp.Raw, "BODYSTRUCTURE");
+            BodyPart root = string.IsNullOrEmpty(bsRaw)
+                ? null
+                : BodyStructureParser.Parse(bsRaw);
+
+            var mail = new MailMessage
+            {
+                Id = id,
+                Folder = folder,
+                Flags = flags,
+                MessageId = HeaderParser.GetRaw(headers, "Message-ID"),
+                InReplyTo = HeaderParser.GetRaw(headers, "In-Reply-To"),
+                ReplyTo = HeaderParser.GetRaw(headers, "Reply-To"),
+                Subject = HeaderParser.Get(headers, "Subject"),
+                Date = MimeDecoder.ParseDate(HeaderParser.GetRaw(headers, "Date")) ?? DateTime.MinValue,
+                To = AddressParser.ParseList(HeaderParser.GetRaw(headers, "To")),
+                CC = AddressParser.ParseList(HeaderParser.GetRaw(headers, "CC")),
+                BCC = AddressParser.ParseList(HeaderParser.GetRaw(headers, "BCC")),
+            };
+
+            string rawFrom = HeaderParser.GetRaw(headers, "From");
+            AddressParser.ParseSingle(rawFrom, out string fromName, out string fromEmail);
             mail.From = rawFrom;
             mail.FromName = fromName;
             mail.FromEmail = fromEmail;
             mail.FromImage = BuildInitialsSpan(fromName ?? fromEmail);
-            mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(fullMessage, "Subject"));
-            mail.Date = (DateTime)ParseDate(GetHeaderValue(fullMessage, "Date"));
-            mail.To = ParseAddressList(GetHeaderValue(fullMessage, "To"));
-            mail.CC = ParseAddressList(GetHeaderValue(fullMessage, "CC"));
-            mail.BCC = ParseAddressList(GetHeaderValue(fullMessage, "BCC"));
 
-            ExtractBodies(fullMessage, out string html, out string plainText, out List<MailAttachment> attachments);
-            mail.HtmlBody = InjectImportant(ReplaceCidWithDataUri(html, attachments));
-            mail.PlainTextBody = !string.IsNullOrEmpty(plainText) ? plainText : HtmlToPlainText(html);
-            mail.Attachments = attachments;
+            // 2 — If no BODYSTRUCTURE, fall back to fetching BODY[]
+            if (root == null)
+            {
+                string tagFull = Tag();
+                await SendAsync($"{tagFull} UID FETCH {id} (BODY[])", ct);
+                var fullResp = await ReadTaggedAsync(tagFull, ct);
+                ParseRawBody(fullResp.Raw, mail);
+                return mail;
+            }
+
+            // 3 — Selectively fetch only needed parts
+            await FetchPartsAsync(id, root, mail, ct);
+            mail.HtmlBody = InjectImportant(ReplaceCidWithDataUri(mail.HtmlBody, mail.Attachments));
+            mail.PlainTextBody = !string.IsNullOrEmpty(mail.PlainTextBody)
+                ? mail.PlainTextBody
+                : MimeDecoder.HtmlToPlainText(mail.HtmlBody);
 
             return mail;
         }
-        #endregion
 
-        #region Body & Attachment Extraction
-        private string ExtractHeaderFields(string response, string uid)
+        private async Task FetchPartsAsync(string id, BodyPart root, MailMessage mail, CancellationToken ct)
         {
-            // ✅ FLAGS is now between UID and BODY, so search for BODY[HEADER.FIELDS after UID {uid}
-            string marker = $"UID {uid}";
-            int uidIndex = response.IndexOf(marker);
-            if (uidIndex == -1) return string.Empty;
+            var parts = BodyStructureParser.Flatten(root)
+                        .Where(p => !p.IsMultipart)
+                        .ToList();
 
-            // From the UID position, find the next BODY[HEADER.FIELDS
-            int bodyIndex = response.IndexOf("BODY[HEADER.FIELDS", uidIndex);
-            if (bodyIndex == -1) return string.Empty;
-
-            int literalStart = response.IndexOf("{", bodyIndex);
-            int literalEnd = response.IndexOf("}", literalStart);
-            if (literalStart == -1 || literalEnd == -1) return string.Empty;
-
-            // Make sure the literal brace belongs to this FETCH block, not the next
-            int nextUidIndex = response.IndexOf($"UID ", uidIndex + marker.Length);
-            if (nextUidIndex != -1 && literalStart > nextUidIndex) return string.Empty;
-
-            string lengthStr = response.Substring(literalStart + 1, literalEnd - literalStart - 1);
-            if (!int.TryParse(lengthStr, out int literalLength)) return string.Empty;
-
-            int headerStart = response.IndexOf("\r\n", literalEnd) + 2;
-            if (headerStart <= 1) return string.Empty;
-            if (headerStart + literalLength > response.Length) return string.Empty;
-
-            return response.Substring(headerStart, literalLength).Trim();
-        }
-        private void ExtractBodies(string message, out string html, out string plainText, out List<MailAttachment> attachments)
-        {
-            html = null;
-            plainText = null;
-            attachments = new List<MailAttachment>();
-
-            var fetchMatch = Regex.Match(message, @"\* \d+ FETCH \(.*?\r?\n", RegexOptions.Singleline);
-            if (fetchMatch.Success)
-                message = message.Substring(fetchMatch.Index + fetchMatch.Length);
-
-            message = Regex.Replace(message, @"\)\r?\nA\d+ OK.*$", "", RegexOptions.Multiline).Trim();
-            message = Regex.Replace(message, @"\r?\nA\d+ OK.*$", "", RegexOptions.Multiline).Trim();
-
-            ExtractFromPart(message, ref html, ref plainText, attachments);
-
-            if (html == null) html = string.Empty;
-            if (plainText == null) plainText = string.Empty;
-        }
-
-        private void ExtractFromPart(string part, ref string html, ref string plainText, List<MailAttachment> attachments, int depth = 0)
-        {
-            if (depth > 10) return;
-
-            string boundary = GetBoundary(part);
-
-            if (!string.IsNullOrEmpty(boundary))
+            foreach (var part in parts)
             {
-                var parts = part.Split(new[] { "--" + boundary }, StringSplitOptions.RemoveEmptyEntries);
+                string section = string.IsNullOrEmpty(part.Section) ? "1" : part.Section;
+                string tagP = Tag();
+                await SendAsync($"{tagP} UID FETCH {id} (BODY.PEEK[{section}])", ct);
+                var resp = await ReadTaggedAsync(tagP, ct);
 
-                foreach (var subPart in parts)
+                string body = ExtractSectionBody(resp.Raw, section);
+                if (body == null) continue;
+
+                string mimeType = $"{part.Type}/{part.SubType}".ToLowerInvariant();
+
+                if (part.IsAttachment || (part.Type != "text" && !string.IsNullOrEmpty(part.FileName)))
                 {
-                    if (subPart.TrimStart().StartsWith("--")) continue;
-                    if (string.IsNullOrWhiteSpace(subPart)) continue;
-
-                    string contentType = GetRawHeaderValue(subPart, "Content-Type")?.ToLower() ?? "";
-                    string contentDisposition = GetRawHeaderValue(subPart, "Content-Disposition")?.ToLower() ?? "";
-                    string contentId = GetRawHeaderValue(subPart, "Content-ID") ?? "";
-
-                    // Clean up Content-ID angle brackets  <image001@mail> → image001@mail
-                    contentId = contentId.Trim().Trim('<', '>');
-
-                    bool isAttachment = contentDisposition.Contains("attachment");
-                    bool isInline = contentDisposition.Contains("inline") && !contentType.Contains("text/");
-
-                    if (contentType.Contains("multipart/"))
+                    byte[] data = MimeDecoder.DecodeAttachmentBytes(body, part.Encoding);
+                    mail.Attachments.Add(new MailAttachment
                     {
-                        ExtractFromPart(subPart, ref html, ref plainText, attachments, depth + 1);
-                    }
-                    else if (isAttachment || isInline || (!contentType.Contains("text/") && !string.IsNullOrEmpty(contentId)))
+                        FileName = part.FileName ?? $"attachment_{Guid.NewGuid():N}.bin",
+                        ContentType = mimeType,
+                        ContentId = part.ContentId,
+                        IsInline = part.IsInline && !part.IsAttachment,
+                        SizeBytes = data.LongLength,
+                        Data = data
+                    });
+                }
+                else if (part.IsInline && part.Type != "text")
+                {
+                    byte[] data = MimeDecoder.DecodeAttachmentBytes(body, part.Encoding);
+                    mail.Attachments.Add(new MailAttachment
                     {
-                        // ✅ This part is an attachment or inline embedded file
-                        var attachment = ExtractAttachment(subPart, contentType, contentDisposition, contentId);
-                        if (attachment != null)
-                            attachments.Add(attachment);
-                    }
-                    else if (contentType.Contains("text/html") && html == null)
-                    {
-                        html = DecodePart(subPart);
-                    }
-                    else if (contentType.Contains("text/plain") && plainText == null)
-                    {
-                        plainText = DecodePart(subPart);
-                    }
-                    else if (!contentType.Contains("text/") && !string.IsNullOrEmpty(contentType))
-                    {
-                        // Binary part without explicit disposition — treat as attachment
-                        var attachment = ExtractAttachment(subPart, contentType, contentDisposition, contentId);
-                        if (attachment != null)
-                            attachments.Add(attachment);
-                    }
+                        FileName = part.FileName ?? $"inline_{Guid.NewGuid():N}.bin",
+                        ContentType = mimeType,
+                        ContentId = part.ContentId,
+                        IsInline = true,
+                        SizeBytes = data.LongLength,
+                        Data = data
+                    });
+                }
+                else if (mimeType == "text/html" && mail.HtmlBody == null)
+                {
+                    mail.HtmlBody = MimeDecoder.DecodePart(body, part.Encoding, part.Charset);
+                }
+                else if (mimeType == "text/plain" && mail.PlainTextBody == null)
+                {
+                    mail.PlainTextBody = MimeDecoder.DecodePart(body, part.Encoding, part.Charset);
                 }
             }
-            else
-            {
-                string contentType = GetRawHeaderValue(part, "Content-Type")?.ToLower() ?? "";
-                string trimmed = part.Trim();
-                string noWhitespace = trimmed.Replace("\r\n", "").Replace("\n", "").Replace("\r", "");
-
-                bool isBase64 = noWhitespace.Length > 0 &&
-                                Regex.IsMatch(noWhitespace, @"^[A-Za-z0-9+/]+=*$");
-
-                if (isBase64)
-                {
-                    try
-                    {
-                        byte[] bytes = Convert.FromBase64String(noWhitespace);
-                        string decoded = Encoding.UTF8.GetString(bytes);
-
-                        if (contentType.Contains("text/plain") && plainText == null)
-                            plainText = decoded;
-                        else if (html == null)
-                            html = decoded;
-                    }
-                    catch
-                    {
-                        if (html == null) html = DecodePart(part);
-                    }
-                }
-                else
-                {
-                    if (contentType.Contains("text/plain") && plainText == null)
-                        plainText = DecodePart(part);
-                    else if (html == null)
-                        html = DecodePart(part);
-                }
-            }
-
-            if (html == null && plainText != null)
-                html = $"<pre>{System.Net.WebUtility.HtmlEncode(plainText)}</pre>";
         }
 
-        /// <summary>
-        /// Extracts a single attachment part into a MailAttachment object.
-        /// Handles base64 and quoted-printable encoded attachments.
-        /// </summary>
-        private MailAttachment ExtractAttachment(string part, string contentType, string contentDisposition, string contentId)
+        // ─────────────────────────────────────────────────────────────────────
+        //  INTERNAL HELPERS
+        // ─────────────────────────────────────────────────────────────────────
+        private async Task SelectFolderAsync(string folder, CancellationToken ct)
         {
+            string tag = Tag();
+            await SendAsync($"{tag} SELECT {SafeFolder(folder)}", ct);
+            (await ReadTaggedAsync(tag, ct)).ThrowIfFailed($"SELECT {folder}");
+        }
+
+        private async Task SelectFolderInternalAsync(string folder, CancellationToken ct)
+            => await SelectFolderAsync(folder, ct);
+
+        private async Task<string[]> SearchAsync(string criteria, CancellationToken ct)
+        {
+            string tag = Tag();
+            await SendAsync($"{tag} UID SEARCH {criteria}", ct);
+            var resp = await ReadTaggedAsync(tag, ct);
+
+            foreach (string line in resp.Lines)
+            {
+                var m = Regex.Match(line, @"^\* SEARCH(.*)$", RegexOptions.IgnoreCase);
+                if (m.Success)
+                    return m.Groups[1].Value.Trim()
+                           .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            }
+            return new string[0];
+        }
+
+        private string BuildFlagSearch(ImapFlags flag, string emailFilter)
+        {
+            string search;
+            if (flag == ImapFlags.SEEN) search = "SEEN";
+            else if (flag == ImapFlags.UNSEEN) search = "UNSEEN";
+            else if (flag == ImapFlags.ANSWERED) search = "ANSWERED";
+            else if (flag == ImapFlags.UNANSWERED) search = "UNANSWERED";
+            else if (flag == ImapFlags.FLAGGED) search = "FLAGGED";
+            else if (flag == ImapFlags.UNFLAGGED) search = "UNFLAGGED";
+            else if (flag == ImapFlags.DELETED) search = "DELETED";
+            else if (flag == ImapFlags.UNDELETED) search = "UNDELETED";
+            else if (flag == ImapFlags.DRAFT) search = "DRAFT";
+            else if (flag == ImapFlags.UNDRAFT) search = "UNDRAFT";
+            else search = "ALL";
+
+            if (!string.IsNullOrEmpty(emailFilter))
+                search = $"FROM \"{emailFilter}\" {search}";
+
+            return search;
+        }
+
+        // ── Send ──────────────────────────────────────────────────────────────
+        private async Task SendAsync(string command, CancellationToken ct)
+        {
+            Console.WriteLine("[SEND] " + command);
+            await _writer.WriteLineAsync(command);
+        }
+
+        // ── Read tagged response ──────────────────────────────────────────────
+        private async Task<ImapResponse> ReadTaggedAsync(string tag, CancellationToken ct)
+        {
+            var resp = new ImapResponse { Tag = tag };
+
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                string line = await ReadLineAsync(ct);
+                Console.WriteLine($"[IMAP] {line}");
+
+                // Literal expansion
+                var litMatch = Regex.Match(line, @"\{(\d+)\}$");
+                if (litMatch.Success)
+                {
+                    int count = int.Parse(litMatch.Groups[1].Value);
+                    string data = await ReadLiteralAsync(count, ct);
+                    line = line + data;
+                }
+
+                resp.Lines.Add(line);
+
+                if (line.StartsWith(tag + " ", StringComparison.Ordinal))
+                {
+                    string status = line.Substring(tag.Length + 1);
+                    resp.IsOk = status.StartsWith("OK", StringComparison.OrdinalIgnoreCase);
+                    resp.IsNo = status.StartsWith("NO", StringComparison.OrdinalIgnoreCase);
+                    resp.IsBad = status.StartsWith("BAD", StringComparison.OrdinalIgnoreCase);
+                    resp.Raw = string.Join("\r\n", resp.Lines);
+                    if (resp.IsNo || resp.IsBad) IsConnected = false;
+                    return resp;
+                }
+
+                if (line.StartsWith("* BYE", StringComparison.OrdinalIgnoreCase))
+                {
+                    resp.IsBye = true;
+                    resp.Raw = string.Join("\r\n", resp.Lines);
+                    IsConnected = false;
+                    return resp;
+                }
+            }
+        }
+
+        // ── Read line WITH 60s timeout  (normal commands) ────────────────────
+        private async Task<string> ReadLineAsync(CancellationToken ct)
+        {
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(60));
             try
             {
-                int bodyIndex = part.IndexOf("\r\n\r\n");
-                int separatorLength = 4;
-                if (bodyIndex < 0) { bodyIndex = part.IndexOf("\n\n"); separatorLength = 2; }
-
-                string headers = bodyIndex >= 0 ? part.Substring(0, bodyIndex) : "";
-                string body = bodyIndex >= 0 ? part.Substring(bodyIndex + separatorLength) : part;
-                body = body.Trim();
-
-                // Extract filename from Content-Disposition or Content-Type
-                string fileName = ExtractFileName(headers);
-
-                // Extract full content-type (with charset etc.) from raw headers
-                string fullContentType = GetRawHeaderValue(headers, "Content-Type") ?? contentType;
-                // Strip parameters — keep just "image/png" not "image/png; name=foo.png"
-                string mimeType = fullContentType.Split(';')[0].Trim();
-
-                string encoding = GetRawHeaderValue(headers, "Content-Transfer-Encoding")?.ToLower() ?? "";
-
-                byte[] data;
-                if (encoding.Contains("base64"))
-                {
-                    string cleaned = Regex.Replace(body, @"\s", "");
-                    data = Convert.FromBase64String(cleaned);
-                }
-                else if (encoding.Contains("quoted-printable"))
-                {
-                    data = DecodeQuotedPrintable(body);
-                }
-                else
-                {
-                    data = Encoding.UTF8.GetBytes(body);
-                }
-
-                bool isInline = !string.IsNullOrEmpty(contentId) ||
-                                contentDisposition.Contains("inline");
-
-                return new MailAttachment
-                {
-                    FileName = string.IsNullOrEmpty(fileName) ? $"attachment_{Guid.NewGuid():N}.bin" : fileName,
-                    ContentType = string.IsNullOrEmpty(mimeType) ? "application/octet-stream" : mimeType,
-                    ContentId = string.IsNullOrEmpty(contentId) ? null : contentId,
-                    IsInline = isInline,
-                    SizeBytes = data.LongLength,
-                    Data = data
-                };
+                return await ReadLineRawAsync(cts.Token);
             }
-            catch
+            finally { cts.Dispose(); }
+        }
+
+        // ── Read line with NO timeout  (IDLE push — server may be silent for mins) ──
+        private async Task<string> ReadLineRawAsync(CancellationToken ct)
+        {
+            var sb = new StringBuilder(256);
+            while (true)
             {
-                return null;
+                ct.ThrowIfCancellationRequested();
+                char[] buf = new char[1];
+                int n = await _reader.ReadAsync(buf, 0, 1);
+                if (n == 0) return sb.ToString();
+                if (buf[0] == '\r') continue;
+                if (buf[0] == '\n') return sb.ToString();
+                sb.Append(buf[0]);
             }
         }
 
-        /// <summary>
-        /// Extracts filename from Content-Disposition or Content-Type headers.
-        /// Handles both filename= and name= parameters, and MIME encoded filenames.
-        /// </summary>
-        private string ExtractFileName(string headers)
+        private async Task<string> ReadLiteralAsync(int count, CancellationToken ct)
         {
-            // Try Content-Disposition: attachment; filename="foo.pdf"
-            string disposition = GetRawHeaderValue(headers, "Content-Disposition") ?? "";
-            var filenameMatch = Regex.Match(disposition, @"filename\*?=""?([^""\r\n;]+)""?", RegexOptions.IgnoreCase);
-            if (filenameMatch.Success)
-                return DecodeMimeEncodedWords(filenameMatch.Groups[1].Value.Trim());
+            char[] buf = new char[count];
+            int total = 0;
+            while (total < count)
+            {
+                ct.ThrowIfCancellationRequested();
+                int n = await _reader.ReadAsync(buf, total, count - total);
+                if (n <= 0) break;
+                total += n;
+            }
+            return new string(buf, 0, total);
+        }
 
-            // Try Content-Type: application/pdf; name="foo.pdf"
-            string contentType = GetRawHeaderValue(headers, "Content-Type") ?? "";
-            var nameMatch = Regex.Match(contentType, @"name\*?=""?([^""\r\n;]+)""?", RegexOptions.IgnoreCase);
-            if (nameMatch.Success)
-                return DecodeMimeEncodedWords(nameMatch.Groups[1].Value.Trim());
-
+        // ── Extract FETCH block for a specific UID ────────────────────────────
+        private string ExtractFetchBlock(string response, string uid)
+        {
+            // Find "* NNN FETCH (…)" that contains UID uid
+            foreach (Match m in Regex.Matches(response,
+                @"\* \d+ FETCH \((.+?)(?=\n\* |\n[A-Z]\d+ |\z)",
+                RegexOptions.Singleline))
+            {
+                string block = m.Groups[1].Value;
+                if (Regex.IsMatch(block, $@"\bUID\s+{Regex.Escape(uid)}\b"))
+                    return block;
+            }
             return null;
         }
 
-        /// <summary>
-        /// Replaces cid: references in HTML body with inline data URIs.
-        /// This makes embedded images (logos, signatures) visible in the browser
-        /// without needing a separate download endpoint.
-        ///
-        /// e.g. src="cid:image001@mail" → src="data:image/png;base64,iVBOR..."
-        /// </summary>
+        private string ExtractLiteralFromBlock(string block, string fieldName)
+        {
+            if (string.IsNullOrEmpty(block)) return null;
+            var m = Regex.Match(block,
+                $@"BODY\[{Regex.Escape(fieldName)}[^\]]*\]\s*\{{(\d+)\}}(.+)",
+                RegexOptions.Singleline | RegexOptions.IgnoreCase);
+            if (!m.Success) return null;
+            int len = int.Parse(m.Groups[1].Value);
+            string d = m.Groups[2].Value;
+            return d.Length >= len ? d.Substring(0, len) : d;
+        }
+
+        private string ExtractSectionBody(string response, string section)
+        {
+            var m = Regex.Match(response,
+                $@"BODY\[{Regex.Escape(section)}\]\s*\{{(\d+)\}}([\s\S]+)",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            if (!m.Success) return null;
+            int len = int.Parse(m.Groups[1].Value);
+            string d = m.Groups[2].Value;
+            return d.Length >= len ? d.Substring(0, len) : d;
+        }
+
+        private string ExtractField(string block, string fieldName)
+        {
+            if (string.IsNullOrEmpty(block)) return null;
+
+            var m = Regex.Match(block,
+                $@"{Regex.Escape(fieldName)}\s+(\(.+\)|\S+)",
+                RegexOptions.Singleline | RegexOptions.IgnoreCase);
+            if (!m.Success) return null;
+
+            string val = m.Groups[1].Value.Trim();
+
+            // If it's a paren group, find the balanced end
+            if (val.StartsWith("("))
+                return ExtractBalancedParens(block, m.Groups[1].Index);
+
+            return val;
+        }
+
+        private string ExtractBalancedParens(string s, int start)
+        {
+            int depth = 0;
+            bool inQ = false;
+            var sb = new StringBuilder();
+            for (int i = start; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '"') inQ = !inQ;
+                if (!inQ)
+                {
+                    if (c == '(') depth++;
+                    else if (c == ')') { depth--; sb.Append(c); if (depth == 0) break; continue; }
+                }
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        private List<string> ExtractFlagsFromResponse(string response, string uid)
+        {
+            foreach (string line in response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+            {
+                if (!line.Contains($"UID {uid}")) continue;
+                var m = Regex.Match(line, @"FLAGS\s*\(([^)]*)\)");
+                if (m.Success)
+                    return m.Groups[1].Value
+                           .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)
+                           .Select(f => f.TrimStart('\\').ToUpperInvariant())
+                           .ToList();
+            }
+            return new List<string>();
+        }
+
+        private List<string> ExtractFlagsFromBlock(string block)
+        {
+            if (string.IsNullOrEmpty(block)) return new List<string>();
+            var m = Regex.Match(block, @"FLAGS\s*\(([^)]*)\)");
+            if (!m.Success) return new List<string>();
+            return m.Groups[1].Value
+                   .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)
+                   .Select(f => f.TrimStart('\\').ToUpperInvariant())
+                   .ToList();
+        }
+
+        // ── Fallback raw-body parser (used when BODYSTRUCTURE is unavailable) ─
+        private void ParseRawBody(string raw, MailMessage mail)
+        {
+            // Strip FETCH wrapper
+            raw = Regex.Replace(raw, @"^\* \d+ FETCH \(.*?\r?\n", "", RegexOptions.Singleline);
+            raw = Regex.Replace(raw, @"\)\r?\n[A-Z]\d+ OK.*$", "", RegexOptions.Multiline).Trim();
+
+            string html = null;
+            string plainText = null;
+            var attaches = new List<MailAttachment>();
+
+            ParseMimePart(raw, ref html, ref plainText, attaches);
+
+            mail.HtmlBody = InjectImportant(ReplaceCidWithDataUri(html, attaches));
+            mail.PlainTextBody = plainText ?? MimeDecoder.HtmlToPlainText(html);
+            mail.Attachments = attaches;
+        }
+
+        private void ParseMimePart(
+            string part, ref string html, ref string plainText,
+            List<MailAttachment> attaches, int depth = 0)
+        {
+            if (depth > 10) return;
+
+            int hEnd = part.IndexOf("\r\n\r\n");
+            if (hEnd < 0) hEnd = part.IndexOf("\n\n");
+            string headerSection = hEnd >= 0 ? part.Substring(0, hEnd) : "";
+            var partHeaders = HeaderParser.Parse(headerSection);
+
+            string ct = HeaderParser.GetRaw(partHeaders, "Content-Type") ?? "";
+            string enc = HeaderParser.GetRaw(partHeaders, "Content-Transfer-Encoding") ?? "";
+            string disp = HeaderParser.GetRaw(partHeaders, "Content-Disposition") ?? "";
+            string cid = (HeaderParser.GetRaw(partHeaders, "Content-ID") ?? "").Trim('<', '>');
+            string boundary = MimeDecoder.ExtractBoundary(ct);
+
+            if (!string.IsNullOrEmpty(boundary))
+            {
+                string body = hEnd >= 0 ? part.Substring(hEnd + (part[hEnd] == '\r' ? 4 : 2)) : part;
+                var subParts = body.Split(new[] { "--" + boundary }, StringSplitOptions.None);
+                foreach (var sub in subParts)
+                {
+                    if (sub.TrimStart().StartsWith("--")) continue;
+                    if (string.IsNullOrWhiteSpace(sub)) continue;
+                    ParseMimePart(sub, ref html, ref plainText, attaches, depth + 1);
+                }
+                return;
+            }
+
+            string bodyText = hEnd >= 0
+                ? part.Substring(hEnd + (part[hEnd] == '\r' ? 4 : 2)).Trim()
+                : part.Trim();
+
+            bool isAtt = disp.IndexOf("attachment", StringComparison.OrdinalIgnoreCase) >= 0
+                      || (!string.IsNullOrEmpty(MimeDecoder.ExtractFilename(disp, ct)));
+
+            if (isAtt || (ct.IndexOf("text/", StringComparison.OrdinalIgnoreCase) < 0 && !string.IsNullOrEmpty(ct)))
+            {
+                byte[] data = MimeDecoder.DecodeAttachmentBytes(bodyText, enc);
+                attaches.Add(new MailAttachment
+                {
+                    FileName = MimeDecoder.ExtractFilename(disp, ct) ?? $"file_{Guid.NewGuid():N}.bin",
+                    ContentType = ct.Split(';')[0].Trim(),
+                    ContentId = string.IsNullOrEmpty(cid) ? null : cid,
+                    IsInline = !string.IsNullOrEmpty(cid) || disp.Contains("inline"),
+                    SizeBytes = data.LongLength,
+                    Data = data
+                });
+            }
+            else if (ct.IndexOf("text/html", StringComparison.OrdinalIgnoreCase) >= 0 && html == null)
+            {
+                html = MimeDecoder.DecodePart(bodyText, enc, MimeDecoder.ExtractCharset(ct));
+            }
+            else if (ct.IndexOf("text/plain", StringComparison.OrdinalIgnoreCase) >= 0 && plainText == null)
+            {
+                plainText = MimeDecoder.DecodePart(bodyText, enc, MimeDecoder.ExtractCharset(ct));
+            }
+        }
+
+        // ── HTML post-processing ──────────────────────────────────────────────
         private string ReplaceCidWithDataUri(string html, List<MailAttachment> attachments)
         {
-            if (string.IsNullOrEmpty(html) || attachments == null || attachments.Count == 0)
-                return html;
-
+            if (string.IsNullOrEmpty(html) || attachments == null) return html;
             return Regex.Replace(html, @"cid:([^\s""'>]+)", m =>
             {
                 string cid = m.Groups[1].Value.Trim();
-
-                // Match by ContentId (with or without angle brackets)
                 var match = attachments.FirstOrDefault(a =>
                     a.ContentId != null &&
                     (a.ContentId.Equals(cid, StringComparison.OrdinalIgnoreCase) ||
                      a.ContentId.Equals($"<{cid}>", StringComparison.OrdinalIgnoreCase)));
-
-                return match?.DataUri ?? m.Value; // replace with data URI or leave as-is
+                return match != null ? match.DataUri : m.Value;
             }, RegexOptions.IgnoreCase);
         }
 
         private string InjectImportant(string html)
         {
             if (string.IsNullOrEmpty(html)) return html;
-
             return Regex.Replace(html, @"style=""([^""]*)""", m =>
             {
-                string styleContent = m.Groups[1].Value;
-                var properties = styleContent.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
-                var result = new StringBuilder();
-
-                foreach (var prop in properties)
+                var sb = new StringBuilder();
+                foreach (var prop in m.Groups[1].Value.Split(';'))
                 {
-                    string trimmedProp = prop.Trim();
-                    if (string.IsNullOrEmpty(trimmedProp)) continue;
-
-                    if (!trimmedProp.EndsWith("!important", StringComparison.OrdinalIgnoreCase))
-                        result.Append(trimmedProp + " !important;");
-                    else
-                        result.Append(trimmedProp + ";");
+                    string p = prop.Trim();
+                    if (string.IsNullOrEmpty(p)) continue;
+                    sb.Append(p.EndsWith("!important", StringComparison.OrdinalIgnoreCase)
+                        ? p + ";"
+                        : p + " !important;");
                 }
-
-                return $"style=\"{result}\"";
+                return $"style=\"{sb}\"";
             }, RegexOptions.IgnoreCase);
         }
 
-        private string DecodePart(string part)
+        // ── Subject normalization ─────────────────────────────────────────────
+        private string NormalizeSubject(string s)
         {
-            if (string.IsNullOrWhiteSpace(part)) return string.Empty;
-
-            int bodyIndex = part.IndexOf("\r\n\r\n");
-            int separatorLength = 4;
-            if (bodyIndex < 0) { bodyIndex = part.IndexOf("\n\n"); separatorLength = 2; }
-
-            string headers = bodyIndex >= 0 ? part.Substring(0, bodyIndex) : "";
-            string body = bodyIndex >= 0 ? part.Substring(bodyIndex + separatorLength) : part;
-            body = body.Trim();
-
-            string encoding = GetRawHeaderValue(headers, "Content-Transfer-Encoding")?.ToLower() ?? "";
-            string charset = GetCharset(headers) ?? "UTF-8";
-
-            byte[] bytes;
-            if (encoding.Contains("base64"))
-            {
-                string cleaned = Regex.Replace(body, @"\s", "");
-                try { bytes = Convert.FromBase64String(cleaned); }
-                catch { return body; }
-            }
-            else if (encoding.Contains("quoted-printable"))
-            {
-                bytes = DecodeQuotedPrintable(body);
-            }
-            else
-            {
-                bytes = Encoding.UTF8.GetBytes(body);
-            }
-
-            Encoding enc;
-            try { enc = Encoding.GetEncoding(charset); }
-            catch { enc = Encoding.UTF8; }
-
-            return enc.GetString(bytes).Trim();
+            if (string.IsNullOrEmpty(s)) return s;
+            string result = s;
+            while (Regex.IsMatch(result, @"^\s*(Re|Fwd?)\s*:\s*", RegexOptions.IgnoreCase))
+                result = Regex.Replace(result, @"^\s*(Re|Fwd?)\s*:\s*", "", RegexOptions.IgnoreCase);
+            return result.Trim();
         }
 
-        private string HtmlToPlainText(string html)
-        {
-            if (string.IsNullOrEmpty(html)) return "";
-            string text = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
-            text = Regex.Replace(text, @"<[^>]+>", "", RegexOptions.IgnoreCase);
-            text = System.Net.WebUtility.HtmlDecode(text);
-            text = Regex.Replace(text, @"--[a-f0-9]{20,}.*", "", RegexOptions.IgnoreCase);
-            text = Regex.Replace(text, @"^Content-\w+:.*$", "", RegexOptions.Multiline | RegexOptions.IgnoreCase);
-            text = text.Replace("\r\n", "\n").Replace("\r", "\n");
-            text = Regex.Replace(text, @"\n{3,}", "\n\n");
-            return text.Trim();
-        }
-
-        private string GetBoundary(string message)
-        {
-            var match = Regex.Match(message, @"boundary=""?([^""\r\n;]+)""?", RegexOptions.IgnoreCase);
-            return match.Success ? match.Groups[1].Value : null;
-        }
-
-        #endregion
-
-        #region Header & Utils
-
-        private string NormalizeSubject(string subject)
-        {
-            if (string.IsNullOrEmpty(subject)) return subject;
-            string normalized = Regex.Replace(subject, @"^\s*(Re|Fwd|Fw)\s*:\s*", "", RegexOptions.IgnoreCase);
-            while (Regex.IsMatch(normalized, @"^\s*(Re|Fwd|Fw)\s*:\s*", RegexOptions.IgnoreCase))
-                normalized = Regex.Replace(normalized, @"^\s*(Re|Fwd|Fw)\s*:\s*", "", RegexOptions.IgnoreCase);
-            return normalized.Trim();
-        }
-
-        private string EscapeImapString(string input)
-        {
-            if (string.IsNullOrEmpty(input)) return input;
-            return input.Replace("\\", "\\\\").Replace("\"", "\\\"");
-        }
-
-        private void ParseFrom(string rawFrom, out string fromName, out string fromEmail)
-        {
-            fromName = null;
-            fromEmail = null;
-
-            if (string.IsNullOrWhiteSpace(rawFrom))
-            {
-                fromName = "?";
-                fromEmail = string.Empty;
-                return;
-            }
-
-            rawFrom = rawFrom.Trim();
-
-            var angleMatch = Regex.Match(rawFrom, @"^""?([^""<]*?)""?\s*<([^>]+)>$");
-            if (angleMatch.Success)
-            {
-                string name = angleMatch.Groups[1].Value.Trim();
-                string email = angleMatch.Groups[2].Value.Trim();
-                fromEmail = email;
-                fromName = string.IsNullOrEmpty(name) ? ExtractLocalPart(email) : name;
-                return;
-            }
-
-            if (Regex.IsMatch(rawFrom, @"^[^@\s]+@[^@\s]+\.[^@\s]+$"))
-            {
-                fromEmail = rawFrom;
-                fromName = ExtractLocalPart(rawFrom);
-                return;
-            }
-
-            fromName = rawFrom;
-            fromEmail = string.Empty;
-        }
-
-        private string ExtractLocalPart(string email)
-        {
-            if (string.IsNullOrEmpty(email)) return "?";
-            int atIndex = email.IndexOf('@');
-            string local = atIndex > 0 ? email.Substring(0, atIndex) : email;
-            return local.Length > 0 ? char.ToUpper(local[0]) + local.Substring(1) : local;
-        }
-
+        // ── Avatar builder ────────────────────────────────────────────────────
         private string BuildInitialsSpan(string input)
         {
             if (string.IsNullOrWhiteSpace(input)) input = "?";
-
             var words = input.Trim().Split(new[] { ' ', '.', '_', '-' }, StringSplitOptions.RemoveEmptyEntries);
             string initials = words.Length >= 2
-                ? $"{words[0][0]}{words[words.Length - 1][0]}"
+                ? string.Concat(words[0][0].ToString(), words[words.Length - 1][0].ToString())
                 : words[0].Substring(0, Math.Min(2, words[0].Length));
-
             initials = initials.ToUpper();
-            string color = GetColorForLetter(initials);
-
-            return $"<span class=\"rounded-circle text-white fw-bold d-inline-flex align-items-center justify-content-center flex-shrink-0\" " +
-                   $"style=\"width:34px; height:34px; font-size:.7rem; background-color:{color}\">" +
-                   $"{initials}" +
-                   $"</span>";
+            string color = GetColorForInitial(initials[0]);
+            return $"<span class=\"rounded-circle text-white fw-bold d-inline-flex align-items-center " +
+                   $"justify-content-center flex-shrink-0\" " +
+                   $"style=\"width:34px;height:34px;font-size:.7rem;background-color:{color}\">" +
+                   $"{initials}</span>";
         }
 
-        private string GetColorForLetter(string input)
+        private string GetColorForInitial(char c)
         {
-            if (string.IsNullOrEmpty(input)) return "#6c757d";
-            char firstChar = char.ToUpper(input[0]);
-            string[] colors = new[]
-            {
-                "#e74c3c", "#3498db", "#2ecc71", "#f1c40f",
-                "#9b59b6", "#e67e22", "#1abc9c", "#34495e"
-            };
-            return colors[firstChar % colors.Length];
+            string[] colors = { "#e74c3c", "#3498db", "#2ecc71", "#f1c40f", "#9b59b6", "#e67e22", "#1abc9c", "#34495e" };
+            return colors[char.ToUpper(c) % colors.Length];
         }
 
-        private List<string> ParseAddressList(string headerValue)
+        // ── Misc ──────────────────────────────────────────────────────────────
+        private string Tag() => "A" + _tag++;
+        private string SafeFolder(string f) => f.Contains(' ') ? $"\"{f}\"" : f;
+        private string EscapeImap(string s) => s == null ? "" : s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
+        public void Dispose()
         {
-            var result = new List<string>();
-            if (string.IsNullOrWhiteSpace(headerValue)) return result;
-
-            var addresses = Regex.Split(headerValue, @",(?=(?:[^""]*""[^""]*"")*[^""]*$)");
-            foreach (var addr in addresses)
-            {
-                string trimmed = addr.Trim();
-                if (string.IsNullOrEmpty(trimmed)) continue;
-                var match = Regex.Match(trimmed, @"<([^>]+)>");
-                if (match.Success)
-                    result.Add(match.Groups[1].Value.Trim());
-                else if (Regex.IsMatch(trimmed, @"^[^@\s]+@[^@\s]+\.[^@\s]+$"))
-                    result.Add(trimmed);
-                else
-                    result.Add(trimmed);
-            }
-            return result;
+            LogoutAsync().GetAwaiter().GetResult();
+            _lock.Dispose();
         }
-
-        private string GetRawHeaderValue(string block, string name)
-        {
-            if (string.IsNullOrEmpty(block)) return null;
-
-            int headerEnd = block.IndexOf("\r\n\r\n");
-            if (headerEnd < 0) headerEnd = block.IndexOf("\n\n");
-            if (headerEnd > 0) block = block.Substring(0, headerEnd);
-            if (block.Length > 4096) block = block.Substring(0, 4096);
-
-            var lines = block.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-            string current = null;
-            string foundName = null;
-
-            foreach (var line in lines)
-            {
-                if ((line.StartsWith(" ") || line.StartsWith("\t")) && current != null)
-                {
-                    current += " " + line.Trim();
-                    continue;
-                }
-
-                int colon = line.IndexOf(':');
-                if (colon <= 0)
-                {
-                    if (current != null && foundName != null) return current;
-                    continue;
-                }
-
-                string headerName = line.Substring(0, colon).Trim();
-                string headerValue = line.Substring(colon + 1).Trim();
-
-                if (headerName.Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    current = headerValue;
-                    foundName = headerName;
-                }
-                else if (current != null)
-                {
-                    return current;
-                }
-            }
-
-            return current;
-        }
-
-        private string GetHeaderValue(string headers, string name)
-        {
-            if (string.IsNullOrEmpty(headers)) return null;
-
-            var lines = headers.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-            string currentHeader = null;
-
-            foreach (var line in lines)
-            {
-                if ((line.StartsWith(" ") || line.StartsWith("\t")) && currentHeader != null)
-                {
-                    currentHeader += line.Trim();
-                    continue;
-                }
-
-                int colonIndex = line.IndexOf(':');
-                if (colonIndex <= 0) continue;
-
-                string headerName = line.Substring(0, colonIndex).Trim();
-                string headerValue = line.Substring(colonIndex + 1).Trim();
-
-                if (headerName.Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    // ✅ Always return full raw value — let ParseFrom / ParseAddressList handle splitting
-                    currentHeader = headerValue;
-                    return currentHeader;
-                }
-            }
-
-            return null;
-        }
-        private DateTime? ParseDate(string dateHeader)
-        {
-            if (string.IsNullOrWhiteSpace(dateHeader))
-                return null;
-
-            // Remove comments like (PST)
-            dateHeader = Regex.Replace(dateHeader, @"\s*\(.*?\)", "");
-
-            // Normalize multiple spaces
-            dateHeader = Regex.Replace(dateHeader, @"\s+", " ").Trim();
-
-            // Try DateTimeOffset first (handles timezone offsets)
-            if (DateTimeOffset.TryParse(
-                dateHeader,
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal,
-                out var dto))
-            {
-                return dto.UtcDateTime;
-            }
-
-            // Fallback to DateTime
-            if (DateTime.TryParse(
-                dateHeader,
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.AllowWhiteSpaces,
-                out var dt))
-            {
-                return dt;
-            }
-
-            return null; // Never return MinValue
-        }
-
-        private string[] ParseMessageIds(string response)
-        {
-            var match = Regex.Match(response, @"\* SEARCH(.*)", RegexOptions.IgnoreCase);
-            if (!match.Success) return new string[0];
-            return match.Groups[1].Value.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-        }
-
-        private byte[] DecodeQuotedPrintable(string input)
-        {
-            if (string.IsNullOrEmpty(input)) return new byte[0];
-            input = input.Replace("=\r\n", "").Replace("=\n", "");
-            var bytes = new List<byte>();
-            for (int i = 0; i < input.Length; i++)
-            {
-                if (input[i] == '=' && i + 2 < input.Length)
-                {
-                    string hex = input.Substring(i + 1, 2);
-                    if (byte.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out byte b))
-                    {
-                        bytes.Add(b);
-                        i += 2;
-                    }
-                }
-                else
-                {
-                    bytes.Add((byte)input[i]);
-                }
-            }
-            return bytes.ToArray();
-        }
-
-        private string DecodeMimeEncodedWords(string input)
-        {
-            if (string.IsNullOrEmpty(input)) return input;
-            try
-            {
-                var match = Regex.Match(input, @"=\?(.+?)\?(B|Q)\?(.+?)\?=", RegexOptions.IgnoreCase);
-                if (!match.Success) return input;
-
-                string charset = match.Groups[1].Value;
-                string method = match.Groups[2].Value.ToUpper();
-                string encoded = match.Groups[3].Value;
-
-                if (method == "B")
-                {
-                    var bytes = Convert.FromBase64String(encoded);
-                    return Encoding.GetEncoding(charset).GetString(bytes);
-                }
-                if (method == "Q")
-                {
-                    encoded = encoded.Replace('_', ' ');
-                    return Encoding.GetEncoding(charset).GetString(DecodeQuotedPrintable(encoded));
-                }
-            }
-            catch { }
-            return input;
-        }
-
-        private string GetCharset(string headers)
-        {
-            var contentType = GetRawHeaderValue(headers, "Content-Type");
-            if (contentType == null) return null;
-            var match = Regex.Match(contentType, @"charset\s*=\s*[""']?(?<charset>[^;""'\s]+)");
-            return match.Success ? match.Groups["charset"].Value : null;
-        }
-
-        private string GetTag() => "A" + tagCounter++;
-
-        private async Task<string> ReadResponseAsync(string tag)
-        {
-            var sb = new StringBuilder();
-            string line;
-
-            while (true)
-            {
-                var readTask = reader.ReadLineAsync();
-                if (await Task.WhenAny(readTask, Task.Delay(60000)) != readTask)
-                    throw new TimeoutException($"IMAP timeout waiting for: {tag}");
-
-                line = await readTask;
-                if (line == null) break;
-
-                Console.WriteLine($"[IMAP] {line}");
-
-                if (Regex.IsMatch(line, @"^A\d+ NO", RegexOptions.IgnoreCase))
-                    isConnected = false;
-
-                sb.AppendLine(line);
-
-                var literalMatch = Regex.Match(line, @"\{(\d+)\}$");
-                if (literalMatch.Success)
-                {
-                    int bytesToRead = int.Parse(literalMatch.Groups[1].Value);
-                    Console.WriteLine($"[IMAP] Reading literal {bytesToRead} bytes...");
-
-                    // ✅ Use StreamReader — it owns the internal read buffer, NOT sslStream directly
-                    char[] charBuffer = new char[bytesToRead];
-                    int totalRead = 0;
-
-                    while (totalRead < bytesToRead)
-                    {
-                        int remaining = bytesToRead - totalRead;
-                        var readCharsTask = reader.ReadAsync(charBuffer, totalRead, remaining);
-
-                        if (await Task.WhenAny(readCharsTask, Task.Delay(60000)) != readCharsTask)
-                            throw new TimeoutException($"Timeout reading literal body at {totalRead}/{bytesToRead}");
-
-                        int r = await readCharsTask;
-                        if (r <= 0) break;
-                        totalRead += r;
-                    }
-
-                    string literalContent = new string(charBuffer, 0, totalRead);
-                    sb.Append(literalContent);
-                    Console.WriteLine($"[IMAP] Literal read complete: {totalRead} chars");
-
-                    await reader.ReadLineAsync(); // consume trailing CRLF
-                }
-
-                if (line.StartsWith(tag + " "))
-                    break;
-            }
-
-            return sb.ToString();
-        }
-
-        private bool EnsureOk(string response)
-        {
-            if (!response.Contains("OK"))
-                throw new Exception("IMAP Error:\n" + response);
-            return true;
-        }
-
-        #endregion
     }
 }
