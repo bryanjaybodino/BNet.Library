@@ -452,7 +452,58 @@ namespace BNet.IMAP.Mailer
             }
             finally { _lock.Release(); }
         }
+        // ── Create Folder ──────────────────────────────────────────────────────────
+        public async Task<bool> CreateFolderAsync(string folderName)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                if (writer == null) throw new Exception("Not connected.");
+                string safeFolder = folderName.Contains(" ") ? $"\"{folderName}\"" : folderName;
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} CREATE {safeFolder}");
+                return EnsureOk(await ReadResponseAsync(tag));
+            }
+            finally { _lock.Release(); }
+        }
 
+        // ── Mark as Important (\Flagged) ───────────────────────────────────────────
+        public async Task<bool> MarkAsImportantAsync(string id, string folder = "INBOX")
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                if (writer == null) throw new Exception("Not connected.");
+                string safeFolder = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                string tagSelect = GetTag();
+                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolder}");
+                EnsureOk(await ReadResponseAsync(tagSelect));
+
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Flagged)");
+                return EnsureOk(await ReadResponseAsync(tag));
+            }
+            finally { _lock.Release(); }
+        }
+
+        // ── Unmark Important ──────────────────────────────────────────────────────
+        public async Task<bool> MarkAsUnimportantAsync(string id, string folder = "INBOX")
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                if (writer == null) throw new Exception("Not connected.");
+                string safeFolder = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                string tagSelect = GetTag();
+                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolder}");
+                EnsureOk(await ReadResponseAsync(tagSelect));
+
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} UID STORE {id} -FLAGS (\\Flagged)");
+                return EnsureOk(await ReadResponseAsync(tag));
+            }
+            finally { _lock.Release(); }
+        }
         public async Task<List<string>> ListMailboxesAsync()
         {
             await _lock.WaitAsync();
