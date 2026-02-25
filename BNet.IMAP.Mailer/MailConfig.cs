@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -40,6 +41,7 @@ namespace BNet.IMAP.Mailer
         public List<string> To { get; set; }
         public List<string> CC { get; set; }
         public List<string> BCC { get; set; }
+        public List<string> Flags { get; set; } = new List<string>();
         public string Id { get; set; }
 
         // From broken into 3 parts
@@ -72,6 +74,7 @@ namespace BNet.IMAP.Mailer
         public List<string> To { get; set; }
         public List<string> CC { get; set; }
         public List<string> BCC { get; set; }
+        public List<string> Flags { get; set; }
         public string Id { get; set; }
 
         // From broken into 3 parts
@@ -212,7 +215,7 @@ namespace BNet.IMAP.Mailer
 
                 string uidSet = string.Join(",", pageUids);
                 string tagFetch = GetTag();
-                await writer.WriteLineAsync($"{tagFetch} UID FETCH {uidSet} (BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])");
+                await writer.WriteLineAsync( $"{tagFetch} UID FETCH {uidSet} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])");
                 string response = await ReadResponseAsync(tagFetch);
 
                 var mailInboxes = new List<MailInboxes>();
@@ -236,6 +239,7 @@ namespace BNet.IMAP.Mailer
                         BCC = ParseAddressList(GetHeaderValue(messageBlock, "BCC")),
                         Subject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject")),
                         Date = (DateTime)ParseDate(GetHeaderValue(messageBlock, "Date")),
+                        Flags = ExtractFlags(response, uid),
                         TotalEmail = totalEmails,
                         TotalPagination = totalPages,
                         Submail = new List<MailMessage>()
@@ -283,7 +287,7 @@ namespace BNet.IMAP.Mailer
                 EnsureOk(await ReadResponseAsync(tagSelect));
 
                 string tagFetch = GetTag();
-                await writer.WriteLineAsync($"{tagFetch} UID FETCH {id} (BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])");
+                await writer.WriteLineAsync($"{tagFetch} UID FETCH {id} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE)])"); // ✅ id not uidSet
                 string headerResponse = await ReadResponseAsync(tagFetch);
 
                 string messageBlock = ExtractHeaderFields(headerResponse, id);
@@ -291,7 +295,6 @@ namespace BNet.IMAP.Mailer
                 string rawFrom = GetHeaderValue(messageBlock, "From");
 
                 ParseFrom(rawFrom, out string fromName, out string fromEmail);
-
                 string normalizedSubject = NormalizeSubject(rawSubject);
 
                 var primary = new MailInboxes
@@ -307,6 +310,7 @@ namespace BNet.IMAP.Mailer
                     BCC = ParseAddressList(GetHeaderValue(messageBlock, "BCC")),
                     Subject = rawSubject,
                     Date = (DateTime)ParseDate(GetHeaderValue(messageBlock, "Date")),
+                    Flags = ExtractFlags(headerResponse, id), // ✅ already correct
                     Submail = new List<MailMessage>()
                 };
 
@@ -315,7 +319,6 @@ namespace BNet.IMAP.Mailer
                 string searchResponse = await ReadResponseAsync(tagSearch);
 
                 string[] relatedUids = ParseMessageIds(searchResponse);
-
                 var threadUids = relatedUids
                     .Where(u => u != id)
                     .OrderBy(u => long.TryParse(u, out long n) ? n : 0)
@@ -506,6 +509,30 @@ namespace BNet.IMAP.Mailer
 
         #region Internal Fetch
 
+        // Fix the method to find FLAGS for a specific UID
+        private List<string> ExtractFlags(string response, string uid)
+        {
+            // Find the FETCH line for this specific UID
+            var lines = response.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var line in lines)
+            {
+                // Match lines like: * 5 FETCH (UID 123 FLAGS (\Seen \Answered) ...
+                if (!line.Contains($"UID {uid}") && !line.Contains("FETCH")) continue;
+
+                var match = Regex.Match(line, @"FLAGS\s*\(([^)]*)\)");
+                if (match.Success)
+                {
+                    return match.Groups[1].Value
+                   .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)
+                   .Select(f => f.TrimStart('\\').ToUpperInvariant()) // Remove leading '\' and normalize
+                   .ToList();
+                }
+            }
+
+            return new List<string>();
+        }
+
         /// <summary>
         /// Core method: fetches a full email by UID, extracts body + attachments.
         /// skipSelect = true when folder is already selected (used inside GetThreadAsync).
@@ -520,16 +547,23 @@ namespace BNet.IMAP.Mailer
                 await ReadResponseAsync(tagSelect);
             }
 
+            // ✅ Fetch FLAGS separately to avoid corrupting the body literal parser
+            string tagFlags = GetTag();
+            await writer.WriteLineAsync($"{tagFlags} UID FETCH {id} (UID FLAGS)");
+            string flagsResponse = await ReadResponseAsync(tagFlags);
+            List<string> flags = ExtractFlags(flagsResponse, id);
+
+            // Fetch full body
             string tagFetch = GetTag();
             await writer.WriteLineAsync($"{tagFetch} UID FETCH {id} (BODY[])");
             await writer.FlushAsync();
-
             string fullMessage = await ReadResponseAsync(tagFetch);
 
             string rawFrom = GetHeaderValue(fullMessage, "From");
             ParseFrom(rawFrom, out string fromName, out string fromEmail);
 
             var mail = new MailMessage { Id = id };
+            mail.Flags = flags; // ✅
             mail.From = rawFrom;
             mail.FromName = fromName;
             mail.FromEmail = fromEmail;
@@ -540,34 +574,40 @@ namespace BNet.IMAP.Mailer
             mail.CC = ParseAddressList(GetHeaderValue(fullMessage, "CC"));
             mail.BCC = ParseAddressList(GetHeaderValue(fullMessage, "BCC"));
 
-            // ✅ Extract body AND attachments in one pass
             ExtractBodies(fullMessage, out string html, out string plainText, out List<MailAttachment> attachments);
-
             mail.HtmlBody = InjectImportant(ReplaceCidWithDataUri(html, attachments));
             mail.PlainTextBody = !string.IsNullOrEmpty(plainText) ? plainText : HtmlToPlainText(html);
             mail.Attachments = attachments;
 
             return mail;
         }
-
         #endregion
 
         #region Body & Attachment Extraction
         private string ExtractHeaderFields(string response, string uid)
         {
-            string marker = $"UID {uid} BODY[HEADER.FIELDS";
+            // ✅ FLAGS is now between UID and BODY, so search for BODY[HEADER.FIELDS after UID {uid}
+            string marker = $"UID {uid}";
             int uidIndex = response.IndexOf(marker);
             if (uidIndex == -1) return string.Empty;
 
-            int literalStart = response.IndexOf("{", uidIndex);
+            // From the UID position, find the next BODY[HEADER.FIELDS
+            int bodyIndex = response.IndexOf("BODY[HEADER.FIELDS", uidIndex);
+            if (bodyIndex == -1) return string.Empty;
+
+            int literalStart = response.IndexOf("{", bodyIndex);
             int literalEnd = response.IndexOf("}", literalStart);
             if (literalStart == -1 || literalEnd == -1) return string.Empty;
+
+            // Make sure the literal brace belongs to this FETCH block, not the next
+            int nextUidIndex = response.IndexOf($"UID ", uidIndex + marker.Length);
+            if (nextUidIndex != -1 && literalStart > nextUidIndex) return string.Empty;
 
             string lengthStr = response.Substring(literalStart + 1, literalEnd - literalStart - 1);
             if (!int.TryParse(lengthStr, out int literalLength)) return string.Empty;
 
             int headerStart = response.IndexOf("\r\n", literalEnd) + 2;
-            if (headerStart == -1) return string.Empty;
+            if (headerStart <= 1) return string.Empty;
             if (headerStart + literalLength > response.Length) return string.Empty;
 
             return response.Substring(headerStart, literalLength).Trim();
