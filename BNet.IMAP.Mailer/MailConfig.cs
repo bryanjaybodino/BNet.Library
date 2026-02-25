@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Security;
@@ -234,7 +235,7 @@ namespace BNet.IMAP.Mailer
                         CC = ParseAddressList(GetHeaderValue(messageBlock, "CC")),
                         BCC = ParseAddressList(GetHeaderValue(messageBlock, "BCC")),
                         Subject = DecodeMimeEncodedWords(GetHeaderValue(messageBlock, "Subject")),
-                        Date = ParseDate(GetHeaderValue(messageBlock, "Date")),
+                        Date = (DateTime)ParseDate(GetHeaderValue(messageBlock, "Date")),
                         TotalEmail = totalEmails,
                         TotalPagination = totalPages,
                         Submail = new List<MailMessage>()
@@ -305,7 +306,7 @@ namespace BNet.IMAP.Mailer
                     CC = ParseAddressList(GetHeaderValue(messageBlock, "CC")),
                     BCC = ParseAddressList(GetHeaderValue(messageBlock, "BCC")),
                     Subject = rawSubject,
-                    Date = ParseDate(GetHeaderValue(messageBlock, "Date")),
+                    Date = (DateTime)ParseDate(GetHeaderValue(messageBlock, "Date")),
                     Submail = new List<MailMessage>()
                 };
 
@@ -372,12 +373,17 @@ namespace BNet.IMAP.Mailer
         // ─────────────────────────────────────────────────────────────────────
         //  MARK AS SEEN / DELETE / MOVE / LIST MAILBOXES / LOGOUT
         // ─────────────────────────────────────────────────────────────────────
-        public async Task<bool> MarkAsSeenAsync(string id)
+        public async Task<bool> MarkAsSeenAsync(string id, string folder = "INBOX")
         {
             await _lock.WaitAsync();
             try
             {
                 if (writer == null) throw new Exception("Not connected.");
+                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                string tagSelect = GetTag();
+                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
+                EnsureOk(await ReadResponseAsync(tagSelect));
+
                 string tag = GetTag();
                 await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Seen)");
                 return EnsureOk(await ReadResponseAsync(tag));
@@ -385,30 +391,60 @@ namespace BNet.IMAP.Mailer
             finally { _lock.Release(); }
         }
 
-        public async Task<bool> DeleteMessageAsync(string id)
+        public async Task<bool> MarkAsUnseenAsync(string id, string folder = "INBOX")
         {
             await _lock.WaitAsync();
             try
             {
                 if (writer == null) throw new Exception("Not connected.");
+                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                string tagSelect = GetTag();
+                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
+                EnsureOk(await ReadResponseAsync(tagSelect));
+
+                string tag = GetTag();
+                await writer.WriteLineAsync($"{tag} UID STORE {id} -FLAGS (\\Seen)");
+                return EnsureOk(await ReadResponseAsync(tag));
+            }
+            finally { _lock.Release(); }
+        }
+
+        public async Task<bool> DeleteMessageAsync(string id, string folder = "INBOX")
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                if (writer == null) throw new Exception("Not connected.");
+                string safeFolderName = folder.Contains(" ") ? $"\"{folder}\"" : folder;
+                string tagSelect = GetTag();
+                await writer.WriteLineAsync($"{tagSelect} SELECT {safeFolderName}");
+                EnsureOk(await ReadResponseAsync(tagSelect));
+
                 string tag = GetTag();
                 await writer.WriteLineAsync($"{tag} UID STORE {id} +FLAGS (\\Deleted)");
                 EnsureOk(await ReadResponseAsync(tag));
+
                 tag = GetTag();
                 await writer.WriteLineAsync($"{tag} EXPUNGE");
                 return EnsureOk(await ReadResponseAsync(tag));
             }
             finally { _lock.Release(); }
         }
-
-        public async Task<bool> MoveToFolderAsync(string id, string folder)
+        public async Task<bool> MoveToFolderAsync(string id, string sourceFolder = "INBOX", string destinationFolder = "INBOX")
         {
             await _lock.WaitAsync();
             try
             {
                 if (writer == null) throw new Exception("Not connected.");
+                string safeSource = sourceFolder.Contains(" ") ? $"\"{sourceFolder}\"" : sourceFolder;
+                string safeDestination = destinationFolder.Contains(" ") ? $"\"{destinationFolder}\"" : destinationFolder;
+
+                string tagSelect = GetTag();
+                await writer.WriteLineAsync($"{tagSelect} SELECT {safeSource}");
+                EnsureOk(await ReadResponseAsync(tagSelect));
+
                 string tag = GetTag();
-                await writer.WriteLineAsync($"{tag} UID MOVE {id} \"{folder}\"");
+                await writer.WriteLineAsync($"{tag} UID MOVE {id} {safeDestination}");
                 return EnsureOk(await ReadResponseAsync(tag));
             }
             finally { _lock.Release(); }
@@ -499,7 +535,7 @@ namespace BNet.IMAP.Mailer
             mail.FromEmail = fromEmail;
             mail.FromImage = BuildInitialsSpan(fromName ?? fromEmail);
             mail.Subject = DecodeMimeEncodedWords(GetHeaderValue(fullMessage, "Subject"));
-            mail.Date = ParseDate(GetHeaderValue(fullMessage, "Date"));
+            mail.Date = (DateTime)ParseDate(GetHeaderValue(fullMessage, "Date"));
             mail.To = ParseAddressList(GetHeaderValue(fullMessage, "To"));
             mail.CC = ParseAddressList(GetHeaderValue(fullMessage, "CC"));
             mail.BCC = ParseAddressList(GetHeaderValue(fullMessage, "BCC"));
@@ -1025,11 +1061,38 @@ namespace BNet.IMAP.Mailer
 
             return null;
         }
-
-        private DateTime ParseDate(string dateHeader)
+        private DateTime? ParseDate(string dateHeader)
         {
-            DateTime.TryParse(dateHeader, out var dt);
-            return dt;
+            if (string.IsNullOrWhiteSpace(dateHeader))
+                return null;
+
+            // Remove comments like (PST)
+            dateHeader = Regex.Replace(dateHeader, @"\s*\(.*?\)", "");
+
+            // Normalize multiple spaces
+            dateHeader = Regex.Replace(dateHeader, @"\s+", " ").Trim();
+
+            // Try DateTimeOffset first (handles timezone offsets)
+            if (DateTimeOffset.TryParse(
+                dateHeader,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal,
+                out var dto))
+            {
+                return dto.UtcDateTime;
+            }
+
+            // Fallback to DateTime
+            if (DateTime.TryParse(
+                dateHeader,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces,
+                out var dt))
+            {
+                return dt;
+            }
+
+            return null; // Never return MinValue
         }
 
         private string[] ParseMessageIds(string response)
