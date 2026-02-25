@@ -14,7 +14,8 @@ Lightweight, dependency-free IMAP client for .NET to fetch, read, move, and mana
 - 🧵 Fetch email threads (conversation grouping by subject)
 - 👤 Sender profile: `FromName`, `FromEmail`, `FromImage` (colored initials avatar)
 - 🖼 Inline images auto-replaced with data URIs (renders without extra requests)
-- ✅ Mark message as read
+- 🏷 Per-message IMAP flags (`Seen`, `Answered`, `Flagged`, `Deleted`, `Draft`, etc.)
+- ✅ Mark message as read / unread
 - 🗑 Delete and expunge messages
 - 📂 Move messages to another folder
 - 📋 List all mailboxes
@@ -59,7 +60,7 @@ public class MailAttachment
 ---
 
 ### MailMessage
-Represents a full email with body content and attachments.
+Represents a full email with body content, attachments, and flags.
 
 ```csharp
 public class MailMessage
@@ -76,6 +77,7 @@ public class MailMessage
     public DateTime     Date          { get; set; }
     public string       HtmlBody      { get; set; }  // full HTML (inline images auto-replaced with data URIs)
     public string       PlainTextBody { get; set; }  // plain text fallback
+    public List<string> Flags         { get; set; }  // ✅ NEW — e.g. ["Seen", "Answered"]
 
     public List<MailAttachment> Attachments       { get; set; }  // all attachments (inline + file)
     public List<MailAttachment> FileAttachments   { get; }       // only downloadable file attachments
@@ -102,6 +104,7 @@ public class MailInboxes
     public List<string> To              { get; set; }
     public List<string> CC              { get; set; }
     public List<string> BCC             { get; set; }
+    public List<string> Flags           { get; set; }  // ✅ NEW — e.g. ["Seen", "Flagged"]
     public string       Subject         { get; set; }
     public string       Folder          { get; set; }  // "INBOX", "Sent", etc.
     public DateTime     Date            { get; set; }
@@ -140,6 +143,7 @@ foreach (var message in inbox)
     Console.WriteLine($"Subject:    {message.Subject}");
     Console.WriteLine($"Date:       {message.Date}");
     Console.WriteLine($"Folder:     {message.Folder}");
+    Console.WriteLine($"Flags:      {string.Join(", ", message.Flags)}");  // ✅ NEW
 }
 ```
 
@@ -202,6 +206,7 @@ Console.WriteLine($"To:        {string.Join(", ", msg.To)}");
 Console.WriteLine($"CC:        {string.Join(", ", msg.CC)}");
 Console.WriteLine($"Subject:   {msg.Subject}");
 Console.WriteLine($"Date:      {msg.Date:g}");
+Console.WriteLine($"Flags:     {string.Join(", ", msg.Flags)}");  // ✅ NEW
 Console.WriteLine($"PlainText: {msg.PlainTextBody}");
 Console.WriteLine($"HtmlBody:  {msg.HtmlBody}");
 ```
@@ -241,14 +246,16 @@ var thread = await mail.GetThreadAsync("MESSAGE_UID", "INBOX");
 Console.WriteLine($"Subject: {thread.Subject}");
 Console.WriteLine($"From:    {thread.FromName} <{thread.FromEmail}>");
 Console.WriteLine($"Date:    {thread.Date:g}");
+Console.WriteLine($"Flags:   {string.Join(", ", thread.Flags)}");  // ✅ NEW
 Console.WriteLine($"Replies: {thread.Submail?.Count ?? 0}");
 
 // Thread replies — already full MailMessage with body + attachments
 foreach (var reply in thread.Submail ?? new())
 {
     Console.WriteLine($"  [{reply.Id}] {reply.Subject}");
-    Console.WriteLine($"         From: {reply.FromName} <{reply.FromEmail}>");
-    Console.WriteLine($"         Date: {reply.Date:g}");
+    Console.WriteLine($"         From  : {reply.FromName} <{reply.FromEmail}>");
+    Console.WriteLine($"         Date  : {reply.Date:g}");
+    Console.WriteLine($"         Flags : {string.Join(", ", reply.Flags)}");  // ✅ NEW
 
     if (reply.HasAttachments)
         foreach (var file in reply.FileAttachments)
@@ -273,6 +280,17 @@ Thread subject normalization — all of the below map to the same thread:
 ### ✅ Mark Message as Read
 ```csharp
 await mail.MarkAsSeenAsync("MESSAGE_UID");
+
+// With explicit folder
+await mail.MarkAsSeenAsync("MESSAGE_UID", "INBOX");
+```
+
+### ✅ Mark Message as Unread ✅ NEW
+```csharp
+await mail.MarkAsUnseenAsync("MESSAGE_UID");
+
+// With explicit folder
+await mail.MarkAsUnseenAsync("MESSAGE_UID", "INBOX");
 ```
 
 ---
@@ -280,6 +298,9 @@ await mail.MarkAsSeenAsync("MESSAGE_UID");
 ### 🗑 Delete Message
 ```csharp
 await mail.DeleteMessageAsync("MESSAGE_UID");
+
+// With explicit folder
+await mail.DeleteMessageAsync("MESSAGE_UID", "INBOX");
 ```
 
 > ⚠️ This permanently removes the email. Move to Trash first if you want recoverable deletion.
@@ -288,12 +309,14 @@ await mail.DeleteMessageAsync("MESSAGE_UID");
 
 ### 📂 Move Message to Folder
 ```csharp
-await mail.MoveToFolderAsync("MESSAGE_UID", "Archive");
+await mail.MoveToFolderAsync("MESSAGE_UID", sourceFolder: "INBOX", destinationFolder: "Archive");
 
 // Gmail examples
-await mail.MoveToFolderAsync("MESSAGE_UID", "[Gmail]/Trash");
-await mail.MoveToFolderAsync("MESSAGE_UID", "[Gmail]/All Mail");
+await mail.MoveToFolderAsync("MESSAGE_UID", "INBOX", "[Gmail]/Trash");
+await mail.MoveToFolderAsync("MESSAGE_UID", "INBOX", "[Gmail]/All Mail");
 ```
+
+> ⚠️ `UID MOVE` requires the MOVE extension (RFC 6851). Supported by Gmail, Outlook, and most modern IMAP servers.
 
 ---
 
@@ -337,6 +360,31 @@ await mail.Logout();
 
 ---
 
+## 🏷 Message Flags Reference
+
+Flags are returned as a `List<string>` on both `MailMessage` and `MailInboxes`. Common values:
+
+| Flag | Meaning |
+|---|---|
+| `Seen` | Email has been read |
+| `Answered` | Email has been replied to |
+| `Flagged` | Email is starred / flagged |
+| `Deleted` | Email is marked for deletion |
+| `Draft` | Email is a draft |
+| `Recent` | Email is newly arrived (set by server) |
+
+**Check if an email is unread:**
+```csharp
+bool isUnread = !message.Flags.Contains(@"Seen");
+```
+
+**Check if an email is flagged/starred:**
+```csharp
+bool isStarred = message.Flags.Contains(@"\Flagged");
+```
+
+---
+
 ## 💻 Sample Console App
 
 A complete working example covering every feature.
@@ -374,9 +422,10 @@ Console.WriteLine($"  Total pages  : {(inbox.Count > 0 ? inbox[0].TotalPaginatio
 foreach (var msg in inbox)
 {
     Console.WriteLine($"  [{msg.Id}] {msg.Subject}");
-    Console.WriteLine($"         From : {msg.FromName} <{msg.FromEmail}>");
-    Console.WriteLine($"         Date : {msg.Date:g}");
-    Console.WriteLine($"       Folder : {msg.Folder}");
+    Console.WriteLine($"         From  : {msg.FromName} <{msg.FromEmail}>");
+    Console.WriteLine($"         Date  : {msg.Date:g}");
+    Console.WriteLine($"       Folder  : {msg.Folder}");
+    Console.WriteLine($"        Flags  : {string.Join(", ", msg.Flags)}");
     Console.WriteLine();
 }
 
@@ -393,6 +442,7 @@ if (inbox.Count > 0)
     Console.WriteLine($"  To         : {string.Join(", ", full.To ?? new List<string>())}");
     Console.WriteLine($"  CC         : {string.Join(", ", full.CC ?? new List<string>())}");
     Console.WriteLine($"  Date       : {full.Date:g}");
+    Console.WriteLine($"  Flags      : {string.Join(", ", full.Flags)}");
     Console.WriteLine($"  PlainText  : {full.PlainTextBody?[..Math.Min(200, full.PlainTextBody?.Length ?? 0)]}...");
     Console.WriteLine($"  Attachments: {full.FileAttachments?.Count ?? 0}");
 
@@ -407,21 +457,26 @@ if (inbox.Count > 0)
         }
     }
 
-    // ── Mark as read ──────────────────────────────────────────────────────
+    // ── Mark as read / unread ─────────────────────────────────────────────
     await mail.MarkAsSeenAsync(uid);
     Console.WriteLine($"\n  Marked UID {uid} as read.");
+
+    await mail.MarkAsUnseenAsync(uid);
+    Console.WriteLine($"  Marked UID {uid} as unread.");
 
     // ── Thread ────────────────────────────────────────────────────────────
     Console.WriteLine($"\n=== Thread for UID {uid} ===");
     var thread = await mail.GetThreadAsync(uid, "INBOX");
     Console.WriteLine($"  Subject : {thread.Subject}");
+    Console.WriteLine($"  Flags   : {string.Join(", ", thread.Flags)}");
     Console.WriteLine($"  Replies : {thread.Submail?.Count ?? 0}");
 
     foreach (var reply in thread.Submail ?? new List<MailMessage>())
     {
         Console.WriteLine($"\n    [{reply.Id}] {reply.Subject}");
-        Console.WriteLine($"           From : {reply.FromName} <{reply.FromEmail}>");
-        Console.WriteLine($"           Date : {reply.Date:g}");
+        Console.WriteLine($"           From  : {reply.FromName} <{reply.FromEmail}>");
+        Console.WriteLine($"           Date  : {reply.Date:g}");
+        Console.WriteLine($"           Flags : {string.Join(", ", reply.Flags)}");
 
         if (reply.HasAttachments)
             foreach (var f in reply.FileAttachments)
@@ -429,7 +484,7 @@ if (inbox.Count > 0)
     }
 
     // ── Move (uncomment to use) ───────────────────────────────────────────
-    // await mail.MoveToFolderAsync(uid, "[Gmail]/All Mail");
+    // await mail.MoveToFolderAsync(uid, "INBOX", "[Gmail]/All Mail");
     // Console.WriteLine($"Moved UID {uid} to All Mail.");
 
     // ── Delete (uncomment to use) ─────────────────────────────────────────
@@ -458,6 +513,28 @@ await mail.Logout();
 
 ---
 
+## 🐛 Bug Fixes & Changelog
+
+### Latest Updates
+
+| # | Area | Fix / Enhancement |
+|---|---|---|
+| 1 | **Date Parsing** | Fixed `ParseDate` to correctly handle timezone offsets, parenthetical comments like `(PST)`, and malformed date strings. Now uses `DateTimeOffset.TryParse` with `AssumeUniversal` before falling back to `DateTime.TryParse`. |
+| 2 | **Mark as Unread** | Added `MarkAsUnseenAsync(string id, string folder)` — uses `UID STORE -FLAGS (\Seen)` to remove the `\Seen` flag. |
+| 3 | **Action Methods Fixed** | All action methods (`MarkAsSeenAsync`, `MarkAsUnseenAsync`, `DeleteMessageAsync`, `MoveToFolderAsync`) now correctly issue a `SELECT` command before any `UID STORE` or `UID MOVE`, preventing the `BAD UID STORE not allowed now` error. Folder names containing spaces are automatically quoted. |
+| 4 | **Flags Support** | `Flags` property (`List<string>`) added to both `MailMessage` and `MailInboxes`. Flags are fetched via `UID FETCH (UID FLAGS ...)` and parsed by `ExtractFlags(response, uid)`. `FetchFullMessageInternalAsync` issues a separate `UID FETCH (UID FLAGS)` call before fetching the body to avoid corrupting the literal byte reader. |
+
+### Previously Fixed
+
+| Issue | Fix |
+|---|---|
+| `TimeoutException: Timeout reading literal body at 0/N` | Literal bodies now read from `StreamReader.ReadAsync` instead of `SslStream.ReadAsync`. The `StreamReader` buffers ahead; reading from the raw stream would find 0 bytes and stall. |
+| `BAD invalid tag` on first command | `StreamWriter` now uses `new UTF8Encoding(false)` (no BOM). The default `Encoding.UTF8` emits a 3-byte BOM (`0xEF 0xBB 0xBF`) before the first command, which the IMAP server cannot parse as a tag. |
+| MIME encoded display names not decoded (e.g. `=?UTF-8?B?...?=`) | `ParseFrom` now calls `DecodeMimeEncodedWords` before parsing, and `DecodeMimeEncodedWords` handles multiple encoded-word tokens in a single header. |
+| `ExtractHeaderFields` returns empty when `FLAGS` precedes `BODY[HEADER.FIELDS]` | Fixed marker search — now finds `BODY[HEADER.FIELDS` starting from the `UID {uid}` position instead of matching both as a single fixed string. |
+
+---
+
 ## 🔐 Notes
 
 - Ensure IMAP is enabled in your email provider settings.
@@ -466,16 +543,7 @@ await mail.Logout();
 - `MailConfig` is **thread-safe** — a single instance serializes all async calls via `SemaphoreSlim`.
 - The `StreamWriter` uses **UTF-8 without BOM** internally. This is required for IMAP protocol compliance — servers reject commands that begin with a byte-order mark.
 - Literal message bodies are read via `StreamReader` (not the raw `SslStream`) to avoid timeouts caused by internal read-ahead buffering.
-
----
-
-## 🐛 Known Issues Fixed
-
-| Issue | Fix |
-|---|---|
-| `TimeoutException: Timeout reading literal body at 0/N` | Literal bodies now read from `StreamReader.ReadAsync` instead of `SslStream.ReadAsync`. The `StreamReader` buffers ahead; reading from the raw stream would find 0 bytes and stall. |
-| `BAD invalid tag` on first command | `StreamWriter` now uses `new UTF8Encoding(false)` (no BOM). The default `Encoding.UTF8` emits a 3-byte BOM (`0xEF 0xBB 0xBF`) before the first command, which the IMAP server cannot parse as a tag. |
-| MIME encoded display names not decoded (e.g. `=?UTF-8?B?...?=`) | `ParseFrom` now calls `DecodeMimeEncodedWords` before parsing, and `DecodeMimeEncodedWords` handles multiple encoded-word tokens in a single header. |
+- `UID MOVE` requires the MOVE extension (RFC 6851). Supported by Gmail and Outlook. For servers that don't support it, fall back to `UID COPY` + `UID STORE +FLAGS (\Deleted)` + `EXPUNGE`.
 
 ---
 
