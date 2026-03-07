@@ -40,10 +40,3 @@ namespace BNet.ASP.MVC.Pagination.Sample.Controllers
         }
     }
 }
-
-
-// FOR Version 1.0.1 
-//call this codes to your View.cshtml For SEARCH FILTER
-//htmlTableUsers_SearchEvent({parameterName:'your filter'});
-
-//htmlTableUsers <<--- This is the id of your HTML Tabe in your view.cshtml

@@ -10,9 +10,13 @@
 		<PackageOutputPath>$(OutputPath)</PackageOutputPath>
 		<IsPackable>true</IsPackable>
 		<Title>BNet.ASP.MVC.Pagination</Title>
-		<Version>1.0.2</Version>
-		<Description>Easy Backend Pagination for ASP.NET MVC with Customizable Properties.
-This library is based on the WebForms GridView.</Description>
+		<Version>3.0.0</Version>
+		<Description>
+			A lightweight server-side pagination library for ASP.NET Core MVC.
+			Inspired by the WebForms GridView, it brings familiar grid-style pagination
+			to modern MVC with minimal setup, live search support, and fully
+			customizable CSS properties.
+		</Description>
 		<PackageProjectUrl>https://github.com/bryanjaybodino/BNet.Library</PackageProjectUrl>
 		<PackageReadmeFile>_README.md</PackageReadmeFile>
 		<PackageLicenseFile>_License.txt</PackageLicenseFile>

@@ -21,13 +21,19 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="BNet.ASP.MVC.Pagination" Version="1.0.2" />
+    <PackageReference Include="BNet.ASP.MVC.Pagination" Version="3.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.7" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.7" />
   </ItemGroup>
 
   <ItemGroup>
     <EditorConfigFiles Remove="C:\BNet\BNet.ASP.MVC.Pagination.Sample\.editorconfig" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BNet.ASP.MVC.Pagination">
+      <HintPath>..\BNet.ASP.MVC.Pagination\bin\Debug\net8.0\BNet.ASP.MVC.Pagination.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
 </Project>

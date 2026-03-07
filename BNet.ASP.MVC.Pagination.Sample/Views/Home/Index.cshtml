@@ -23,14 +23,14 @@
             @{
                 try // TAKE NOTE YOU MUST USE TRY CATCH HERE
                 {
-                    for (int i = Model.start; i < Model.end; i++)
+                    for (int i = Model.Start; i < Model.End; i++)
                     {
                         <tr>
-                            <td>@Model.table[i].id</td>
-                            <td>@Model.table[i].firstname</td>
-                            <td>@Model.table[i].lastname</td>
-                            <td>@Model.table[i].age</td>
-                            <td>@Model.table[i].datecreated</td>
+                            <td>@Model.Table[i].id</td>
+                            <td>@Model.Table[i].firstname</td>
+                            <td>@Model.Table[i].lastname</td>
+                            <td>@Model.Table[i].age</td>
+                            <td>@Model.Table[i].datecreated</td>
                         </tr>
                     }
                 }
@@ -40,11 +40,11 @@
                 <tr>
                     <td colspan="5">
                         <div>
-                            @Model.page_entry
+                            @Model.PageEntry
 
                         </div>
                         <div>
-                            @Model.pagination
+                            @Model.Pagination
                         </div>
                     </td>
                 </tr>

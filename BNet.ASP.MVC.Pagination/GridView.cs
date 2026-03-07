@@ -1,18 +1,17 @@
-﻿using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Html;
+﻿using Microsoft.AspNetCore.Html;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Routing;
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
 using System.Text;
-using Microsoft.AspNetCore.Routing;
-using System.Linq;
-using Microsoft.AspNetCore.DataProtection.KeyManagement;
+using System.Threading.Tasks;
 
 namespace BNet.ASP.MVC.Pagination
 {
     public class GridView
     {
+        // ── Events ────────────────────────────────────────────────────────────
         public class PaginationChangedEventArgs : EventArgs
         {
             public string NewPageIndex { get; set; }
@@ -23,281 +22,268 @@ namespace BNet.ASP.MVC.Pagination
         public delegate Task<IActionResult> PaginationEventHandler(PaginationChangedEventArgs e);
         public event PaginationEventHandler PaginationChanged;
 
-        // Instance variables
-        private int max_page { get; set; } = 0;
-      
-        private int max_page_sequence { get; set; } = 0;
-        private int page_index { get; set; } = 0;
-        private int page_start { get; set; } = 0;
-        private int page_end { get; set; } = 0;
-        private int page_offset { get; set; } = 0;
-
-        public int start { get; set; } = 0;
-        public int end { get; set; } = 0;
-        public object table { get; private set; } = new object();
-        public HtmlString pagination { get; private set; }
-        public HtmlString page_entry { get; private set; }
-      
+        // ── Public configuration ───────────────────────────────────────────
         public string CSS_Pagination { get; set; } = "pagination";
         public string CSS_Button { get; set; } = "page-item page-link btn rounded-0";
-        public string CSS_PageIndex { get; set; } = "bg-primary text-white ";
-        private string TableId { get; set; } = "";
-        private string Route { get; set; } = "";
-        private string scriptName { get; set; } = "";
-
-
-        private int page_sequence { get; set; } = 1;
+        public string CSS_PageIndex { get; set; } = "bg-primary text-white";
         public bool FirstAndLast { get; set; } = false;
-        private int _RowSize { get; set; } = 0;
-        private int _PageSize { get; set; } = 0;
 
-        private void SetSession(HttpContext context, string tableId)
+        // ── Public read-only output ────────────────────────────────────────
+        public int Start { get; private set; }
+        public int End { get; private set; }
+        public object Table { get; private set; } = new object();
+        public HtmlString Pagination { get; private set; }
+        public HtmlString PageEntry { get; private set; }
+
+        // ── Private pagination state ───────────────────────────────────────
+        private int _maxPage = 0;
+        private int _maxPageSequence = 0;
+        private int _pageIndex = 0;
+        private int _pageStart = 0;
+        private int _pageEnd = 0;
+        private int _pageOffset = 0;
+        private int _pageSequence = 1;
+        private int _rowSize = 0;
+        private int _pageSize = 0;
+        private string _tableId = string.Empty;
+        private string _route = string.Empty;
+        private string _scriptName = string.Empty;
+
+        // ── Session key helpers ────────────────────────────────────────────
+        private static string PageSequenceKey(string tableId) => $"{tableId}_page_sequence";
+        private static string RowSizeKey(string tableId) => $"{tableId}_rowsize";
+        private static string PageSizeKey(string tableId) => $"{tableId}_pagesize";
+        private static string FirstLastKey(string tableId) => $"{tableId}_first_and_last";
+
+        // ── Public entry points ────────────────────────────────────────────
+
+        /// <summary>Initialises the grid for a first render.</summary>
+        public void SetGridView<T>(
+            HttpContext context,
+            List<T> dataList,
+            string routeName,
+            string tableName,
+            int rowSize,
+            int pageSize)
         {
-            string _page_sequence = tableId + "_page_sequence";
-            string _rowsize = tableId + "_rowsize";
-            string _pagesize = tableId + "_pagesize";
-            string _first_and_last = tableId + "_first_and_last";
+            _tableId = tableName;
+            _route = routeName;
+            BuildPagination(context, dataList, rowSize, pageSize, pageIndex: "0");
+            LoadSession(context);
+        }
 
+        /// <summary>Updates the grid after a pagination action.</summary>
+        public void NewPagination<T>(
+            HttpContext context,
+            List<T> dataTable,
+            PaginationChangedEventArgs e)
+        {
+            _tableId = e.TableName;
+            _route = e.RouteName;
+            LoadSession(context);
+            BuildPagination(context, dataTable, _rowSize, _pageSize, e.NewPageIndex);
+        }
+
+        // ── Session management ─────────────────────────────────────────────
+
+        private void LoadSession(HttpContext context)
+        {
             var session = context.Session;
 
-            // Helper function to get or set session values
-            int GetOrSetSessionValue(string key, int defaultValue)
-            {
-                if (!session.TryGetValue(key, out var value))
-                {
-                    session.SetInt32(key, defaultValue);
-                    return defaultValue;
-                }
-                return session.GetInt32(key).Value;
-            }
+            _pageSequence = GetOrSet(session, PageSequenceKey(_tableId), _pageSequence);
+            _rowSize = GetOrSet(session, RowSizeKey(_tableId), _rowSize);
+            _pageSize = GetOrSet(session, PageSizeKey(_tableId), _pageSize);
 
-            page_sequence = GetOrSetSessionValue(_page_sequence, page_sequence);
-            _RowSize = GetOrSetSessionValue(_rowsize, _RowSize);
-            _PageSize = GetOrSetSessionValue(_pagesize, _PageSize);
-
-            // Handle boolean value
-            if (!session.TryGetValue(_first_and_last, out var value))
-            {
-                // Store the boolean value as a string
-                session.SetString(_first_and_last, FirstAndLast.ToString().ToLower());
-            }
+            var firstLastRaw = session.GetString(FirstLastKey(_tableId));
+            if (firstLastRaw is null)
+                session.SetString(FirstLastKey(_tableId), FirstAndLast.ToString().ToLower());
             else
-            {
-                // Retrieve the boolean value from the session
-                var stringValue = session.GetString(_first_and_last);
-                FirstAndLast = !string.IsNullOrEmpty(stringValue) && bool.Parse(stringValue);
-            }
+                FirstAndLast = bool.TryParse(firstLastRaw, out var parsed) && parsed;
         }
 
-
-
-
-        private void UpdateSession(HttpContext context, string tableId, int newPageSequence, int newRowSize, int newPageSize,bool newFirstLast)
+        private void SaveSession(HttpContext context)
         {
-            // Define the session keys based on the tableId
-            string _page_sequence = tableId + "_page_sequence";
-            string _rowsize = tableId + "_rowsize";
-            string _pagesize = tableId + "_pagesize";
-            string _first_and_last = tableId + "_first_and_last";
-
-            // Access the session
             var session = context.Session;
-
-            // Update the session with the new values
-            session.SetInt32(_page_sequence, newPageSequence);
-            session.SetInt32(_rowsize, newRowSize);
-            session.SetInt32(_pagesize, newPageSize);
-            session.SetString(_first_and_last, newFirstLast.ToString());
-
-
-            // Update the instance variables with the new values
-            page_sequence = newPageSequence;
-            _RowSize = newRowSize;
-            _PageSize = newPageSize;
-            FirstAndLast = newFirstLast;
+            session.SetInt32(PageSequenceKey(_tableId), _pageSequence);
+            session.SetInt32(RowSizeKey(_tableId), _rowSize);
+            session.SetInt32(PageSizeKey(_tableId), _pageSize);
+            session.SetString(FirstLastKey(_tableId), FirstAndLast.ToString().ToLower());
         }
 
-        private void Set<T>(HttpContext context, List<T> dataTable, int RowSize, int PageSize, string setPageIndex)
+        private static int GetOrSet(ISession session, string key, int defaultValue)
         {
-            _RowSize = RowSize;
-            _PageSize = PageSize;
-            scriptName = TableId + "_PaginationChange";
-
-            if (setPageIndex == "0")
+            if (!session.TryGetValue(key, out _))
             {
-                page_sequence = 1;
+                session.SetInt32(key, defaultValue);
+                return defaultValue;
             }
-            setPageIndex = (setPageIndex == "") ? "0" : setPageIndex;
-            max_page = (int)Math.Ceiling((double)dataTable.Count / _RowSize);
-            int first_page = 1;
-
-            max_page_sequence = (int)Math.Ceiling((double)max_page / _PageSize);
-
-            if (setPageIndex.ToUpper() == "NEXT")
-            {
-                page_sequence++;
-            }
-            else if (setPageIndex.ToUpper() == "BACK")
-            {
-                page_sequence--;
-            }
-            else if (setPageIndex.ToUpper() == "FIRST")
-            {
-                page_sequence = first_page;
-            }
-            else if (setPageIndex.ToUpper() == "LAST")
-            {
-                page_sequence = max_page_sequence;
-            }
-
-
-
-            page_start = (page_sequence - 1) * _PageSize;
-            page_end = _PageSize * page_sequence;
-            page_end = (page_end > max_page) ? max_page : page_end;
-
-            if (setPageIndex.ToUpper() == "NEXT" || setPageIndex.ToUpper() == "BACK" || setPageIndex.ToUpper() == "FIRST")
-            {
-                page_index = page_start;
-            }
-            else if (setPageIndex.ToUpper() == "LAST")
-            {
-                page_index = max_page - 1;
-            }
-            else
-            {
-                page_index = Convert.ToInt32(setPageIndex);
-            }
-
-            page_offset = (page_index * _RowSize) + _RowSize;
-            page_offset = (page_offset > dataTable.Count) ? dataTable.Count : page_offset;
-
-            start = (page_index * _RowSize);
-            end = _RowSize * (page_index + 1);
-            table = dataTable;
-
-            int result = (dataTable.Count > 0) ? ((page_index * _RowSize) + 1) : 0;
-            string Pagination = "<div class=\"" + CSS_Pagination + "\">";
-            string PageEntry = "<div>";
-            PageEntry += "Showing " + result.ToString("N0") + " to " + (page_offset).ToString("N0") + " of " + dataTable.Count.ToString("N0") + " entries";
-            PageEntry += "</div>";
-            page_entry = new HtmlString(PageEntry);
-            string action = "";
-
-            if (page_sequence > 1)
-            {
-                if (FirstAndLast == true)
-                {
-                    Pagination += "<a style='display:block' onclick=\"" + scriptName + "('FIRST', '" + TableId + "','" + Route + "')\" class=\"" + CSS_Button + "\"  " + action + " >" + first_page + "</a>";
-                    Pagination += "<span style='padding:7px;display:block'>_</span>";
-                }
-                Pagination += "<a style='display:block' onclick=\"" + scriptName + "('BACK', '" + TableId + "','" + Route + "')\" class=\"" + CSS_Button + "\">Back</a>";
-            }
-
-            for (int i = page_start; i < page_end; i++)
-            {
-                action = (page_index == i) ? CSS_PageIndex : "";
-                Pagination += "<a onclick=\"" + scriptName + "(" + i + ", '" + TableId + "','" + Route + "')\" class=\"" + CSS_Button + " " + action + "\">" + (i + 1) + "</a>";
-            }
-            if (page_end != max_page)
-            {
-                Pagination += "<a style='display:block' onclick=\"" + scriptName + "('NEXT', '" + TableId + "','" + Route + "')\" class=\"" + CSS_Button + "\">Next</a>";
-                if (FirstAndLast == true)
-                {
-                    Pagination += "<span style='padding:7px;display:block'>_</span>";
-                    Pagination += "<a style='display:block' onclick=\"" + scriptName + "('LAST', '" + TableId + "','" + Route + "')\" class=\"" + CSS_Button + "\"  " + action + " >" + max_page + "</a>";
-                }
-            }
-
-            Pagination += "</div>";
-
-            Pagination += GeneratePaginationScript(scriptName);
-            Pagination += GenerateSearchEventScript(context, TableId);
-
-            pagination = new HtmlString(Pagination);
-
-            UpdateSession(context, TableId, page_sequence, _RowSize, PageSize,FirstAndLast);
+            return session.GetInt32(key) ?? defaultValue;
         }
-        string GeneratePaginationScript(string scriptName)
-        {
-            string script = "<script>\n";
-            script += "function " + scriptName + "(pageindex='0',tableid='',route='') {\n";
-            script += "     var url = document.location.origin + '/' +route+ '?NewPageIndex='+ pageindex+'&TableName='+tableid+'&RouteName='+route;\n";
-            script += "    fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' } })\n";
-            script += "        .then(response => response.text())\n";
-            script += "        .then(responseText => {\n";
-            script += "            const parser = new DOMParser();\n";
-            script += "            const doc = parser.parseFromString(responseText, 'text/html');\n";
-            script += "            const TableContent = doc.getElementById(tableid).innerHTML;\n";
-            script += "            document.getElementById(tableid).innerHTML = TableContent;\n";
-            script += "        })\n";
-            script += "        .catch(error => {\n";
-            script += "            document.body.innerHTML = '<h4>INVALID HTTP REQUEST</h4>' + '<br>' + error.message;\n";
-            script += "        });\n";
-            script += "}\n";
-            script += "</script>";
 
-            return script;
-        }
-        private string GenerateSearchEventScript(HttpContext context, string tableId)
+        // ── Core pagination builder ────────────────────────────────────────
+
+        private void BuildPagination<T>(
+            HttpContext context,
+            List<T> dataTable,
+            int rowSize,
+            int pageSize,
+            string pageIndex)
         {
-            var routeData = context.GetRouteData();
-            var controller = routeData.Values["controller"];
-            string route = controller.ToString();
+            _rowSize = rowSize;
+            _pageSize = pageSize;
+            _scriptName = $"{_tableId}_PaginationChange";
+
+            // Normalise input
+            if (pageIndex == "0") _pageSequence = 1;
+            if (string.IsNullOrEmpty(pageIndex)) pageIndex = "0";
+
+            // Totals
+            _maxPage = (int)Math.Ceiling((double)dataTable.Count / _rowSize);
+            _maxPageSequence = (int)Math.Ceiling((double)_maxPage / _pageSize);
+
+            ApplySequenceNavigation(pageIndex);
+
+            _pageStart = (_pageSequence - 1) * _pageSize;
+            _pageEnd = Math.Min(_pageSize * _pageSequence, _maxPage);
+
+            ApplyIndexNavigation(pageIndex);
+
+            _pageOffset = Math.Min((_pageIndex * _rowSize) + _rowSize, dataTable.Count);
+            Start = _pageIndex * _rowSize;
+            End = _rowSize * (_pageIndex + 1);
+            Table = dataTable;
+
+            PageEntry = BuildPageEntry(dataTable.Count);
+            Pagination = BuildPaginationHtml(context);
+
+            SaveSession(context);
+        }
+
+        private void ApplySequenceNavigation(string pageIndex)
+        {
+            switch (pageIndex.ToUpperInvariant())
+            {
+                case "NEXT": _pageSequence = Math.Min(_pageSequence + 1, _maxPageSequence); break;
+                case "BACK": _pageSequence = Math.Max(_pageSequence - 1, 1); break;
+                case "FIRST": _pageSequence = 1; break;
+                case "LAST": _pageSequence = _maxPageSequence; break;
+            }
+        }
+
+        private void ApplyIndexNavigation(string pageIndex)
+        {
+            switch (pageIndex.ToUpperInvariant())
+            {
+                case "NEXT":
+                case "BACK":
+                case "FIRST":
+                    _pageIndex = _pageStart;
+                    break;
+                case "LAST":
+                    _pageIndex = _maxPage - 1;
+                    break;
+                default:
+                    _pageIndex = int.TryParse(pageIndex, out var parsed) ? parsed : 0;
+                    break;
+            }
+        }
+
+        // ── HTML builders ──────────────────────────────────────────────────
+
+        private HtmlString BuildPageEntry(int totalCount)
+        {
+            int from = totalCount > 0 ? (_pageIndex * _rowSize) + 1 : 0;
+            return new HtmlString(
+                $"<div>Showing {from:N0} to {_pageOffset:N0} of {totalCount:N0} entries</div>");
+        }
+
+        private HtmlString BuildPaginationHtml(HttpContext context)
+        {
             var sb = new StringBuilder();
+            sb.Append($"<div class=\"{CSS_Pagination}\">");
 
-            sb.AppendLine("<script>");
-            sb.AppendLine($"function {tableId}_SearchEvent(params) {{");
-            sb.AppendLine("    // Convert params object to query string");
-            sb.AppendLine("    let queryString = Object.keys(params).map(key => key + '=' + encodeURIComponent(params[key])).join('&');");
-            sb.AppendLine($"    // Construct the URL with the query string");
-            sb.AppendLine($"    let url = document.location.origin + '/{route}?' + queryString;");
-            sb.AppendLine("    // Make an HTTP GET request using fetch API");
-            sb.AppendLine("    fetch(url, {");
-            sb.AppendLine("        method: 'GET',");
-            sb.AppendLine("        headers: {");
-            sb.AppendLine("            'Content-Type': 'application/json'");
-            sb.AppendLine("        }");
-            sb.AppendLine("    })");
-            sb.AppendLine("    .then(response => {");
-            sb.AppendLine("        if (!response.ok) {");
-            sb.AppendLine("            return response.text().then(text => {");
-            sb.AppendLine("                throw new Error(text);");
-            sb.AppendLine("            });");
-            sb.AppendLine("        }");
-            sb.AppendLine("        return response.text();");
-            sb.AppendLine("    })");
-            sb.AppendLine("    .then(responseText => {");
-            sb.AppendLine("        // Parse the response text to find the HTML content");
-            sb.AppendLine("        let parser = new DOMParser();");
-            sb.AppendLine("        let doc = parser.parseFromString(responseText, 'text/html');");
-            sb.AppendLine($"        let result = doc.getElementById('{tableId}').innerHTML;");
-            sb.AppendLine($"        document.getElementById('{tableId}').innerHTML = result;");
-            sb.AppendLine("    })");
-            sb.AppendLine("    .catch(error => {");
-            sb.AppendLine("        // Handle any errors that occurred during the fetch");
-            sb.AppendLine("        document.body.innerHTML = '<h4>INVALID HTTP REQUEST</h4>' + '<br>' + error.message;");
-            sb.AppendLine("    });");
-            sb.AppendLine("}");
-            sb.AppendLine("</script>");
+            // Back / First buttons
+            if (_pageSequence > 1)
+            {
+                if (FirstAndLast)
+                {
+                    sb.Append(NavButton("FIRST", "1"));
+                    sb.Append("<span style='padding:7px;display:block'>_</span>");
+                }
+                sb.Append(NavButton("BACK", "Back"));
+            }
 
-            return sb.ToString();
-        }
-        public void SetGridView<T>(HttpContext context, List<T> MyDataList, string RouteName, string TableName, int RowSize, int PageSize)
-        {
-            TableId = TableName;
-            Route = RouteName;
-            Set(context, MyDataList, RowSize, PageSize, "0");
-            SetSession(context, TableId);
+            // Numbered page buttons
+            for (int i = _pageStart; i < _pageEnd; i++)
+            {
+                string active = (_pageIndex == i) ? CSS_PageIndex : string.Empty;
+                sb.Append($"<a onclick=\"{_scriptName}({i}, '{_tableId}','{_route}')\" " +
+                          $"class=\"{CSS_Button} {active}\">{i + 1}</a>");
+            }
+
+            // Next / Last buttons
+            if (_pageEnd != _maxPage)
+            {
+                sb.Append(NavButton("NEXT", "Next"));
+                if (FirstAndLast)
+                {
+                    sb.Append("<span style='padding:7px;display:block'>_</span>");
+                    sb.Append(NavButton("LAST", _maxPage.ToString()));
+                }
+            }
+
+            sb.Append("</div>");
+            sb.Append(BuildPaginationScript());
+            sb.Append(BuildSearchScript(context));
+
+            return new HtmlString(sb.ToString());
         }
 
-        public void NewPagination<T>(HttpContext context, List<T> dataTable, PaginationChangedEventArgs e)
-        {
-            TableId = e.TableName;
-            Route = e.RouteName;
+        private string NavButton(string action, string label) =>
+            $"<a style='display:block' onclick=\"{_scriptName}('{action}', '{_tableId}','{_route}')\" " +
+            $"class=\"{CSS_Button}\">{label}</a>";
 
-            SetSession(context, TableId);
-            Set(context, dataTable, _RowSize, _PageSize, e.NewPageIndex);
+        // ── Script builders ────────────────────────────────────────────────
+
+        private string BuildPaginationScript() => $@"
+<script>
+function {_scriptName}(pageindex, tableid, route) {{
+    pageindex = pageindex ?? '0';
+    var url = `${{document.location.origin}}/${{route}}?NewPageIndex=${{pageindex}}&TableName=${{tableid}}&RouteName=${{route}}`;
+    fetch(url, {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }} }})
+        .then(r => r.text())
+        .then(html => {{
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            document.getElementById(tableid).innerHTML = doc.getElementById(tableid).innerHTML;
+        }})
+        .catch(err => {{
+            document.body.innerHTML = '<h4>INVALID HTTP REQUEST</h4><br>' + err.message;
+        }});
+}}
+</script>";
+
+        private string BuildSearchScript(HttpContext context)
+        {
+            var controller = context.GetRouteData().Values["controller"]?.ToString() ?? string.Empty;
+            return $@"
+<script>
+function {_tableId}_SearchEvent(params) {{
+    const queryString = Object.keys(params).map(k => k + '=' + encodeURIComponent(params[k])).join('&');
+    const url = `${{document.location.origin}}/{controller}?${{queryString}}`;
+    fetch(url, {{ method: 'GET', headers: {{ 'Content-Type': 'application/json' }} }})
+        .then(r => {{
+            if (!r.ok) return r.text().then(t => {{ throw new Error(t); }});
+            return r.text();
+        }})
+        .then(html => {{
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            document.getElementById('{_tableId}').innerHTML = doc.getElementById('{_tableId}').innerHTML;
+        }})
+        .catch(err => {{
+            document.body.innerHTML = '<h4>INVALID HTTP REQUEST</h4><br>' + err.message;
+        }});
+}}
+</script>";
         }
     }
 }
