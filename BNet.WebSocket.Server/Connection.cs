@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -32,16 +33,28 @@ namespace BNet.WebSocket.Server
             _listener = new TcpListener(IPAddress.Any, port);
         }
 
+        // FIX #1: Added X509KeyStorageFlags so the private key is accessible in all environments
+        // FIX #3: Removed ServicePointManager callback — it only affects outgoing HTTP clients, not inbound SSL
         public void LoadCertificate(string path, string password)
         {
-            ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
-            _serverCertificate = new X509Certificate2(path, password);
+            _serverCertificate = new X509Certificate2(
+                path,
+                password,
+                X509KeyStorageFlags.MachineKeySet |
+                X509KeyStorageFlags.PersistKeySet |
+                X509KeyStorageFlags.Exportable
+            );
         }
 
         public void LoadCertificate(byte[] rawData, string password)
         {
-            ServicePointManager.ServerCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
-            _serverCertificate = new X509Certificate2(rawData, password);
+            _serverCertificate = new X509Certificate2(
+                rawData,
+                password,
+                X509KeyStorageFlags.MachineKeySet |
+                X509KeyStorageFlags.PersistKeySet |
+                X509KeyStorageFlags.Exportable
+            );
         }
 
         public async Task StartAsync()
@@ -66,18 +79,15 @@ namespace BNet.WebSocket.Server
 
         public Task SendMessageToRoomAsync(string roomId, string message)
         {
-            // Use HashSet to ensure clients are unique
             var clients = _clients.Values
                 .Where(c => c.Rooms.Contains(roomId))
                 .Distinct()
                 .ToList();
 
-            // Create a task for each client to write the message
             var tasks = clients.Select(client =>
                 WriteMessageAsync(client.Stream, message)
             ).ToArray();
 
-            // Use Task.WhenAll to await the completion of all tasks
             return Task.WhenAll(tasks);
         }
 
@@ -98,8 +108,8 @@ namespace BNet.WebSocket.Server
 
                 var tasks = _clients.Keys.Select(async client =>
                 {
-                    await RemoveClientAsync(client); // Assuming RemoveClient is synchronous
-                    return Task.FromResult(0); // Return a completed task for each client
+                    await RemoveClientAsync(client);
+                    return Task.FromResult(0);
                 }).ToArray();
 
                 return Task.WhenAll(tasks);
@@ -110,6 +120,7 @@ namespace BNet.WebSocket.Server
             }
         }
 
+        // FIX #2: Explicitly specify TLS protocols in AuthenticateAsServerAsync
         private async Task<Stream> HandleSecurityAsync(Stream stream)
         {
             if (_serverCertificate == null)
@@ -118,7 +129,12 @@ namespace BNet.WebSocket.Server
             }
 
             var sslStream = new SslStream(stream, false);
-            await sslStream.AuthenticateAsServerAsync(_serverCertificate);
+            await sslStream.AuthenticateAsServerAsync(
+                _serverCertificate,
+                clientCertificateRequired: false,
+                enabledSslProtocols: SslProtocols.Tls12,
+                checkCertificateRevocation: false
+            );
             return sslStream;
         }
 
@@ -157,7 +173,6 @@ namespace BNet.WebSocket.Server
             }
             finally
             {
-                // Ensure client is removed from dictionary when done
                 await RemoveClientAsync(client);
             }
         }
@@ -177,6 +192,7 @@ namespace BNet.WebSocket.Server
 
                 var clients = _clients.Values.Distinct().ToList();
                 await SetOnConnectedClient(clients.Count);
+
                 while (client.Connected)
                 {
                     string message = await ReadMessageAsync(client, stream);
@@ -196,11 +212,12 @@ namespace BNet.WebSocket.Server
                     {
                         throw new Exception("Force close client due to abnormal activity");
                     }
-                    else if (message == "Unexpected frame type received") // This is my placeholder
+                    else if (message == "Unexpected frame type received")
                     {
-                        //Do Nothing
+                        // Do Nothing
                     }
                 }
+
                 throw new Exception("Client Disconnected");
             }
             else
@@ -289,7 +306,6 @@ namespace BNet.WebSocket.Server
                 if (requestLine != null)
                 {
                     var requestParts = requestLine.Split(' ');
-
                     if (requestParts.Length > 1)
                     {
                         var url = requestParts[1];
@@ -320,7 +336,6 @@ namespace BNet.WebSocket.Server
                 int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
                 if (bytesRead == 0)
                 {
-                    // Connection closed
                     return null;
                 }
 
@@ -368,14 +383,12 @@ namespace BNet.WebSocket.Server
                             byte[] payload = new byte[payloadRead];
                             Array.Copy(buffer, payloadOffset, payload, 0, payloadRead);
 
-                            // Apply masking to the payload
                             for (int i = 0; i < payload.Length; i++)
                             {
                                 payload[i] ^= maskingKey[i % 4];
                             }
 
                             messageBuilder.AddRange(payload);
-
                             offset += headerSize + 4 + payloadRead;
 
                             if (isFinalFragment)
@@ -383,7 +396,6 @@ namespace BNet.WebSocket.Server
                                 break;
                             }
 
-                            // Reset payload length for the next fragment
                             payloadLength = 0;
                             break;
 
@@ -391,15 +403,12 @@ namespace BNet.WebSocket.Server
                             byte[] closeFrame = new byte[bytesRead];
                             Array.Copy(buffer, offset, closeFrame, 0, bytesRead);
 
-                            // Extract close code and reason
                             if (bytesRead > 2)
                             {
                                 ushort closeCode = (ushort)((closeFrame[0] << 8) | closeFrame[1]);
                                 string closeReason = Encoding.UTF8.GetString(closeFrame, 2, bytesRead - 2);
-                                // Log or handle close code and reason
                             }
 
-                            // Send a close frame response
                             byte[] responseCloseFrame = CreateCloseFrame();
                             await stream.WriteAsync(responseCloseFrame, 0, responseCloseFrame.Length);
                             throw new InvalidOperationException("Received close frame.");
@@ -407,11 +416,11 @@ namespace BNet.WebSocket.Server
                         case 9: // Ping frame
                             byte[] pongFrame = CreatePongFrame(buffer, bytesRead, offset);
                             await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
-                            offset += 2 + (buffer[offset + 1] & 0x7F); // Move past the Ping frame
+                            offset += 2 + (buffer[offset + 1] & 0x7F);
                             break;
 
                         case 10: // Pong frame
-                            offset += 2 + (buffer[offset + 1] & 0x7F); // Move past the Pong frame
+                            offset += 2 + (buffer[offset + 1] & 0x7F);
                             break;
 
                         default:
@@ -426,26 +435,31 @@ namespace BNet.WebSocket.Server
         private byte[] CreatePongFrame(byte[] buffer, int bytesRead, int offset)
         {
             byte[] pongFrame = new byte[2 + (buffer[offset + 1] & 0x7F)];
-            pongFrame[0] = 0x8A; // 0x8A for Pong frame
-            pongFrame[1] = buffer[offset + 1]; // Copy length
+            pongFrame[0] = 0x8A; // FIN + Pong opcode
+            pongFrame[1] = buffer[offset + 1];
             Array.Copy(buffer, offset + 2, pongFrame, 2, pongFrame.Length - 2);
             return pongFrame;
         }
 
+        // FIX #4: Corrected byte-packing and added proper WebSocket framing header (0x88)
         private byte[] CreateCloseFrame(ushort statusCode = 1000, string reason = "")
         {
             byte[] statusCodeBytes = BitConverter.GetBytes(statusCode);
-            Array.Reverse(statusCodeBytes); // Ensure big-endian byte order
+            Array.Reverse(statusCodeBytes); // big-endian
 
             byte[] reasonBytes = Encoding.UTF8.GetBytes(reason);
-            byte[] frame = new byte[2 + reasonBytes.Length];
 
-            // Close code
-            frame[0] = (byte)((statusCodeBytes[0] >> 8) & 0xFF);
-            frame[1] = (byte)(statusCodeBytes[1] & 0xFF);
+            // Build payload: 2-byte status code + reason
+            byte[] payload = new byte[2 + reasonBytes.Length];
+            payload[0] = statusCodeBytes[0];
+            payload[1] = statusCodeBytes[1];
+            Array.Copy(reasonBytes, 0, payload, 2, reasonBytes.Length);
 
-            // Close reason
-            Array.Copy(reasonBytes, 0, frame, 2, reasonBytes.Length);
+            // Build WebSocket frame: FIN + close opcode (0x88) + payload length + payload
+            byte[] frame = new byte[2 + payload.Length];
+            frame[0] = 0x88; // FIN bit + close opcode
+            frame[1] = (byte)payload.Length;
+            Array.Copy(payload, 0, frame, 2, payload.Length);
 
             return frame;
         }
@@ -491,14 +505,12 @@ namespace BNet.WebSocket.Server
 
         public async Task SendMessageAsync(string message)
         {
-            // Copy clients to avoid modification during enumeration
             var clients = _clients.Values.Distinct().ToList();
-
             var tasks = clients.Select(client => WriteMessageAsync(client.Stream, message)).ToArray();
-
             await Task.WhenAll(tasks);
         }
 
+        // FIX #5: Fire OnDisconnectedClient (not OnConnectedClient) when a client leaves
         private async Task RemoveClientAsync(TcpClient client)
         {
             if (_clients.TryRemove(client, out var myClient))
@@ -507,7 +519,7 @@ namespace BNet.WebSocket.Server
                 client?.Close();
             }
             var clients = _clients.Values.Distinct().ToList();
-            await SetOnConnectedClient(clients.Count);
+            await SetOnDisconnectedClient(clients.Count);
         }
     }
 }
