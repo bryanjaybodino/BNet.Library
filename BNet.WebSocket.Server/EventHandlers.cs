@@ -57,6 +57,34 @@ namespace BNet.WebSocket.Server
         }
         #endregion
 
+        #region OnBinaryReceived
+        public class BinaryReceivedEventArgs : EventArgs
+        {
+            public byte[] Data { get; set; }
+        }
+
+        private readonly ConcurrentDictionary<Guid, EventHandler<BinaryReceivedEventArgs>> _onBinaryReceivedHandlers
+            = new ConcurrentDictionary<Guid, EventHandler<BinaryReceivedEventArgs>>();
+
+        public event EventHandler<BinaryReceivedEventArgs> OnBinaryReceived
+        {
+            add { _onBinaryReceivedHandlers[Guid.NewGuid()] = value; }
+            remove
+            {
+                var item = _onBinaryReceivedHandlers.FirstOrDefault(kvp => kvp.Value == value);
+                if (item.Key != Guid.Empty) _onBinaryReceivedHandlers.TryRemove(item.Key, out _);
+            }
+        }
+
+        public async Task SetOnBinaryReceived(byte[] data)
+        {
+            var args = new BinaryReceivedEventArgs { Data = data };
+            var tasks = _onBinaryReceivedHandlers.Values.ToList()
+                .Select(h => Task.Run(() => { try { h?.Invoke(this, args); } catch (Exception ex) { Console.WriteLine($"OnBinaryReceived error: {ex.Message}"); } }));
+            await Task.WhenAll(tasks);
+        }
+        #endregion
+
         #region OnConnectedClient
         public class ConnectedClientEventArgs : EventArgs
         {

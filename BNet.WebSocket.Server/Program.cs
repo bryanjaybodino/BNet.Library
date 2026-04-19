@@ -12,12 +12,14 @@ using BNet.WebSocket.Server;
 class Program
 {
     static Connection connection = new Connection(8080);
+
     static async Task Main(string[] args)
     {
-        // Start the TCP connection
         //connection.Setup(8080);
         //connection.LoadCertificate("C:\\cert.pfx", "123123");
+
         connection.OnReceived += Connection_OnReceived;
+        connection.OnBinaryReceived += Connection_OnBinaryReceived;
         connection.OnConnectedClient += Connection_OnConnectedClient;
         connection.OnDisconnectedClient += Connection_OnDisconnectedClient;
         connection.OnError += Connection_OnError;
@@ -32,43 +34,74 @@ class Program
         await Task.WhenAll(serverTask, keyPressTask);
 
 
-        //Send Message to all connected clients
-        await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
+        // ── Text examples ────────────────────────────────────────────────────
+        // Send text message to all connected clients
+        await connection.SendMessageAsync("Hello everyone!");
 
-        //Send Message to Specific Client Room 
+        // Send text message to a specific room
         await connection.SendMessageToRoomAsync("Room1", "Hello Room1");
-        //ws://localhost:8080?room=Room1
+        // ws://localhost:8080?room=Room1
+
+        // ── Binary examples ──────────────────────────────────────────────────
+        // Send a JSON payload as binary to all clients
+        byte[] binaryPayload = Encoding.UTF8.GetBytes("{\"type\":\"ping\"}");
+        await connection.SendBinaryAsync(binaryPayload);
+
+        // Send raw binary to a specific room
+        await connection.SendBinaryToRoomAsync("Room1", binaryPayload);
     }
+
+    // ── Event handlers ────────────────────────────────────────────────────────
 
     private static void Connection_OnError(object sender, EventHandlers.ErrorEventArgs e)
     {
-        Console.WriteLine(e.Message);
+        Console.WriteLine("Error: " + e.Message);
     }
 
     private static void Connection_OnDisconnectedClient(object sender, EventHandlers.DisconnectedClientEventArgs e)
     {
-        Console.WriteLine("Total Clients : " + e.Count.ToString());
+        Console.WriteLine("Total Clients: " + e.Count);
     }
 
     private static void Connection_OnConnectedClient(object sender, EventHandlers.ConnectedClientEventArgs e)
     {
-        Console.WriteLine("Total Clients : " + e.Count.ToString());
+        Console.WriteLine("Total Clients: " + e.Count);
     }
 
     private static void Connection_OnReceived(object sender, EventHandlers.ReceivedEventArgs e)
     {
-        Console.WriteLine("Received Message: " + e.Message);
+        Console.WriteLine("Received Text: " + e.Message);
     }
 
+    private static void Connection_OnBinaryReceived(object sender, EventHandlers.BinaryReceivedEventArgs e)
+    {
+        // e.Data is the raw byte[] from the binary WebSocket frame.
+        // Here we decode it as UTF-8 JSON — adjust to your protocol as needed.
+        string decoded = Encoding.UTF8.GetString(e.Data);
+        Console.WriteLine($"Received Binary ({e.Data.Length} bytes): {decoded}");
+
+        // Optional: echo the binary back to all clients
+        // _ = connection.SendBinaryAsync(e.Data);
+    }
 
     private static async void ListenForKeyPress()
     {
         while (true)
         {
-            var keyInfo = Console.ReadKey(intercept: true); // Read the key without displaying it
+            var keyInfo = Console.ReadKey(intercept: true);
             Console.WriteLine($"Key Pressed: {keyInfo.KeyChar}");
-            await connection.SendMessageAsync("Test Send Text Message to All Clients Connected");
+
+            if (keyInfo.Key == ConsoleKey.T)
+            {
+                // Send text frame
+                await connection.SendMessageAsync("Text broadcast from server");
+            }
+            else if (keyInfo.Key == ConsoleKey.B)
+            {
+                // Send binary frame
+                byte[] data = Encoding.UTF8.GetBytes("{\"type\":\"server-push\",\"msg\":\"binary broadcast\"}");
+                await connection.SendBinaryAsync(data);
+            }
         }
     }
-
 }
