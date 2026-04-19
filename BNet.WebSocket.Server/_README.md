@@ -1,6 +1,6 @@
 ﻿# BNet.WebSocket.Server
 
-A lightweight, easy-to-use WebSocket server library for .NET. Built on raw TCP with no heavy dependencies — just clean WebSocket handling with room support, SSL/TLS, and async events.
+A lightweight, easy-to-use WebSocket server library for .NET. Built on raw TCP with no heavy dependencies — just clean WebSocket handling with room support, SSL/TLS, binary frames, and async events.
 
 ---
 
@@ -29,6 +29,9 @@ server.OnDisconnectedClient += (sender, e) =>
 server.OnReceived += (sender, e) =>
     Console.WriteLine($"Message received: {e.Message}");
 
+server.OnBinaryReceived += (sender, e) =>
+    Console.WriteLine($"Binary received: {e.Data.Length} bytes");
+
 server.OnError += (sender, e) =>
     Console.WriteLine($"Error: {e.Message}");
 
@@ -55,28 +58,33 @@ const socket = new WebSocket("wss://yourdomain.com:8080");
 
 ## 🏠 Rooms
 
-Rooms allow you to broadcast messages only to a specific group of connected clients. A client joins a room by appending a query string to the WebSocket URL when connecting.
+Rooms allow you to broadcast messages only to a specific group of connected clients. A client joins a room by appending a `room` query parameter to the WebSocket URL when connecting.
 
 **URL format:**
 ```
-ws://localhost:8080?roomName=value
+ws://localhost:8080?room=value
 ```
 
 **Examples:**
 ```
-ws://localhost:8080?chat=general
-ws://localhost:8080?game=room42
-ws://localhost:8080?channel=updates
+ws://localhost:8080?room=general
+ws://localhost:8080?room=room42
+ws://localhost:8080?room=updates
 ```
 
-> Any query key and value are supported — the full query string (e.g. `?chat=general`) becomes the room identifier.
+> The `room` query key is required — the value (e.g. `general`) becomes the room identifier used for targeted broadcasts.
 
-**Sending a message to a specific room from the server:**
+**Sending a text message to a specific room from the server:**
 ```csharp
-await server.SendMessageToRoomAsync("?chat=general", "Hello, room!");
+await server.SendMessageToRoomAsync("general", "Hello, room!");
 ```
 
-**Clients connected without a room** receive all broadcast messages sent via `SendMessageAsync`.
+**Sending a binary message to a specific room from the server:**
+```csharp
+await server.SendBinaryToRoomAsync("general", myByteArray);
+```
+
+**Clients connected without a room** receive all broadcast messages sent via `SendMessageAsync` or `SendBinaryAsync`.
 
 ---
 
@@ -89,8 +97,10 @@ await server.SendMessageToRoomAsync("?chat=general", "Hello, room!");
 | `Connection(int port)` | Creates a server on the given port |
 | `StartAsync()` | Starts listening for connections |
 | `StopAsync()` | Gracefully stops the server and disconnects all clients |
-| `SendMessageAsync(string message)` | Broadcasts a message to **all** connected clients |
-| `SendMessageToRoomAsync(string roomId, string message)` | Sends a message to all clients in a specific room |
+| `SendMessageAsync(string message)` | Broadcasts a text message to **all** connected clients |
+| `SendMessageToRoomAsync(string roomId, string message)` | Sends a text message to all clients in a specific room |
+| `SendBinaryAsync(byte[] data)` | Broadcasts a binary message to **all** connected clients |
+| `SendBinaryToRoomAsync(string roomId, byte[] data)` | Sends a binary message to all clients in a specific room |
 | `LoadCertificate(string path, string password)` | Loads a TLS certificate from a `.pfx` file path |
 | `LoadCertificate(byte[] rawData, string password)` | Loads a TLS certificate from raw bytes |
 | `IsRunning` | `bool` — whether the server is currently active |
@@ -99,10 +109,56 @@ await server.SendMessageToRoomAsync("?chat=general", "Hello, room!");
 
 | Event | Args | Description |
 |---|---|---|
-| `OnReceived` | `ReceivedEventArgs.Message` | Fired when a message is received from any client |
+| `OnReceived` | `ReceivedEventArgs.Message` | Fired when a **text** message is received from any client |
+| `OnBinaryReceived` | `BinaryReceivedEventArgs.Data` | Fired when a **binary** frame is received from any client; `Data` is the raw `byte[]` payload |
 | `OnConnectedClient` | `ConnectedClientEventArgs.Count` | Fired when a client connects; includes current total count |
 | `OnDisconnectedClient` | `DisconnectedClientEventArgs.Count` | Fired when a client disconnects; includes remaining count |
 | `OnError` | `ErrorEventArgs.Message` | Fired when an internal error occurs |
+
+---
+
+## 📨 Binary Frames
+
+The server natively handles WebSocket binary frames (opcode `0x02`). When a binary frame arrives from a client, the server:
+
+1. **Immediately broadcasts** the payload back to the sender's room (or all clients if no room), using a proper binary WebSocket frame — so other clients receive it as `Blob` / `ArrayBuffer`, not text.
+2. **Fires `OnBinaryReceived`** in the background, giving your server-side code access to the raw `byte[]` for side-effects such as saving to a database, sending push notifications, etc.
+
+**Sending binary from the browser:**
+```js
+const socket = new WebSocket("ws://localhost:8080?room=general");
+
+// Send a typed array
+const buffer = new Uint8Array([1, 2, 3, 4]);
+socket.send(buffer.buffer);
+
+// Receive binary back
+socket.binaryType = "arraybuffer";
+socket.onmessage = (e) => {
+    const view = new Uint8Array(e.data);
+    console.log("Received binary:", view);
+};
+```
+
+**Handling binary on the server:**
+```csharp
+server.OnBinaryReceived += (sender, e) =>
+{
+    // e.Data is the raw byte[] payload sent by the client
+    Console.WriteLine($"Binary received: {e.Data.Length} bytes");
+    // e.g. save to DB, process image, forward to another service...
+};
+```
+
+**Sending binary from the server:**
+```csharp
+// Broadcast to all clients
+byte[] payload = File.ReadAllBytes("data.bin");
+await server.SendBinaryAsync(payload);
+
+// Broadcast to a specific room
+await server.SendBinaryToRoomAsync("general", payload);
+```
 
 ---
 
@@ -123,8 +179,9 @@ The server uses **TLS 1.2** and handles the SSL handshake automatically for each
 
 ## ⚠️ Limitations
 
-- **Base64 / binary image data:** Not recommended. Due to WebSocket framing constraints, only payloads up to approximately **35 KB** are reliably supported. Larger binary payloads (e.g. full-resolution images as Base64 strings) may be truncated or fail.
-- **Text messages only:** The server is optimized for UTF-8 text frames. Binary frames are accepted but decoded as UTF-8.
+- **Payload size:** The receive buffer processes a single read per frame. Very large payloads that exceed the TCP receive buffer size in a single read may be truncated. Keeping individual message payloads under **~35 KB** is recommended for reliability.
+- **Text messages:** The `OnReceived` event delivers UTF-8 decoded strings. For structured data, consider serializing to JSON before sending.
+- **Binary messages:** Binary frames are broadcast immediately and delivered as raw `byte[]` via `OnBinaryReceived`. Avoid sending very large binary payloads in a single frame — split them on the client side if needed.
 
 ---
 
