@@ -174,13 +174,16 @@ namespace BNet.WebSocket.Server
                     using (Stream secureStream = await HandleSecurityAsync(networkStream))
                     {
                         if (secureStream == null)
-                            throw new NotSupportedException("Failed to secure the stream for client.");
+                            return;
+                        //throw new NotSupportedException("Failed to secure the stream for client.");
 
                         if (_clients.ContainsKey(client))
-                            throw new Exception("Client already connected.");
+                            return;
+                        //throw new Exception("Client already connected.");
 
                         if (!_clients.TryAdd(client, new MyClients { Stream = secureStream }))
-                            throw new Exception("Failed to add client to the dictionary.");
+                            return;
+                        //throw new Exception("Failed to add client to the dictionary.");
 
                         await HandleStartupAsync(client, secureStream);
                     }
@@ -225,7 +228,8 @@ namespace BNet.WebSocket.Server
                     }
                     else if (message == string.Empty)
                     {
-                        throw new Exception("Force close client due to abnormal activity");
+                        return;
+                        //throw new Exception("Force close client due to abnormal activity");
                     }
                     else if (message == "Unexpected frame type received")
                     {
@@ -457,7 +461,9 @@ namespace BNet.WebSocket.Server
                             {
                                 byte[] responseCloseFrame = CreateCloseFrame();
                                 await stream.WriteAsync(responseCloseFrame, 0, responseCloseFrame.Length);
-                                throw new InvalidOperationException("Received close frame.");
+                                break;
+
+                                //throw new InvalidOperationException("Received close frame.");
                             }
 
                         case 9: // Ping frame
