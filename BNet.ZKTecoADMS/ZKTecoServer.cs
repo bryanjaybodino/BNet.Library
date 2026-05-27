@@ -150,7 +150,33 @@ namespace BNet.ZKTecoADMS
                 try
                 {
                     HttpListenerContext ctx = await _listener.GetContextAsync().ConfigureAwait(false);
-                    _ = Task.Run(() => HandleRequestAsync(ctx, ct), ct);
+
+                    // FIX 4: Give each request its own timeout CancellationToken.
+                    // If the device sends a request but then stalls (e.g. slow photo
+                    // upload or a buggy firmware hang), the request handler would block
+                    // forever. A 60-second per-request timeout ensures the TCP socket
+                    // is closed and the slot freed even if the device goes unresponsive
+                    // mid-transfer. This is separate from the server-wide ct.
+                    _ = Task.Run(async () =>
+                    {
+                        using (var requestCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                        {
+                            requestCts.CancelAfter(TimeSpan.FromSeconds(60));
+                            try
+                            {
+                                await HandleRequestAsync(ctx, requestCts.Token).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                            {
+                                // Per-request timeout — close the context so the device
+                                // gets a TCP RST and retries rather than hanging.
+                                RaiseError("RequestTimeout", new TimeoutException(
+                                    "Request from " + (ctx.Request.QueryString["SN"] ?? "unknown") +
+                                    " timed out after 60 s."));
+                                try { ctx.Response.Abort(); } catch { /* ignore */ }
+                            }
+                        }
+                    }, ct);
                 }
                 catch (HttpListenerException) when (ct.IsCancellationRequested) { break; }
                 catch (ObjectDisposedException) when (ct.IsCancellationRequested) { break; }
@@ -232,6 +258,11 @@ namespace BNet.ZKTecoADMS
         {
             string info = ctx.Request.QueryString["INFO"] ?? "";
 
+            // INFO-less /iclock/getrequest is the device's normal keep-alive poll
+            // (sent every few seconds while idle). We must go through RespondAsync
+            // so the response is properly flushed+closed; a half-open TCP socket
+            // here causes the device to show the double-arrows reconnect icon and
+            // drop the first punch that arrives after an idle period.
             if (string.IsNullOrEmpty(info))
             {
                 await RespondAsync(ctx, "OK", ct).ConfigureAwait(false);
@@ -515,10 +546,25 @@ namespace BNet.ZKTecoADMS
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/plain";
             ctx.Response.ContentLength64 = buf.Length;
+
+            // FIX 1: Keep-Alive header — tells the device the connection is still
+            // alive and it can reuse the TCP session for subsequent pushes.
+            // Without this, ZKTeco firmware drops the connection after each request
+            // and shows the "reconnecting" arrows icon on idle-then-punch scenarios.
+            ctx.Response.Headers["Connection"] = "keep-alive";
+
             await ctx.Response.OutputStream
                 .WriteAsync(buf, 0, buf.Length, ct)
                 .ConfigureAwait(false);
+
+            // FIX 2: Flush + close the output stream AND close the response.
+            // HttpListener on .NET Framework does NOT auto-flush on OutputStream.Close().
+            // Leaving the response un-closed keeps the TCP socket in a half-open state;
+            // after the device's idle timeout expires it sees the connection as dead,
+            // retries, and the next punch is dropped or delayed (shown as double arrows).
+            ctx.Response.OutputStream.Flush();
             ctx.Response.OutputStream.Close();
+            ctx.Response.Close();
         }
 
         private void RaiseError(string source, Exception ex) =>
