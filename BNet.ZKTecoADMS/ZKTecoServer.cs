@@ -149,38 +149,51 @@ namespace BNet.ZKTecoADMS
             {
                 try
                 {
-                    HttpListenerContext ctx = await _listener.GetContextAsync().ConfigureAwait(false);
+                    HttpListenerContext ctx = await _listener
+                        .GetContextAsync()
+                        .ConfigureAwait(false);
 
-                    // FIX 4: Give each request its own timeout CancellationToken.
-                    // If the device sends a request but then stalls (e.g. slow photo
-                    // upload or a buggy firmware hang), the request handler would block
-                    // forever. A 60-second per-request timeout ensures the TCP socket
-                    // is closed and the slot freed even if the device goes unresponsive
-                    // mid-transfer. This is separate from the server-wide ct.
                     _ = Task.Run(async () =>
                     {
-                        using (var requestCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                        using (var requestCts =
+                            CancellationTokenSource.CreateLinkedTokenSource(ct))
                         {
                             requestCts.CancelAfter(TimeSpan.FromSeconds(60));
                             try
                             {
-                                await HandleRequestAsync(ctx, requestCts.Token).ConfigureAwait(false);
+                                await HandleRequestAsync(ctx, requestCts.Token)
+                                    .ConfigureAwait(false);
                             }
-                            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                            catch (OperationCanceledException)
+                                when (!ct.IsCancellationRequested)
                             {
-                                // Per-request timeout — close the context so the device
-                                // gets a TCP RST and retries rather than hanging.
                                 RaiseError("RequestTimeout", new TimeoutException(
-                                    "Request from " + (ctx.Request.QueryString["SN"] ?? "unknown") +
-                                    " timed out after 60 s."));
-                                try { ctx.Response.Abort(); } catch { /* ignore */ }
+                                    "Request timed out after 60s"));
+                                try { ctx.Response.Abort(); } catch { }
+                            }
+                            catch (Exception ex)
+                            {
+                                // ← THIS was missing — unhandled exceptions here
+                                // were silently leaving contexts open
+                                RaiseError("RequestHandler", ex);
+                                try { ctx.Response.Abort(); } catch { }
                             }
                         }
                     }, ct);
                 }
-                catch (HttpListenerException) when (ct.IsCancellationRequested) { break; }
-                catch (ObjectDisposedException) when (ct.IsCancellationRequested) { break; }
-                catch (Exception ex) { RaiseError("ListenLoop", ex); }
+                catch (HttpListenerException)
+                    when (ct.IsCancellationRequested)
+                { break; }
+                catch (ObjectDisposedException)
+                    when (ct.IsCancellationRequested)
+                { break; }
+                catch (Exception ex)
+                {
+                    RaiseError("ListenLoop", ex);
+                    // ← Add a small delay so a repeated error doesn't
+                    // spin the CPU at 100% if the listener goes bad
+                    await Task.Delay(1000, ct).ConfigureAwait(false);
+                }
             }
         }
 
@@ -304,22 +317,22 @@ namespace BNet.ZKTecoADMS
             });
 
             string responseBody = string.Format(
-                "GET OPTION FROM: {0}\n" +
-                "ATTLOGSTAMP=0\n" +
-                "OPERLOGSTAMP=0\n" +
-                "ATTPHOTOSTAMP={1}\n" +
-                "ATTPHOTO=1\n" +
-                "ErrorDelay={2}\n" +
-                "Delay={3}\n" +
-                "TransTimes=00:00;14:05\n" +
-                "TransInterval=1\n" +
-                "TransFlag=TransData AttLog OpLog AttPhoto\n" +
-                "TimeZone={4}\n" +
-                "Realtime=1\n" +
-                "Encrypt=None\n" +
-                "ServerVer=2.4.1 2015-04-14\n" +
-                "PushProtVer=2.4.1\n" +
-                "PushOptionsFlag=1\n",
+                "GET OPTION FROM: {0}\r\n" +
+                "ATTLOGSTAMP=0\r\n" +
+                "OPERLOGSTAMP=0\r\n" +
+                "ATTPHOTOSTAMP={1}\r\n" +
+                "ATTPHOTO=1\r\n" +
+                "ErrorDelay={2}\r\n" +
+                "Delay={3}\r\n" +
+                "TransTimes=00:00;14:05\r\n" +
+                "TransInterval=1\r\n" +
+                "TransFlag=TransData AttLog OpLog AttPhoto\r\n" +
+                "TimeZone={4}\r\n" +
+                "Realtime=1\r\n" +
+                "Encrypt=None\r\n" +
+                "ServerVer=2.4.1 2015-04-14\r\n" +
+                "PushProtVer=2.4.1\r\n" +
+                "PushOptionsFlag=1\r\n",
                 sn, PhotoStamp, ErrorDelay, Delay, TimeZone);
 
             await RespondAsync(ctx, responseBody, ct).ConfigureAwait(false);
