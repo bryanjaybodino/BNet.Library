@@ -8,8 +8,8 @@ A lightweight, async, event-driven HTTP server that speaks the **ZKTeco ADMS / P
 
 Clone or reference the library directly from the GitHub repository:
 
-- **Library source:** [ZKTecoADMS](https://github.com/bryanjaybodino/BNet.Library/tree/master/ZKTecoADMS)
-- **Sample project:** [ZKTecoADMS.Sample](https://github.com/bryanjaybodino/BNet.Library/tree/master/ZKTecoADMS.Sample)
+- **Library source:** [BNet.ZKTecoADMS](https://github.com/bryanjaybodino/BNet.Library/tree/master/BNet.ZKTecoADMS)
+- **Sample project:** [BNet.ZKTecoADMS.Sample](https://github.com/bryanjaybodino/BNet.Library/tree/master/BNet.ZKTecoADMS.Sample)
 
 ---
 
@@ -20,11 +20,11 @@ using ZKTecoADMS;
 
 var server = new ZKTecoServer
 {
-    Port              = 4780,
+    Port               = 4780,
     PhotoSaveDirectory = @"C:\ZKPhotos",
-    Delay             = 10,
-    ErrorDelay        = 30,
-    TimeZone          = 8
+    Delay              = 10,
+    ErrorDelay         = 30,
+    TimeZone           = 8
 };
 
 server.OnHandshake += (sender, e) =>
@@ -123,9 +123,23 @@ Menu → Comm → Cloud Server Settings → Server Address + Port
 | `PunchTime` | `DateTime` | Parsed punch date and time |
 | `RawTime` | `string` | Raw time string as received from the device |
 | `VerifyMode` | `int` | `1`=Fingerprint, `4`=Password, `15`=Face, `-1`=Unknown |
+| `PunchState` | `int` | Raw punch state from the device (column [3]) |
+| `PunchType` | `PunchType` | Resolved logical punch type (CheckIn, CheckOut, OvertimeIn, OvertimeOut) |
 | `WorkCode` | `int` | Work-code field (firmware-dependent; `0` when absent) |
 | `RawLine` | `string` | Original tab-delimited line from the device |
 | `Timestamp` | `DateTime` | When the record was received by the server |
+
+#### `PunchType` Enum
+
+| Value | Description |
+|---|---|
+| `CheckIn` | Check-In (`VerifyMode=0` on MB460 Plus, or `PunchState=0` on standard firmware) |
+| `CheckOut` | Check-Out (`VerifyMode=1` on MB460 Plus, or `PunchState=1` on standard firmware) |
+| `OvertimeIn` | Overtime start (`VerifyMode=4` on MB460 Plus, or `PunchState=2` on standard firmware) |
+| `OvertimeOut` | Overtime end (`VerifyMode=5` on MB460 Plus, or `PunchState=3` on standard firmware) |
+| `Unknown` | State could not be determined (`-1`) |
+
+> **MB460 Plus firmware note:** This device always sends `PunchState=4` via ADMS Push. The actual punch type selected on the device is carried in the `VerifyMode` field and resolved automatically by the server.
 
 ### `PhotoEventArgs`
 
@@ -157,6 +171,24 @@ Menu → Comm → Cloud Server Settings → Server Address + Port
 | `Body` | `string` | UTF-8 decoded request body |
 | `RawBody` | `byte[]` | Raw request body bytes |
 | `Timestamp` | `DateTime` | When the request was received |
+
+---
+
+## 🔤 `ZKTecoHelper`
+
+### `VerifyLabel(int verifyMode)`
+
+Returns a human-readable label for a `VerifyMode` value.
+
+| Value | Label | Notes |
+|---|---|---|
+| `0` | `CheckIn` | MB460 Plus punch type |
+| `1` | `CheckOut` | MB460 Plus punch type |
+| `4` | `OvertimeIn` | MB460 Plus punch type |
+| `5` | `OvertimeOut` | MB460 Plus punch type |
+| `15` | `Face` | Standard firmware |
+| `255` | `Face(FF)` | Standard firmware — face extended (0xFF) |
+| other | `Mode:{n}` | Unrecognized value |
 
 ---
 

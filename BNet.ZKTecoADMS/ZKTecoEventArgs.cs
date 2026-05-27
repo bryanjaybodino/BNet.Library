@@ -1,14 +1,37 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace BNet.ZKTecoADMS
 {
-    public class ZKTecoEventArgs
+    public static class ZKTecoEventArgs
     {
-        // ── Handshake ──────────────────────────────────────────────────────────────
+        // ── Punch Type ─────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Logical punch type as resolved by the server.
+        ///
+        /// MB460 Plus firmware always sends PunchState=4 via ADMS Push.
+        /// The actual punch type selected on the device is carried in the
+        /// VerifyMode field (column [2]) and resolved by ResolvePunchType().
+        /// </summary>
+        public enum PunchType
+        {
+            /// <summary>Check-In (VerifyMode=0 on MB460 Plus, or PunchState=0 on standard firmware).</summary>
+            CheckIn = 0,
+
+            /// <summary>Check-Out (VerifyMode=1 on MB460 Plus, or PunchState=1 on standard firmware).</summary>
+            CheckOut = 1,
+
+            /// <summary>Overtime start (VerifyMode=2 on MB460 Plus, or PunchState=2 on standard firmware).</summary>
+            OvertimeIn = 2,
+
+            /// <summary>Overtime end (VerifyMode=3 on MB460 Plus, or PunchState=3 on standard firmware).</summary>
+            OvertimeOut = 3,
+
+            /// <summary>State could not be determined.</summary>
+            Unknown = -1
+        }
+
+        // ── Handshake ──────────────────────────────────────────────────────────
 
         /// <summary>Raised when a ZKTeco device completes its initial handshake.</summary>
         public class HandshakeEventArgs : EventArgs
@@ -20,10 +43,10 @@ namespace BNet.ZKTecoADMS
             public DateTime Timestamp { get; set; }
 
             public override string ToString() =>
-                $"[Handshake] SN={SN} at {Timestamp:HH:mm:ss}";
+                string.Format("[Handshake] SN={0} at {1:HH:mm:ss}", SN, Timestamp);
         }
 
-        // ── Heartbeat ──────────────────────────────────────────────────────────────
+        // ── Heartbeat ──────────────────────────────────────────────────────────
 
         /// <summary>Raised on every device heartbeat that carries an INFO payload.</summary>
         public class HeartbeatEventArgs : EventArgs
@@ -41,10 +64,10 @@ namespace BNet.ZKTecoADMS
             public DateTime Timestamp { get; set; }
 
             public override string ToString() =>
-                $"[Heartbeat] SN={SN} Photos={PhotoCount} at {Timestamp:HH:mm:ss}";
+                string.Format("[Heartbeat] SN={0} Photos={1} at {2:HH:mm:ss}", SN, PhotoCount, Timestamp);
         }
 
-        // ── Attendance punch ───────────────────────────────────────────────────────
+        // ── Attendance punch ───────────────────────────────────────────────────
 
         /// <summary>Raised for every attendance record in an ATTLOG upload.</summary>
         public class AttendanceEventArgs : EventArgs
@@ -62,10 +85,53 @@ namespace BNet.ZKTecoADMS
             public string RawTime { get; set; }
 
             /// <summary>
-            /// Verification mode reported by the device.
-            /// Common values: 1=Fingerprint, 4=Password, 15=Face, -1=Unknown.
+            /// Raw value of column [2] from the ATTLOG line.
+            ///
+            /// MB460 Plus: this field carries the punch type the employee selected
+            /// on the device (0=CheckIn, 1=CheckOut, 2=OvertimeIn, 3=OvertimeOut).
+            ///
+            /// Standard firmware: this field is the authentication method
+            /// (1=Fingerprint, 4=Password, 5=Palm, 15=Face, 255=Face extended).
+            ///
+            /// Use <see cref="PunchType"/> for the resolved logical punch type.
+            /// Use <see cref="ZKTecoHelper.VerifyLabel"/> to get a readable label.
             /// </summary>
             public int VerifyMode { get; set; }
+
+            /// <summary>
+            /// Raw numeric punch state as received from the device (column [3]).
+            /// MB460 Plus always sends 4 here regardless of the punch type set on the device.
+            /// Standard firmware sends 0-3 directly.
+            /// Use <see cref="PunchType"/> for the resolved logical type.
+            /// </summary>
+            public int PunchState { get; set; }
+
+            // Backing field set explicitly by the server after resolving the punch type.
+            private PunchType? _resolvedPunchType;
+
+            /// <summary>
+            /// Resolved logical punch type.
+            /// Always set explicitly by the server via ResolvePunchType().
+            /// Falls back to deriving from <see cref="PunchState"/> only if not set.
+            /// </summary>
+            public PunchType PunchType
+            {
+                get
+                {
+                    if (_resolvedPunchType.HasValue)
+                        return _resolvedPunchType.Value;
+
+                    switch (PunchState)
+                    {
+                        case 0: return ZKTecoEventArgs.PunchType.CheckIn;
+                        case 1: return ZKTecoEventArgs.PunchType.CheckOut;
+                        case 2: return ZKTecoEventArgs.PunchType.OvertimeIn;
+                        case 3: return ZKTecoEventArgs.PunchType.OvertimeOut;
+                        default: return ZKTecoEventArgs.PunchType.Unknown;
+                    }
+                }
+                set { _resolvedPunchType = value; }
+            }
 
             /// <summary>Work-code field (firmware-dependent; 0 when absent).</summary>
             public int WorkCode { get; set; }
@@ -77,10 +143,11 @@ namespace BNet.ZKTecoADMS
             public DateTime Timestamp { get; set; }
 
             public override string ToString() =>
-                $"[Attendance] SN={SN} User={UserId} Time={PunchTime:yyyy-MM-dd HH:mm:ss} Verify={VerifyMode}";
+                string.Format("[Attendance] SN={0} User={1} Time={2:yyyy-MM-dd HH:mm:ss} Type={3} Verify={4}",
+                    SN, UserId, PunchTime, PunchType, ZKTecoHelper.VerifyLabel(VerifyMode));
         }
 
-        // ── Photo ──────────────────────────────────────────────────────────────────
+        // ── Photo ──────────────────────────────────────────────────────────────
 
         /// <summary>Raised when an attendance photo upload is processed.</summary>
         public class PhotoEventArgs : EventArgs
@@ -112,11 +179,11 @@ namespace BNet.ZKTecoADMS
 
             public override string ToString() =>
                 Success
-                    ? $"[Photo] SN={SN} User={UserId} → {SavedPath}"
-                    : $"[Photo] SN={SN} User={UserId} FAILED to extract JPEG";
+                    ? string.Format("[Photo] SN={0} User={1} -> {2}", SN, UserId, SavedPath)
+                    : string.Format("[Photo] SN={0} User={1} FAILED to extract JPEG", SN, UserId);
         }
 
-        // ── Error ──────────────────────────────────────────────────────────────────
+        // ── Error ──────────────────────────────────────────────────────────────
 
         /// <summary>Raised when a non-fatal internal error occurs.</summary>
         public class ErrorEventArgs : EventArgs
@@ -131,10 +198,10 @@ namespace BNet.ZKTecoADMS
             public DateTime Timestamp { get; set; }
 
             public override string ToString() =>
-                $"[Error] {Source}: {Exception?.Message}";
+                string.Format("[Error] {0}: {1}", Source, Exception?.Message);
         }
 
-        // ── Raw request (debug) ────────────────────────────────────────────────────
+        // ── Raw request (debug) ────────────────────────────────────────────────
 
         /// <summary>
         /// Raised for every incoming HTTP request before any parsing.
@@ -151,7 +218,8 @@ namespace BNet.ZKTecoADMS
             public DateTime Timestamp { get; set; }
 
             public override string ToString() =>
-                $"[Raw] {Method} {Url} SN={SN} Table={Table} BodyLen={RawBody?.Length}";
+                string.Format("[Raw] {0} {1} SN={2} Table={3} BodyLen={4}",
+                    Method, Url, SN, Table, RawBody?.Length);
         }
     }
 }

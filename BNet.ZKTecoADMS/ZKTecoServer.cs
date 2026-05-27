@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -11,13 +12,22 @@ namespace BNet.ZKTecoADMS
 {
     /// <summary>
     /// Async, event-driven HTTP server that speaks the ZKTeco ADMS/Push protocol.
-    /// Targets .NET Framework 4.5 – 4.8 and .NET 5 – 8 without any third-party DLLs.
+    /// Targets .NET Framework 4.5 - 4.8 and .NET 5 - 8 without any third-party DLLs.
     /// Subscribe to events and call StartAsync() / Start() to begin receiving data.
+    ///
+    /// MB460 Plus firmware note:
+    ///   This device always sends PunchState=4 via ADMS Push regardless of what
+    ///   punch type is configured on the device. The actual punch type is carried
+    ///   in the VerifyMode field (column [2]):
+    ///     0 = Check-In
+    ///     1 = Check-Out
+    ///   The server resolves this via ResolvePunchType() and caches the result
+    ///   per user so that the attendance photo filename includes the punch type.
     /// </summary>
     public class ZKTecoServer :
-        #if NET5_0_OR_GREATER || NETCOREAPP3_0_OR_GREATER
-                IAsyncDisposable,
-        #endif
+#if NET5_0_OR_GREATER || NETCOREAPP3_0_OR_GREATER
+        IAsyncDisposable,
+#endif
         IDisposable
     {
         // ── Configuration ──────────────────────────────────────────────────────
@@ -54,7 +64,7 @@ namespace BNet.ZKTecoADMS
         /// <summary>Fired for every attendance punch record received.</summary>
         public event EventHandler<AttendanceEventArgs> OnAttendance;
 
-        /// <summary>Fired when a photo is successfully saved to disk.</summary>
+        /// <summary>Fired when a photo is received (success or failure).</summary>
         public event EventHandler<PhotoEventArgs> OnPhotoReceived;
 
         /// <summary>Fired on every device heartbeat.</summary>
@@ -63,7 +73,7 @@ namespace BNet.ZKTecoADMS
         /// <summary>Fired when any internal error occurs (non-fatal).</summary>
         public event EventHandler<ErrorEventArgs> OnError;
 
-        /// <summary>Fired for raw request logging / debugging.</summary>
+        /// <summary>Fired for every raw request — useful for debugging.</summary>
         public event EventHandler<RawRequestEventArgs> OnRawRequest;
 
         // ── Private state ──────────────────────────────────────────────────────
@@ -71,6 +81,14 @@ namespace BNet.ZKTecoADMS
         private HttpListener _listener;
         private CancellationTokenSource _cts;
         private Task _listenTask;
+
+        // ── Last punch type cache ──────────────────────────────────────────────
+        // Key: userId
+        // Stores the most recently resolved PunchType per user so that the
+        // attendance photo filename can include the punch type label.
+
+        private readonly Dictionary<string, PunchType> _lastPunchType = new Dictionary<string, PunchType>();
+        private readonly object _punchTypeLock = new object();
 
         // ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -114,7 +132,6 @@ namespace BNet.ZKTecoADMS
         /// <summary>Synchronous stop (blocks until loop exits).</summary>
         public void Stop() => StopAsync().GetAwaiter().GetResult();
 
-        // IAsyncDisposable is only available on .NET Core 3+ / .NET 5+
 #if NET5_0_OR_GREATER || NETCOREAPP3_0_OR_GREATER
         public async ValueTask DisposeAsync()
         {
@@ -132,25 +149,12 @@ namespace BNet.ZKTecoADMS
             {
                 try
                 {
-                    // GetContextAsync has no CancellationToken overload on any TFM;
-                    // cancellation arrives via _listener.Stop() called from StopAsync().
                     HttpListenerContext ctx = await _listener.GetContextAsync().ConfigureAwait(false);
-
-                    // Fire-and-forget each connection so Accept() is never blocked.
                     _ = Task.Run(() => HandleRequestAsync(ctx, ct), ct);
                 }
-                catch (HttpListenerException) when (ct.IsCancellationRequested)
-                {
-                    break; // normal shutdown
-                }
-                catch (ObjectDisposedException) when (ct.IsCancellationRequested)
-                {
-                    break; // normal shutdown
-                }
-                catch (Exception ex)
-                {
-                    RaiseError("ListenLoop", ex);
-                }
+                catch (HttpListenerException) when (ct.IsCancellationRequested) { break; }
+                catch (ObjectDisposedException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex) { RaiseError("ListenLoop", ex); }
             }
         }
 
@@ -163,12 +167,9 @@ namespace BNet.ZKTecoADMS
             string sn = ctx.Request.QueryString["SN"] ?? "unknown";
             string table = ctx.Request.QueryString["table"] ?? "";
 
-            // Read raw body — binary-safe, works on all target TFMs
             byte[] rawBody;
             using (var ms = new MemoryStream())
             {
-                // The 3-arg overload (stream, bufferSize, ct) was added in .NET 4.5,
-                // so this is safe across the whole supported range.
                 await ctx.Request.InputStream
                     .CopyToAsync(ms, 81920, ct)
                     .ConfigureAwait(false);
@@ -237,9 +238,17 @@ namespace BNet.ZKTecoADMS
                 return;
             }
 
+            // INFO format (MB460 Plus, 13 comma-separated fields):
+            //  [0]  Firmware version  e.g. ZMM501-NF28VF-Ver2.2.1
+            //  [1]  Unknown
+            //  [2]  Unknown
+            //  [3]  Pending photo count
+            //  [4]  Device IP
+            //  [5-12] Unknown
             string[] parts = info.Split(',');
             int photoCount = 0;
-            if (parts.Length > 3) int.TryParse(parts[3], out photoCount);
+            if (parts.Length > 3)
+                int.TryParse(parts[3], out photoCount);
 
             OnHeartbeat?.Invoke(this, new HeartbeatEventArgs
             {
@@ -263,9 +272,6 @@ namespace BNet.ZKTecoADMS
                 Timestamp = DateTime.Now
             });
 
-            // Use string.Format (not $ interpolation) for .NET 4.5 compatibility —
-            // although $ strings are a C# 6 language feature (VS 2015+) and DO compile
-            // fine on .NET 4.5 with a modern compiler, Format is universally safe.
             string responseBody = string.Format(
                 "GET OPTION FROM: {0}\n" +
                 "ATTLOGSTAMP=0\n" +
@@ -293,25 +299,57 @@ namespace BNet.ZKTecoADMS
         private async Task HandleAttLogAsync(
             HttpListenerContext ctx, string sn, string body, CancellationToken ct)
         {
+            // ATTLOG tab-delimited column layout — MB460 Plus firmware (11 columns):
+            //
+            //  [0]  UserID      — enrolled user / employee ID
+            //  [1]  DateTime    — punch timestamp (yyyy-MM-dd HH:mm:ss)
+            //  [2]  VerifyMode  — on MB460 Plus this carries the punch type:
+            //                       0 = Check-In
+            //                       1 = Check-Out
+            //                       4 = Overtime-In
+            //                       5 = Overtime-Out
+            //                     On standard firmware it is the auth method:
+            //                       1 = Fingerprint  4 = Password
+            //                       5 = Palm        15 = Face  255 = Face(FF)
+            //  [3]  PunchState  — MB460 Plus ALWAYS sends 4 here via ADMS Push.
+            //                     Standard firmware: 0=In 1=Out 2=OTIn 3=OTOut
+            //  [4]  WorkCode    — optional (0 when absent)
+            //  [5-9] Reserved
+            //  [10] SeqNo       — incrementing punch sequence counter
+
             foreach (string line in body.Split('\n'))
             {
                 string trimmed = line.Trim();
                 if (string.IsNullOrEmpty(trimmed)) continue;
 
                 string[] parts = trimmed.Split('\t');
-                if (parts.Length < 2) continue;
 
                 string userId = parts[0].Trim();
                 string time = parts[1].Trim();
 
+                // [2] VerifyMode
                 int vm = -1;
-                int verifyMode = (parts.Length > 3 && int.TryParse(parts[3], out vm)) ? vm : -1;
+                int verifyMode = (parts.Length > 2 && int.TryParse(parts[2], out vm)) ? vm : -1;
 
+                // [3] PunchState — raw value from device
+                int ps = -1;
+                int punchState = (parts.Length > 3 && int.TryParse(parts[3], out ps)) ? ps : -1;
+
+                // [4] WorkCode
                 int wc = 0;
-                int workCode = (parts.Length > 6 && int.TryParse(parts[6], out wc)) ? wc : 0;
+                int workCode = (parts.Length > 4 && int.TryParse(parts[4], out wc)) ? wc : 0;
 
                 DateTime punchTime;
                 DateTime.TryParse(time, out punchTime);
+
+                // Resolve the exact punch type from the device.
+                // MB460 Plus: PunchState is always 4; actual type is in VerifyMode.
+                // Standard firmware: PunchState carries the type directly.
+                PunchType resolvedType = ResolvePunchType(verifyMode, punchState);
+
+                // Cache the resolved type so HandleAttPhotoAsync can use it for the filename.
+                lock (_punchTypeLock)
+                    _lastPunchType[userId] = resolvedType;
 
                 OnAttendance?.Invoke(this, new AttendanceEventArgs
                 {
@@ -320,6 +358,8 @@ namespace BNet.ZKTecoADMS
                     PunchTime = punchTime,
                     RawTime = time,
                     VerifyMode = verifyMode,
+                    PunchState = punchState,
+                    PunchType = resolvedType,
                     WorkCode = workCode,
                     RawLine = trimmed,
                     Timestamp = DateTime.Now
@@ -338,6 +378,8 @@ namespace BNet.ZKTecoADMS
             byte[] rawBody,
             CancellationToken ct)
         {
+            // PIN filename format from MB460 Plus: yyyyMMddHHmmss-userId.jpg
+            // e.g. PIN=20260527095423-1.jpg  →  userId = "1"
             string uid = "unknown";
 
             foreach (string line in body.Split('\n'))
@@ -352,7 +394,7 @@ namespace BNet.ZKTecoADMS
                 break;
             }
 
-            // Locate the CMD=uploadphoto marker then scan for JPEG SOI (FF D8 FF)
+            // Locate JPEG by scanning for the SOI marker (FF D8 FF) after "CMD=uploadphoto"
             byte[] imageBytes = null;
             byte[] marker = Encoding.UTF8.GetBytes("CMD=uploadphoto");
             int markerPos = FindBytes(rawBody, marker);
@@ -376,12 +418,22 @@ namespace BNet.ZKTecoADMS
             {
                 Directory.CreateDirectory(PhotoSaveDirectory);
 
-                string filename = string.Format(
-                    "{0}_{1:yyyy-MM-dd}.jpg", uid, DateTime.Now);
-                savedPath = Path.Combine(PhotoSaveDirectory, filename);
+                // Look up the last resolved punch type for this user.
+                PunchType punchType = PunchType.Unknown;
+                lock (_punchTypeLock)
+                {
+                    PunchType cached;
+                    if (_lastPunchType.TryGetValue(uid, out cached))
+                        punchType = cached;
+                }
 
-                // File.WriteAllBytesAsync was added in .NET Core 2.0 / .NET Standard 2.1.
-                // On .NET 4.x we use a FileStream with async write instead.
+                // Filename: userId_yyyy-MM-dd_HHmmss_PunchType.jpg
+                // e.g. 1_2026-05-27_162006_CheckOut.jpg
+                string filename = string.Format(
+                    "{0}_{1:yyyy-MM-dd}_{2}.jpg",
+                    uid, DateTime.Now, punchType);
+
+                savedPath = Path.Combine(PhotoSaveDirectory, filename);
                 await WriteAllBytesAsync(savedPath, imageBytes, ct).ConfigureAwait(false);
             }
 
@@ -398,17 +450,39 @@ namespace BNet.ZKTecoADMS
             await RespondAsync(ctx, "OK", ct).ConfigureAwait(false);
         }
 
-        // ── Helpers ────────────────────────────────────────────────────────────
+        // ── Punch type resolver ────────────────────────────────────────────────
 
         /// <summary>
-        /// Polyfill for File.WriteAllBytesAsync that works on all TFMs from 4.5 onwards.
-        /// On .NET 5+ the BCL version is available but using our own is equally correct.
+        /// Resolves the exact logical punch type from what the device sends.
+        ///
+        /// MB460 Plus firmware always sends PunchState=4 via ADMS Push.
+        /// On this device the actual punch type selected by the employee is
+        /// carried in the VerifyMode field (column [2]):
+        ///   0 = Check-In
+        ///   1 = Check-Out
+        ///   4 = Overtime-In
+        ///   5 = Overtime-Out
+        ///
+        /// Standard firmware sends the punch type directly in PunchState (0-3)
+        /// and uses VerifyMode for the authentication method.
         /// </summary>
+        private PunchType ResolvePunchType(int verifyMode, int rawPunchState)
+        {
+            switch (verifyMode)
+            {
+                case 0: return PunchType.CheckIn;
+                case 1: return PunchType.CheckOut;
+                case 4: return PunchType.OvertimeIn;
+                case 5: return PunchType.OvertimeOut;
+                default: return PunchType.Unknown;
+            }
+        }
+
+        // ── Helpers ────────────────────────────────────────────────────────────
+
         private static async Task WriteAllBytesAsync(
             string path, byte[] bytes, CancellationToken ct)
         {
-            // FileOptions.Asynchronous tells Windows to use overlapped I/O,
-            // which is important for truly async writes on .NET 4.x.
             using (var fs = new FileStream(
                 path,
                 FileMode.Create,
@@ -428,9 +502,7 @@ namespace BNet.ZKTecoADMS
             {
                 bool match = true;
                 for (int j = 0; j < needle.Length; j++)
-                {
                     if (haystack[i + j] != needle[j]) { match = false; break; }
-                }
                 if (match) return i;
             }
             return -1;

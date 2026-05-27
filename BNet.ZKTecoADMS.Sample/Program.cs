@@ -1,14 +1,11 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace BNet.ZKTecoADMS.Sample
 {
     internal class Program
     {
-        //ZKTeco ADMS : Modal MB460 Plus
+        // ZKTeco ADMS — Model [MB460 Plus]
         static async Task Main(string[] args)
         {
             var server = new ZKTecoServer
@@ -21,22 +18,52 @@ namespace BNet.ZKTecoADMS.Sample
             };
 
             server.OnHandshake += (sender, e) =>
-                Console.WriteLine($"Device connected: {e.SN}");
+                Console.WriteLine(
+                    "[" + e.Timestamp.ToString("HH:mm:ss") + "] " +
+                    "Device connected: " + e.SN);
 
             server.OnAttendance += (sender, e) =>
-                Console.WriteLine($"Punch: User={e.UserId} Time={e.PunchTime} Verify={e.VerifyMode}");
+                Console.WriteLine(
+                    "[" + e.Timestamp.ToString("HH:mm:ss") + "] " +
+                    "Punch:" +
+                    " User=" + e.UserId +
+                    " Time=" + e.PunchTime.ToString("yyyy-MM-dd HH:mm:ss") +
+                    " Verify=" + ZKTecoHelper.VerifyLabel(e.VerifyMode) +
+                    " Type=" + e.PunchType);
 
             server.OnPhotoReceived += (sender, e) =>
-                Console.WriteLine($"Photo saved: {e.SavedPath}");
+            {
+                if (e.Success)
+                    Console.WriteLine(
+                        "[" + e.Timestamp.ToString("HH:mm:ss") + "] " +
+                        "Photo saved: " + e.SavedPath);
+                else
+                    Console.WriteLine(
+                        "[" + e.Timestamp.ToString("HH:mm:ss") + "] " +
+                        "Photo FAILED for user: " + e.UserId);
+            };
+            server.OnRawRequest += (sender, e) =>
+            {
+                if (e.Table == "ATTLOG")
+                    Console.WriteLine("[RAW ATTLOG]\n" + e.Body);
+            };
 
             server.OnHeartbeat += (sender, e) =>
-                Console.WriteLine($"Heartbeat from {e.SN} — pending photos: {e.PhotoCount}");
+                Console.WriteLine(
+                    "[" + e.Timestamp.ToString("HH:mm:ss") + "] " +
+                    "Heartbeat: " + e.SN +
+                    " pending photos=" + e.PhotoCount);
 
             server.OnError += (sender, e) =>
-                Console.WriteLine($"Error [{e.Source}]: {e.Exception?.Message}");
+                Console.WriteLine(
+                    "[" + e.Timestamp.ToString("HH:mm:ss") + "] " +
+                    "ERROR [" + e.Source + "]: " + e.Exception?.Message);
 
+            Console.WriteLine("ZKTeco ADMS server starting on port " + server.Port + "...");
             await server.StartAsync();
+            Console.WriteLine("Press ENTER to stop.");
             Console.ReadLine();
+            await server.StopAsync();
         }
     }
 }
