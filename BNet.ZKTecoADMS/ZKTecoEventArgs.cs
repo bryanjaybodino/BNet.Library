@@ -144,7 +144,7 @@ namespace BNet.ZKTecoADMS
 
             public override string ToString() =>
                 string.Format("[Attendance] SN={0} User={1} Time={2:yyyy-MM-dd HH:mm:ss} Type={3} Verify={4}",
-                    SN, UserId, PunchTime, PunchType, ZKTecoHelper.VerifyLabel(VerifyMode));
+                    SN, UserId, PunchTime, PunchType, VerifyMode);
         }
 
         // ── Photo ──────────────────────────────────────────────────────────────

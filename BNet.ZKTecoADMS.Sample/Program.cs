@@ -28,7 +28,7 @@ namespace BNet.ZKTecoADMS.Sample
                     "Punch:" +
                     " User=" + e.UserId +
                     " Time=" + e.PunchTime.ToString("yyyy-MM-dd HH:mm:ss") +
-                    " Verify=" + ZKTecoHelper.VerifyLabel(e.VerifyMode) +
+                    " Verify=" + e.VerifyMode +
                     " Type=" + e.PunchType);
 
             server.OnPhotoReceived += (sender, e) =>

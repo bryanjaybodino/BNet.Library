@@ -25,9 +25,9 @@ namespace BNet.ZKTecoADMS
     ///   per user so that the attendance photo filename includes the punch type.
     /// </summary>
     public class ZKTecoServer :
-#if NET5_0_OR_GREATER || NETCOREAPP3_0_OR_GREATER
-        IAsyncDisposable,
-#endif
+    #if NET5_0_OR_GREATER || NETCOREAPP3_0_OR_GREATER
+            IAsyncDisposable,
+    #endif
         IDisposable
     {
         // ── Configuration ──────────────────────────────────────────────────────
@@ -132,12 +132,12 @@ namespace BNet.ZKTecoADMS
         /// <summary>Synchronous stop (blocks until loop exits).</summary>
         public void Stop() => StopAsync().GetAwaiter().GetResult();
 
-#if NET5_0_OR_GREATER || NETCOREAPP3_0_OR_GREATER
-        public async ValueTask DisposeAsync()
-        {
-            await StopAsync().ConfigureAwait(false);
-        }
-#endif
+        #if NET5_0_OR_GREATER || NETCOREAPP3_0_OR_GREATER
+                public async ValueTask DisposeAsync()
+                {
+                    await StopAsync().ConfigureAwait(false);
+                }
+        #endif
 
         public void Dispose() => Stop();
 
@@ -389,7 +389,7 @@ namespace BNet.ZKTecoADMS
                 // Resolve the exact punch type from the device.
                 // MB460 Plus: PunchState is always 4; actual type is in VerifyMode.
                 // Standard firmware: PunchState carries the type directly.
-                PunchType resolvedType = ResolvePunchType(verifyMode, punchState);
+                PunchType resolvedType = ResolvePunchType(verifyMode);
 
                 // Cache the resolved type so HandleAttPhotoAsync can use it for the filename.
                 lock (_punchTypeLock)
@@ -510,7 +510,7 @@ namespace BNet.ZKTecoADMS
         /// Standard firmware sends the punch type directly in PunchState (0-3)
         /// and uses VerifyMode for the authentication method.
         /// </summary>
-        private PunchType ResolvePunchType(int verifyMode, int rawPunchState)
+        private PunchType ResolvePunchType(int verifyMode)
         {
             switch (verifyMode)
             {
@@ -560,21 +560,12 @@ namespace BNet.ZKTecoADMS
             ctx.Response.ContentType = "text/plain";
             ctx.Response.ContentLength64 = buf.Length;
 
-            // FIX 1: Keep-Alive header — tells the device the connection is still
-            // alive and it can reuse the TCP session for subsequent pushes.
-            // Without this, ZKTeco firmware drops the connection after each request
-            // and shows the "reconnecting" arrows icon on idle-then-punch scenarios.
             ctx.Response.Headers["Connection"] = "keep-alive";
 
             await ctx.Response.OutputStream
                 .WriteAsync(buf, 0, buf.Length, ct)
                 .ConfigureAwait(false);
 
-            // FIX 2: Flush + close the output stream AND close the response.
-            // HttpListener on .NET Framework does NOT auto-flush on OutputStream.Close().
-            // Leaving the response un-closed keeps the TCP socket in a half-open state;
-            // after the device's idle timeout expires it sees the connection as dead,
-            // retries, and the next punch is dropped or delayed (shown as double arrows).
             ctx.Response.OutputStream.Flush();
             ctx.Response.OutputStream.Close();
             ctx.Response.Close();
