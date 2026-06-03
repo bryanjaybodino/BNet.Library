@@ -19,9 +19,9 @@ namespace BNet.WebSocket.Server
     {
         public Stream Stream { get; set; }
         public HashSet<string> Rooms { get; set; } = new HashSet<string>();
-
-        // FIX #3: per-client write lock prevents concurrent stream corruption
         public SemaphoreSlim WriteLock { get; } = new SemaphoreSlim(1, 1);
+        public DateTime LastPingTime { get; set; } = DateTime.Now;
+        public bool IsAlive { get; set; } = true;
     }
 
     public class Connection : EventHandlers
@@ -29,12 +29,22 @@ namespace BNet.WebSocket.Server
         private TcpListener _listener;
         private ConcurrentDictionary<TcpClient, MyClients> _clients = new ConcurrentDictionary<TcpClient, MyClients>();
         public bool IsRunning { get; private set; }
-
         private X509Certificate2 _serverCertificate;
+
+        // Server stats
+        public DateTime StartTime { get; private set; }
+        public int TotalConnectionsHandled { get; private set; } = 0;
+
+        // Cloudflare Tunnel optimization
+        private const int PingIntervalSeconds = 45;          // Increased from 25 to 45 (less aggressive)
+        private const int ConnectionTimeoutSeconds = 180;    // Increased from 90 to 180 (more forgiving)
+        private CancellationTokenSource _healthCheckCts;
 
         public Connection(int port)
         {
             _listener = new TcpListener(IPAddress.Any, port);
+            StartTime = DateTime.Now;
+            _healthCheckCts = new CancellationTokenSource();
         }
 
         public void LoadCertificate(string path, string password)
@@ -65,17 +75,66 @@ namespace BNet.WebSocket.Server
             {
                 IsRunning = true;
                 _listener.Start();
-                Console.WriteLine("Server started. Waiting for clients...");
+                Console.WriteLine("🚀 WebSocket Server started. Waiting for clients...");
+
+                // Start health check task
+                _ = Task.Run(HealthCheckLoop, _healthCheckCts.Token);
 
                 while (IsRunning)
                 {
                     TcpClient client = await _listener.AcceptTcpClientAsync();
+                    client.ReceiveTimeout = 60000;
+                    client.SendTimeout = 60000;
                     _ = Task.Run(async () => await HandleClientAsync(client));
                 }
             }
             catch (Exception ex)
             {
                 await SetOnError($"StartAsync: {ex.Message}");
+            }
+        }
+
+        // Health check - monitors connections and removes dead ones
+        private async Task HealthCheckLoop()
+        {
+            while (IsRunning)
+            {
+                try
+                {
+                    await Task.Delay(10000); // Check every 10 seconds (was 5)
+
+                    var deadClients = new List<TcpClient>();
+
+                    foreach (var kvp in _clients)
+                    {
+                        var client = kvp.Key;
+                        var myClient = kvp.Value;
+
+                        // Only remove if CLEARLY dead - not just on timeout
+                        if (!client.Connected || !myClient.IsAlive)
+                        {
+                            deadClients.Add(client);
+                            continue;
+                        }
+
+                        // More lenient timeout - 180 seconds (3 minutes)
+                        if ((DateTime.Now - myClient.LastPingTime).TotalSeconds > ConnectionTimeoutSeconds)
+                        {
+                            Console.WriteLine($"⏱️  Connection timeout after {ConnectionTimeoutSeconds}s");
+                            deadClients.Add(client);
+                        }
+                    }
+
+                    // Remove dead clients
+                    foreach (var client in deadClients)
+                    {
+                        await RemoveClientAsync(client);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"❌ Health check error: {ex.Message}");
+                }
             }
         }
 
@@ -124,14 +183,16 @@ namespace BNet.WebSocket.Server
             if (_clients.TryGetValue(client, out var myClient))
             {
                 myClient.Rooms.Add(roomId);
+                Console.WriteLine($"📍 Client joined room: {roomId}");
             }
         }
 
-        public Task StopAsync()
+        public async Task StopAsync()
         {
             try
             {
                 IsRunning = false;
+                _healthCheckCts.Cancel();
                 _listener.Stop();
 
                 var tasks = _clients.Keys.Select(async client =>
@@ -140,11 +201,12 @@ namespace BNet.WebSocket.Server
                     return Task.FromResult(0);
                 }).ToArray();
 
-                return Task.WhenAll(tasks);
+                await Task.WhenAll(tasks);
+                Console.WriteLine("✅ Server stopped gracefully");
             }
             catch (Exception ex)
             {
-                return SetOnError($"StopAsync: {ex.Message}");
+                await SetOnError($"StopAsync: {ex.Message}");
             }
         }
 
@@ -155,14 +217,22 @@ namespace BNet.WebSocket.Server
                 return stream;
             }
 
-            var sslStream = new SslStream(stream, false);
-            await sslStream.AuthenticateAsServerAsync(
-                _serverCertificate,
-                clientCertificateRequired: false,
-                enabledSslProtocols: SslProtocols.Tls12,
-                checkCertificateRevocation: false
-            );
-            return sslStream;
+            try
+            {
+                var sslStream = new SslStream(stream, false);
+                await sslStream.AuthenticateAsServerAsync(
+                    _serverCertificate,
+                    clientCertificateRequired: false,
+                    enabledSslProtocols: SslProtocols.Tls12,
+                    checkCertificateRevocation: false
+                );
+                return sslStream;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ SSL/TLS Error: {ex.Message}");
+                return null;
+            }
         }
 
         private async Task HandleClientAsync(TcpClient client)
@@ -175,15 +245,12 @@ namespace BNet.WebSocket.Server
                     {
                         if (secureStream == null)
                             return;
-                        //throw new NotSupportedException("Failed to secure the stream for client.");
 
                         if (_clients.ContainsKey(client))
                             return;
-                        //throw new Exception("Client already connected.");
 
                         if (!_clients.TryAdd(client, new MyClients { Stream = secureStream }))
                             return;
-                        //throw new Exception("Failed to add client to the dictionary.");
 
                         await HandleStartupAsync(client, secureStream);
                     }
@@ -191,7 +258,7 @@ namespace BNet.WebSocket.Server
             }
             catch (Exception ex)
             {
-                await SetOnError($"{ex.Message}");
+                Console.WriteLine($"❌ Client error: {ex.Message}");
             }
             finally
             {
@@ -202,11 +269,16 @@ namespace BNet.WebSocket.Server
         private async Task HandleStartupAsync(TcpClient client, Stream stream)
         {
             string handshakeRequest = await ReadRequestAsync(client, stream);
+
+            var firstLine = handshakeRequest.Split(new[] { "\r\n" }, StringSplitOptions.None).FirstOrDefault() ?? "";
+            Console.WriteLine($"📨 Incoming request: {firstLine}");
+
             if (IsWebSocketHandshake(handshakeRequest, out string key))
             {
+                // Handle WebSocket connection
+                Console.WriteLine("🔗 ✅ WebSocket handshake recognized!");
                 await SendHandshakeResponseAsync(stream, key);
 
-                // FIX #1: now returns clean "Room_ABC", not "?room=Room_ABC"
                 string roomId = ExtractRoomIdFromRequest(handshakeRequest);
                 if (!string.IsNullOrEmpty(roomId))
                 {
@@ -215,6 +287,9 @@ namespace BNet.WebSocket.Server
 
                 var clients = _clients.Values.Distinct().ToList();
                 await SetOnConnectedClient(clients.Count);
+
+                // Start ping loop for this connection (Cloudflare Tunnel compatibility)
+                _ = Task.Run(() => PingLoopAsync(client, stream));
 
                 const string BinaryMarker = " BIN ";
 
@@ -229,43 +304,148 @@ namespace BNet.WebSocket.Server
                     else if (message == string.Empty)
                     {
                         return;
-                        //throw new Exception("Force close client due to abnormal activity");
                     }
                     else if (message == "Unexpected frame type received")
                     {
                         // ignore unknown opcodes
+                        continue;
                     }
                     else if (message.StartsWith(BinaryMarker))
                     {
-                        // Binary frame — broadcast to room immediately (fast, same as text path),
-                        // then notify Setup.cs in the background for DB save / email / push.
                         string json = message.Substring(BinaryMarker.Length);
                         byte[] raw = Encoding.UTF8.GetBytes(json);
 
-                        // 1. Instant room broadcast (no round-trip through Setup.cs)
                         if (string.IsNullOrEmpty(roomId))
+                        {
                             await SendBinaryAsync(raw);
+                        }
                         else
+                        {
                             await SendBinaryToRoomAsync(roomId, raw);
+                        }
 
-                        // 2. Background side-effects (DB save, email, notifications)
                         _ = Task.Run(() => SetOnBinaryReceived(raw));
                     }
                     else if (message.Replace(" ", "") != "")
                     {
+                        // Only broadcast once, not both to SetOnReceived and SendMessage
                         await SetOnReceived(message);
+
                         if (string.IsNullOrEmpty(roomId))
+                        {
                             await SendMessageAsync(message);
+                        }
                         else
+                        {
                             await SendMessageToRoomAsync(roomId, message);
+                        }
                     }
                 }
 
                 throw new Exception("Client Disconnected");
             }
+            else if (IsHttpRequest(handshakeRequest))
+            {
+                // Handle regular HTTP request (status check)
+                Console.WriteLine("🌐 HTTP request detected - serving status page");
+                await SendHttpStatusResponseAsync(stream, handshakeRequest);
+            }
             else
             {
-                throw new Exception("Invalid WebSocket handshake.");
+                Console.WriteLine("❌ Invalid request - not WebSocket or HTTP");
+                Console.WriteLine($"Request headers:\n{handshakeRequest.Substring(0, Math.Min(500, handshakeRequest.Length))}");
+                throw new Exception("Invalid request - not WebSocket or HTTP.");
+            }
+        }
+
+        // NEW: Ping loop for Cloudflare Tunnel compatibility
+        private async Task PingLoopAsync(TcpClient client, Stream stream)
+        {
+            try
+            {
+                while (client.Connected && _clients.ContainsKey(client))
+                {
+                    await Task.Delay(PingIntervalSeconds * 1000);
+
+                    if (!client.Connected || !_clients.ContainsKey(client))
+                        break;
+
+                    try
+                    {
+                        byte[] pingFrame = CreatePingFrame();
+                        await stream.WriteAsync(pingFrame, 0, pingFrame.Length);
+                        await stream.FlushAsync();
+
+                        if (_clients.TryGetValue(client, out var myClient))
+                        {
+                            myClient.LastPingTime = DateTime.Now;
+                        }
+
+                        // Debug: ping sent
+                        // Console.WriteLine($"📍 Ping sent");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"⚠️  Ping error: {ex.Message}");
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ping loop error: {ex.Message}");
+            }
+        }
+
+        // Create a proper WebSocket ping frame
+        private byte[] CreatePingFrame()
+        {
+            byte[] frame = new byte[2];
+            frame[0] = 0x89; // FIN=1, RSV=0, OPCODE=9 (Ping)
+            frame[1] = 0x00; // Mask=0, Payload length=0
+            return frame;
+        }
+
+        private bool IsHttpRequest(string request)
+        {
+            var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
+            if (lines.Length == 0) return false;
+
+            var firstLine = lines[0];
+            return firstLine.StartsWith("GET") || firstLine.StartsWith("POST") || firstLine.StartsWith("HEAD");
+        }
+
+        private async Task SendHttpStatusResponseAsync(Stream stream, string request)
+        {
+            try
+            {
+                var uptime = DateTime.Now - StartTime;
+                var clientCount = _clients.Count;
+
+                var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
+                var requestLine = lines[0];
+                var path = requestLine.Split(' ').Length > 1 ? requestLine.Split(' ')[1] : "/";
+                // Just copy and paste this directly - NO LINE BREAKS
+                string htmlBody = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width'><title>Server</title><style>body{margin:0;padding:10px;background:#f5f5f5;font-family:Arial;font-size:14px}.c{max-width:400px;margin:0 auto;background:#fff;padding:15px;border-radius:4px;box-shadow:0 1px 2px rgba(0,0,0,.1)}.s{color:#16a34a;font-weight:bold;font-size:18px;text-align:center;margin:5px 0}.d{padding:5px 0;border-bottom:1px solid #eee}</style></head><body><div class='c'><div class='s'>✅ ONLINE</div><div class='d'><b>Connections:</b> " + clientCount + "</div><div class='d'><b>Uptime:</b> " + uptime.Days + "d " + uptime.Hours + "h " + uptime.Minutes + "m</div><div style='margin-top:10px;font-size:12px;color:#666'>wss://socket.zionstrategicsolutions.com</div><div style='text-align:center;margin-top:10px;font-size:11px;color:#999'>Ping: " + PingIntervalSeconds + "s</div></div></body></html>";
+
+                string response =
+                    "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: text/html; charset=UTF-8\r\n" +
+                    $"Content-Length: {Encoding.UTF8.GetByteCount(htmlBody)}\r\n" +
+                    "Connection: close\r\n" +
+                    "Cache-Control: no-cache\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n" +
+                    "\r\n";
+
+                byte[] responseBytes = Encoding.UTF8.GetBytes(response + htmlBody);
+                await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
+                await stream.FlushAsync();
+
+                Console.WriteLine($"📊 Status page served - {clientCount} active connections");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Error sending status: {ex.Message}");
             }
         }
 
@@ -275,15 +455,21 @@ namespace BNet.WebSocket.Server
             var buffer = new byte[client.ReceiveBufferSize];
             int bytesRead;
 
-            do
+            try
             {
-                bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-                if (bytesRead > 0)
+                do
                 {
-                    requestBuilder.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));
-                }
+                    bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                    if (bytesRead > 0)
+                    {
+                        requestBuilder.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));
+                    }
+                } while (bytesRead > 0 && !requestBuilder.ToString().EndsWith("\r\n\r\n"));
             }
-            while (bytesRead > 0 && !requestBuilder.ToString().EndsWith("\r\n\r\n"));
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error reading request: {ex.Message}");
+            }
 
             return requestBuilder.ToString();
         }
@@ -291,16 +477,23 @@ namespace BNet.WebSocket.Server
         private bool IsWebSocketHandshake(string request, out string key)
         {
             key = null;
-            if (request.Contains("Upgrade: websocket") && request.Contains("Connection: Upgrade"))
+
+            // Case-insensitive check for WebSocket upgrade (Cloudflare compatibility)
+            string lowerRequest = request.ToLower();
+            if (!lowerRequest.Contains("upgrade:") || !lowerRequest.Contains("websocket"))
+                return false;
+            if (!lowerRequest.Contains("connection:") || !lowerRequest.Contains("upgrade"))
+                return false;
+
+            var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
+            foreach (var line in lines)
             {
-                var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
-                foreach (var line in lines)
+                // Case-insensitive header matching
+                if (line.IndexOf("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase) == 0)
                 {
-                    if (line.StartsWith("Sec-WebSocket-Key:"))
-                    {
-                        key = line.Substring("Sec-WebSocket-Key:".Length).Trim();
-                        return true;
-                    }
+                    key = line.Substring("Sec-WebSocket-Key:".Length).Trim();
+                    Console.WriteLine($"✅ WebSocket handshake detected - Key: {key.Substring(0, Math.Min(10, key.Length))}...");
+                    return true;
                 }
             }
             return false;
@@ -324,18 +517,14 @@ namespace BNet.WebSocket.Server
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
                 $"Sec-WebSocket-Accept: {CalculateWebSocketAcceptKey()}\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
                 "\r\n";
 
             byte[] responseBytes = Encoding.UTF8.GetBytes(response);
             await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
+            await stream.FlushAsync();
         }
 
-        // FIX #1: was returning raw "?room=Room_ABC" — now returns "Room_ABC"
-        //
-        // Root cause: the old code returned uri.Query directly, which includes
-        // the leading "?" and the "room=" key name. So JoinRoom stored the key
-        // "?room=Room_ABC", but SendBinaryToRoomAsync looked for "Room_ABC".
-        // No client ever matched → all real-time messages were silently dropped.
         private string ExtractRoomIdFromRequest(string request)
         {
             var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
@@ -359,28 +548,22 @@ namespace BNet.WebSocket.Server
             var url = requestParts[1];
             var uri = new Uri($"http://{hostname}:{port}{url}");
 
-            var query = uri.Query; // e.g. "?room=Room_ABC"
+            var query = uri.Query;
             if (string.IsNullOrEmpty(query)) return null;
 
-            // Parse key=value pairs — extract only the "room" value
             string queryContent = query.TrimStart('?');
             foreach (var part in queryContent.Split('&'))
             {
                 var kv = part.Split(new[] { '=' }, 2);
                 if (kv.Length == 2 && kv[0].Equals("room", StringComparison.OrdinalIgnoreCase))
                 {
-                    return Uri.UnescapeDataString(kv[1]); // returns "Room_ABC"
+                    return Uri.UnescapeDataString(kv[1]);
                 }
             }
 
             return null;
         }
 
-        // Returns:
-        //   non-empty string  → decoded text frame
-        //   null              → binary frame (OnBinaryReceived already fired)
-        //   ""                → force-close signal
-        //   "Unexpected..."   → unknown opcode
         private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
         {
             var messageBuilder = new List<byte>();
@@ -389,13 +572,26 @@ namespace BNet.WebSocket.Server
             while (!isFinalFragment)
             {
                 byte[] buffer = new byte[client.ReceiveBufferSize];
-                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                int bytesRead = 0;
+
+                try
+                {
+                    bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                }
+                catch
+                {
+                    return string.Empty;
+                }
+
                 if (bytesRead == 0)
                     return string.Empty;
 
                 int offset = 0;
                 while (offset < bytesRead)
                 {
+                    if (offset + 2 > bytesRead)
+                        break;
+
                     byte b0 = buffer[offset];
                     isFinalFragment = (b0 & 0x80) != 0;
                     byte opcode = (byte)(b0 & 0x0F);
@@ -410,11 +606,13 @@ namespace BNet.WebSocket.Server
 
                                 if (payloadLength == 126)
                                 {
+                                    if (offset + 4 > bytesRead) return string.Empty;
                                     payloadLength = (buffer[offset + 2] << 8) | buffer[offset + 3];
                                     headerSize += 2;
                                 }
                                 else if (payloadLength == 127)
                                 {
+                                    if (offset + 10 > bytesRead) return string.Empty;
                                     payloadLength = (int)(
                                         ((long)buffer[offset + 2] << 56) |
                                         ((long)buffer[offset + 3] << 48) |
@@ -427,6 +625,9 @@ namespace BNet.WebSocket.Server
                                     );
                                     headerSize += 8;
                                 }
+
+                                if (offset + headerSize + 4 > bytesRead)
+                                    return string.Empty;
 
                                 byte[] maskingKey = new byte[4];
                                 Array.Copy(buffer, offset + headerSize, maskingKey, 0, 4);
@@ -443,9 +644,6 @@ namespace BNet.WebSocket.Server
 
                                 if (opcode == 2)
                                 {
-                                    // Return binary payload decoded as string with a marker prefix.
-                                    // The message loop broadcasts it immediately (fast path) then
-                                    // fires OnBinaryReceived in the background for side-effects.
                                     return " BIN " + Encoding.UTF8.GetString(payload);
                                 }
 
@@ -460,23 +658,31 @@ namespace BNet.WebSocket.Server
                         case 8: // Close frame
                             {
                                 byte[] responseCloseFrame = CreateCloseFrame();
-                                await stream.WriteAsync(responseCloseFrame, 0, responseCloseFrame.Length);
-                                break;
-
-                                //throw new InvalidOperationException("Received close frame.");
+                                try { await stream.WriteAsync(responseCloseFrame, 0, responseCloseFrame.Length); }
+                                catch { }
+                                if (_clients.TryGetValue(client, out var myClient))
+                                    myClient.IsAlive = false;
+                                return string.Empty;
                             }
 
                         case 9: // Ping frame
                             {
                                 byte[] pongFrame = CreatePongFrame(buffer, bytesRead, offset);
-                                await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
+                                try { await stream.WriteAsync(pongFrame, 0, pongFrame.Length); }
+                                catch { }
                                 offset += 2 + (buffer[offset + 1] & 0x7F);
                                 break;
                             }
 
                         case 10: // Pong frame
-                            offset += 2 + (buffer[offset + 1] & 0x7F);
-                            break;
+                            {
+                                if (_clients.TryGetValue(client, out var myClient))
+                                {
+                                    myClient.LastPingTime = DateTime.Now;
+                                }
+                                offset += 2 + (buffer[offset + 1] & 0x7F);
+                                break;
+                            }
 
                         default:
                             return "Unexpected frame type received";
@@ -512,10 +718,6 @@ namespace BNet.WebSocket.Server
             return frame;
         }
 
-        // FIX #3: all writes go through a per-client SemaphoreSlim(1,1)
-        // Without this, two concurrent broadcasts (e.g. typing + chat) could
-        // interleave bytes on the same stream, producing corrupted WS frames
-        // that the browser silently drops or that crash the connection.
         private async Task WriteTextAsync(MyClients client, string message)
         {
             byte[] payload = Encoding.UTF8.GetBytes(message);
@@ -525,6 +727,11 @@ namespace BNet.WebSocket.Server
             {
                 await client.Stream.WriteAsync(frame, 0, frame.Length);
                 await client.Stream.FlushAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error writing text: {ex.Message}");
+                client.IsAlive = false;
             }
             finally
             {
@@ -540,6 +747,11 @@ namespace BNet.WebSocket.Server
             {
                 await client.Stream.WriteAsync(frame, 0, frame.Length);
                 await client.Stream.FlushAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error writing binary: {ex.Message}");
+                client.IsAlive = false;
             }
             finally
             {
@@ -587,8 +799,13 @@ namespace BNet.WebSocket.Server
         {
             if (_clients.TryRemove(client, out var myClient))
             {
-                myClient.Stream?.Dispose();
-                client?.Close();
+                try
+                {
+                    myClient.Stream?.Dispose();
+                    client?.Close();
+                }
+                catch { }
+                TotalConnectionsHandled++;
             }
             var clients = _clients.Values.Distinct().ToList();
             await SetOnDisconnectedClient(clients.Count);
