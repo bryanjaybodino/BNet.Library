@@ -425,8 +425,22 @@ namespace BNet.WebSocket.Server
                 var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
                 var requestLine = lines[0];
                 var path = requestLine.Split(' ').Length > 1 ? requestLine.Split(' ')[1] : "/";
-                // Just copy and paste this directly - NO LINE BREAKS
-                string htmlBody = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width'><title>Server</title><style>body{margin:0;padding:10px;background:#f5f5f5;font-family:Arial;font-size:14px}.c{max-width:400px;margin:0 auto;background:#fff;padding:15px;border-radius:4px;box-shadow:0 1px 2px rgba(0,0,0,.1)}.s{color:#16a34a;font-weight:bold;font-size:18px;text-align:center;margin:5px 0}.d{padding:5px 0;border-bottom:1px solid #eee}</style></head><body><div class='c'><div class='s'>✅ ONLINE</div><div class='d'><b>Connections:</b> " + clientCount + "</div><div class='d'><b>Uptime:</b> " + uptime.Days + "d " + uptime.Hours + "h " + uptime.Minutes + "m</div><div style='margin-top:10px;font-size:12px;color:#666'>wss://socket.zionstrategicsolutions.com</div><div style='text-align:center;margin-top:10px;font-size:11px;color:#999'>Ping: " + PingIntervalSeconds + "s</div></div></body></html>";
+
+                // Extract the Host header
+                string host = "localhost"; // Default fallback
+                string hostHeader = lines.FirstOrDefault(line =>
+                    line.StartsWith("Host:", StringComparison.OrdinalIgnoreCase));
+
+                if (hostHeader != null)
+                {
+                    host = hostHeader.Substring("Host:".Length).Trim();
+                }
+
+                // Build the WebSocket URL using the actual host
+                string wsProtocol = hostHeader?.Contains(":443") ?? false ? "wss" : "wss"; // Default to wss
+                string wsUrl = $"{wsProtocol}://{host}";
+
+                string htmlBody = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width'><title>Server</title><style>body{margin:0;padding:10px;background:#f5f5f5;font-family:Arial;font-size:14px}.c{max-width:400px;margin:0 auto;background:#fff;padding:15px;border-radius:4px;box-shadow:0 1px 2px rgba(0,0,0,.1)}.s{color:#16a34a;font-weight:bold;font-size:18px;text-align:center;margin:5px 0}.d{padding:5px 0;border-bottom:1px solid #eee}</style></head><body><div class='c'><div class='s'>✅ ONLINE</div><div class='d'><b>Connections:</b> " + clientCount + "</div><div class='d'><b>Uptime:</b> " + uptime.Days + "d " + uptime.Hours + "h " + uptime.Minutes + "m</div><div style='margin-top:10px;font-size:12px;color:#666'>" + wsUrl + "</div><div style='text-align:center;margin-top:10px;font-size:11px;color:#999'>Ping: " + PingIntervalSeconds + "s</div></div></body></html>";
 
                 string response =
                     "HTTP/1.1 200 OK\r\n" +
@@ -441,7 +455,7 @@ namespace BNet.WebSocket.Server
                 await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
                 await stream.FlushAsync();
 
-                Console.WriteLine($"📊 Status page served - {clientCount} active connections");
+                Console.WriteLine($"📊 Status page served - {clientCount} active connections - Host: {host}");
             }
             catch (Exception ex)
             {
