@@ -19,7 +19,7 @@ namespace BNet.WebSocket.Server.Sample
             InitializeComponent();
         }
 
-        BNet.WebSocket.Server.Connection connection = new Connection(8080);
+        BNet.WebSocket.Server.Connection connection = new Connection(6080);
         private void Form1_Load(object sender, EventArgs e)
         {
             foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
@@ -29,7 +29,7 @@ namespace BNet.WebSocket.Server.Sample
                     IPInterfaceProperties properties = ni.GetIPProperties();
                     foreach (UnicastIPAddressInformation ip in properties.UnicastAddresses)
                     {
-                        textBox_Hostname.AppendText("ws://" + ip.Address.ToString() + ":8080\r\n");
+                        textBox_Hostname.AppendText("ws://" + ip.Address.ToString() + ":6080\r\n");
                     }
                 }
             }

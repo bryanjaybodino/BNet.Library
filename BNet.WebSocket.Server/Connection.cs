@@ -36,8 +36,8 @@ namespace BNet.WebSocket.Server
         public int TotalConnectionsHandled { get; private set; } = 0;
 
         // Cloudflare Tunnel optimization
-        private const int PingIntervalSeconds = 45;          // Increased from 25 to 45 (less aggressive)
-        private const int ConnectionTimeoutSeconds = 180;    // Increased from 90 to 180 (more forgiving)
+        private const int PingIntervalSeconds = 30;
+        private const int ConnectionTimeoutSeconds = 120;
         private CancellationTokenSource _healthCheckCts;
 
         public Connection(int port)
@@ -77,14 +77,12 @@ namespace BNet.WebSocket.Server
                 _listener.Start();
                 Console.WriteLine("🚀 WebSocket Server started. Waiting for clients...");
 
-                // Start health check task
                 _ = Task.Run(HealthCheckLoop, _healthCheckCts.Token);
 
                 while (IsRunning)
                 {
                     TcpClient client = await _listener.AcceptTcpClientAsync();
-                    client.ReceiveTimeout = 60000;
-                    client.SendTimeout = 60000;
+                    client.NoDelay = true; // Disable Nagle's algorithm for faster WebSocket response times
                     _ = Task.Run(async () => await HandleClientAsync(client));
                 }
             }
@@ -94,14 +92,13 @@ namespace BNet.WebSocket.Server
             }
         }
 
-        // Health check - monitors connections and removes dead ones
         private async Task HealthCheckLoop()
         {
             while (IsRunning)
             {
                 try
                 {
-                    await Task.Delay(10000); // Check every 10 seconds (was 5)
+                    await Task.Delay(10000, _healthCheckCts.Token);
 
                     var deadClients = new List<TcpClient>();
 
@@ -110,27 +107,25 @@ namespace BNet.WebSocket.Server
                         var client = kvp.Key;
                         var myClient = kvp.Value;
 
-                        // Only remove if CLEARLY dead - not just on timeout
                         if (!client.Connected || !myClient.IsAlive)
                         {
                             deadClients.Add(client);
                             continue;
                         }
 
-                        // More lenient timeout - 180 seconds (3 minutes)
                         if ((DateTime.Now - myClient.LastPingTime).TotalSeconds > ConnectionTimeoutSeconds)
                         {
-                            Console.WriteLine($"⏱️  Connection timeout after {ConnectionTimeoutSeconds}s");
+                            Console.WriteLine($"⏱️ Connection timeout after {ConnectionTimeoutSeconds}s");
                             deadClients.Add(client);
                         }
                     }
 
-                    // Remove dead clients
                     foreach (var client in deadClients)
                     {
                         await RemoveClientAsync(client);
                     }
                 }
+                catch (TaskCanceledException) { break; }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"❌ Health check error: {ex.Message}");
@@ -138,7 +133,6 @@ namespace BNet.WebSocket.Server
             }
         }
 
-        // Send text to all clients
         public async Task SendMessageAsync(string message)
         {
             var clients = _clients.Values.Distinct().ToList();
@@ -146,7 +140,6 @@ namespace BNet.WebSocket.Server
             await Task.WhenAll(tasks);
         }
 
-        // Send text to a room
         public Task SendMessageToRoomAsync(string roomId, string message)
         {
             var clients = _clients.Values
@@ -158,7 +151,6 @@ namespace BNet.WebSocket.Server
             return Task.WhenAll(tasks);
         }
 
-        // Send binary to all clients
         public async Task SendBinaryAsync(byte[] data)
         {
             var clients = _clients.Values.Distinct().ToList();
@@ -166,7 +158,6 @@ namespace BNet.WebSocket.Server
             await Task.WhenAll(tasks);
         }
 
-        // Send binary to a room
         public Task SendBinaryToRoomAsync(string roomId, byte[] data)
         {
             var clients = _clients.Values
@@ -223,7 +214,7 @@ namespace BNet.WebSocket.Server
                 await sslStream.AuthenticateAsServerAsync(
                     _serverCertificate,
                     clientCertificateRequired: false,
-                    enabledSslProtocols: SslProtocols.Tls12,
+                    enabledSslProtocols: SslProtocols.Tls12 | (SslProtocols)3072,
                     checkCertificateRevocation: false
                 );
                 return sslStream;
@@ -249,10 +240,11 @@ namespace BNet.WebSocket.Server
                         if (_clients.ContainsKey(client))
                             return;
 
-                        if (!_clients.TryAdd(client, new MyClients { Stream = secureStream }))
+                        var myClient = new MyClients { Stream = secureStream };
+                        if (!_clients.TryAdd(client, myClient))
                             return;
 
-                        await HandleStartupAsync(client, secureStream);
+                        await HandleStartupAsync(client, myClient);
                     }
                 }
             }
@@ -266,8 +258,9 @@ namespace BNet.WebSocket.Server
             }
         }
 
-        private async Task HandleStartupAsync(TcpClient client, Stream stream)
+        private async Task HandleStartupAsync(TcpClient client, MyClients myClient)
         {
+            Stream stream = myClient.Stream;
             string handshakeRequest = await ReadRequestAsync(client, stream);
 
             var firstLine = handshakeRequest.Split(new[] { "\r\n" }, StringSplitOptions.None).FirstOrDefault() ?? "";
@@ -275,7 +268,6 @@ namespace BNet.WebSocket.Server
 
             if (IsWebSocketHandshake(handshakeRequest, out string key))
             {
-                // Handle WebSocket connection
                 Console.WriteLine("🔗 ✅ WebSocket handshake recognized!");
                 await SendHandshakeResponseAsync(stream, key);
 
@@ -288,12 +280,11 @@ namespace BNet.WebSocket.Server
                 var clients = _clients.Values.Distinct().ToList();
                 await SetOnConnectedClient(clients.Count);
 
-                // Start ping loop for this connection (Cloudflare Tunnel compatibility)
-                _ = Task.Run(() => PingLoopAsync(client, stream));
+                _ = Task.Run(() => PingLoopAsync(client, myClient));
 
                 const string BinaryMarker = " BIN ";
 
-                while (client.Connected)
+                while (client.Connected && myClient.IsAlive)
                 {
                     string message = await ReadMessageAsync(client, stream);
 
@@ -307,7 +298,6 @@ namespace BNet.WebSocket.Server
                     }
                     else if (message == "Unexpected frame type received")
                     {
-                        // ignore unknown opcodes
                         continue;
                     }
                     else if (message.StartsWith(BinaryMarker))
@@ -326,9 +316,8 @@ namespace BNet.WebSocket.Server
 
                         _ = Task.Run(() => SetOnBinaryReceived(raw));
                     }
-                    else if (message.Replace(" ", "") != "")
+                    else if (!string.IsNullOrWhiteSpace(message))
                     {
-                        // Only broadcast once, not both to SetOnReceived and SendMessage
                         await SetOnReceived(message);
 
                         if (string.IsNullOrEmpty(roomId))
@@ -341,68 +330,57 @@ namespace BNet.WebSocket.Server
                         }
                     }
                 }
-
-                throw new Exception("Client Disconnected");
             }
             else if (IsHttpRequest(handshakeRequest))
             {
-                // Handle regular HTTP request (status check)
                 Console.WriteLine("🌐 HTTP request detected - serving status page");
                 await SendHttpStatusResponseAsync(stream, handshakeRequest);
             }
             else
             {
                 Console.WriteLine("❌ Invalid request - not WebSocket or HTTP");
-                Console.WriteLine($"Request headers:\n{handshakeRequest.Substring(0, Math.Min(500, handshakeRequest.Length))}");
                 throw new Exception("Invalid request - not WebSocket or HTTP.");
             }
         }
 
-        // NEW: Ping loop for Cloudflare Tunnel compatibility
-        private async Task PingLoopAsync(TcpClient client, Stream stream)
+        private async Task PingLoopAsync(TcpClient client, MyClients myClient)
         {
             try
             {
-                while (client.Connected && _clients.ContainsKey(client))
+                while (client.Connected && myClient.IsAlive && _clients.ContainsKey(client))
                 {
                     await Task.Delay(PingIntervalSeconds * 1000);
 
-                    if (!client.Connected || !_clients.ContainsKey(client))
+                    if (!client.Connected || !myClient.IsAlive)
                         break;
 
+                    byte[] pingFrame = CreatePingFrame();
+
+                    // Fixed: Secure stream writes using WriteLock
+                    await myClient.WriteLock.WaitAsync();
                     try
                     {
-                        byte[] pingFrame = CreatePingFrame();
-                        await stream.WriteAsync(pingFrame, 0, pingFrame.Length);
-                        await stream.FlushAsync();
-
-                        if (_clients.TryGetValue(client, out var myClient))
-                        {
-                            myClient.LastPingTime = DateTime.Now;
-                        }
-
-                        // Debug: ping sent
-                        // Console.WriteLine($"📍 Ping sent");
+                        await myClient.Stream.WriteAsync(pingFrame, 0, pingFrame.Length);
+                        await myClient.Stream.FlushAsync();
                     }
-                    catch (Exception ex)
+                    finally
                     {
-                        Console.WriteLine($"⚠️  Ping error: {ex.Message}");
-                        break;
+                        myClient.WriteLock.Release();
                     }
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Ping loop error: {ex.Message}");
+                myClient.IsAlive = false;
             }
         }
 
-        // Create a proper WebSocket ping frame
         private byte[] CreatePingFrame()
         {
             byte[] frame = new byte[2];
-            frame[0] = 0x89; // FIN=1, RSV=0, OPCODE=9 (Ping)
-            frame[1] = 0x00; // Mask=0, Payload length=0
+            frame[0] = 0x89; // FIN=1, Opcode=9 (Ping)
+            frame[1] = 0x00; // Mask=0, Payload=0
             return frame;
         }
 
@@ -424,21 +402,12 @@ namespace BNet.WebSocket.Server
 
                 var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
                 var requestLine = lines[0];
-                var path = requestLine.Split(' ').Length > 1 ? requestLine.Split(' ')[1] : "/";
 
-                // Extract the Host header
-                string host = "localhost"; // Default fallback
                 string hostHeader = lines.FirstOrDefault(line =>
                     line.StartsWith("Host:", StringComparison.OrdinalIgnoreCase));
 
-                if (hostHeader != null)
-                {
-                    host = hostHeader.Substring("Host:".Length).Trim();
-                }
-
-                // Build the WebSocket URL using the actual host
-                string wsProtocol = hostHeader?.Contains(":443") ?? false ? "wss" : "wss"; // Default to wss
-                string wsUrl = $"{wsProtocol}://{host}";
+                string host = hostHeader != null ? hostHeader.Substring("Host:".Length).Trim() : "localhost";
+                string wsUrl = $"wss://{host}";
 
                 string htmlBody = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width'><title>Server</title><style>body{margin:0;padding:10px;background:#f5f5f5;font-family:Arial;font-size:14px}.c{max-width:400px;margin:0 auto;background:#fff;padding:15px;border-radius:4px;box-shadow:0 1px 2px rgba(0,0,0,.1)}.s{color:#16a34a;font-weight:bold;font-size:18px;text-align:center;margin:5px 0}.d{padding:5px 0;border-bottom:1px solid #eee}</style></head><body><div class='c'><div class='s'>✅ ONLINE</div><div class='d'><b>Connections:</b> " + clientCount + "</div><div class='d'><b>Uptime:</b> " + uptime.Days + "d " + uptime.Hours + "h " + uptime.Minutes + "m</div><div style='margin-top:10px;font-size:12px;color:#666'>" + wsUrl + "</div><div style='text-align:center;margin-top:10px;font-size:11px;color:#999'>Ping: " + PingIntervalSeconds + "s</div></div></body></html>";
 
@@ -454,8 +423,6 @@ namespace BNet.WebSocket.Server
                 byte[] responseBytes = Encoding.UTF8.GetBytes(response + htmlBody);
                 await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
                 await stream.FlushAsync();
-
-                Console.WriteLine($"📊 Status page served - {clientCount} active connections - Host: {host}");
             }
             catch (Exception ex)
             {
@@ -466,7 +433,7 @@ namespace BNet.WebSocket.Server
         private async Task<string> ReadRequestAsync(TcpClient client, Stream stream)
         {
             var requestBuilder = new StringBuilder();
-            var buffer = new byte[client.ReceiveBufferSize];
+            var buffer = new byte[8192];
             int bytesRead;
 
             try
@@ -491,22 +458,16 @@ namespace BNet.WebSocket.Server
         private bool IsWebSocketHandshake(string request, out string key)
         {
             key = null;
-
-            // Case-insensitive check for WebSocket upgrade (Cloudflare compatibility)
             string lowerRequest = request.ToLower();
             if (!lowerRequest.Contains("upgrade:") || !lowerRequest.Contains("websocket"))
-                return false;
-            if (!lowerRequest.Contains("connection:") || !lowerRequest.Contains("upgrade"))
                 return false;
 
             var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
             foreach (var line in lines)
             {
-                // Case-insensitive header matching
                 if (line.IndexOf("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase) == 0)
                 {
                     key = line.Substring("Sec-WebSocket-Key:".Length).Trim();
-                    Console.WriteLine($"✅ WebSocket handshake detected - Key: {key.Substring(0, Math.Min(10, key.Length))}...");
                     return true;
                 }
             }
@@ -542,17 +503,6 @@ namespace BNet.WebSocket.Server
         private string ExtractRoomIdFromRequest(string request)
         {
             var lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
-
-            string hostHeader = lines.FirstOrDefault(line => line.StartsWith("Host:"));
-            if (hostHeader == null)
-                throw new NotSupportedException("Host header not found in request.");
-
-            var hostParts = hostHeader.Substring("Host:".Length).Trim().Split(':');
-            string hostname = hostParts[0];
-            int port = 80;
-            if (hostParts.Length > 1 && int.TryParse(hostParts[1], out int parsedPort))
-                port = parsedPort;
-
             var requestLine = lines.FirstOrDefault();
             if (requestLine == null) return null;
 
@@ -560,12 +510,9 @@ namespace BNet.WebSocket.Server
             if (requestParts.Length < 2) return null;
 
             var url = requestParts[1];
-            var uri = new Uri($"http://{hostname}:{port}{url}");
+            if (!url.Contains("?")) return null;
 
-            var query = uri.Query;
-            if (string.IsNullOrEmpty(query)) return null;
-
-            string queryContent = query.TrimStart('?');
+            string queryContent = url.Substring(url.IndexOf('?') + 1);
             foreach (var part in queryContent.Split('&'))
             {
                 var kv = part.Split(new[] { '=' }, 2);
@@ -578,155 +525,106 @@ namespace BNet.WebSocket.Server
             return null;
         }
 
+        private async Task<byte[]> ReadExactBytesAsync(Stream stream, int count)
+        {
+            byte[] buffer = new byte[count];
+            int totalBytesRead = 0;
+            while (totalBytesRead < count)
+            {
+                int read = await stream.ReadAsync(buffer, totalBytesRead, count - totalBytesRead);
+                if (read == 0) return null;
+                totalBytesRead += read;
+            }
+            return buffer;
+        }
+
         private async Task<string> ReadMessageAsync(TcpClient client, Stream stream)
         {
-            var messageBuilder = new List<byte>();
-            bool isFinalFragment = false;
-
-            while (!isFinalFragment)
+            try
             {
-                byte[] buffer = new byte[client.ReceiveBufferSize];
-                int bytesRead = 0;
+                byte[] header = await ReadExactBytesAsync(stream, 2);
+                if (header == null) return string.Empty;
 
-                try
+                bool isFinalFragment = (header[0] & 0x80) != 0;
+                byte opcode = (byte)(header[0] & 0x0F);
+                bool isMasked = (header[1] & 0x80) != 0;
+                long payloadLength = header[1] & 0x7F;
+
+                if (payloadLength == 126)
                 {
-                    bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                    byte[] extLen = await ReadExactBytesAsync(stream, 2);
+                    if (extLen == null) return string.Empty;
+                    payloadLength = (extLen[0] << 8) | extLen[1];
                 }
-                catch
+                else if (payloadLength == 127)
                 {
-                    return string.Empty;
+                    byte[] extLen = await ReadExactBytesAsync(stream, 8);
+                    if (extLen == null) return string.Empty;
+                    payloadLength = BitConverter.ToInt64(extLen.Reverse().ToArray(), 0);
                 }
 
-                if (bytesRead == 0)
-                    return string.Empty;
-
-                int offset = 0;
-                while (offset < bytesRead)
+                byte[] maskingKey = null;
+                if (isMasked)
                 {
-                    if (offset + 2 > bytesRead)
-                        break;
+                    maskingKey = await ReadExactBytesAsync(stream, 4);
+                    if (maskingKey == null) return string.Empty;
+                }
 
-                    byte b0 = buffer[offset];
-                    isFinalFragment = (b0 & 0x80) != 0;
-                    byte opcode = (byte)(b0 & 0x0F);
+                byte[] payload = payloadLength > 0 ? await ReadExactBytesAsync(stream, (int)payloadLength) : new byte[0];
+                if (payload == null && payloadLength > 0) return string.Empty;
 
-                    switch (opcode)
+                if (isMasked && payloadLength > 0)
+                {
+                    for (int i = 0; i < payload.Length; i++)
                     {
-                        case 1: // Text frame
-                        case 2: // Binary frame
-                            {
-                                int payloadLength = buffer[offset + 1] & 0x7F;
-                                int headerSize = 2;
-
-                                if (payloadLength == 126)
-                                {
-                                    if (offset + 4 > bytesRead) return string.Empty;
-                                    payloadLength = (buffer[offset + 2] << 8) | buffer[offset + 3];
-                                    headerSize += 2;
-                                }
-                                else if (payloadLength == 127)
-                                {
-                                    if (offset + 10 > bytesRead) return string.Empty;
-                                    payloadLength = (int)(
-                                        ((long)buffer[offset + 2] << 56) |
-                                        ((long)buffer[offset + 3] << 48) |
-                                        ((long)buffer[offset + 4] << 40) |
-                                        ((long)buffer[offset + 5] << 32) |
-                                        ((long)buffer[offset + 6] << 24) |
-                                        ((long)buffer[offset + 7] << 16) |
-                                        ((long)buffer[offset + 8] << 8) |
-                                        ((long)buffer[offset + 9])
-                                    );
-                                    headerSize += 8;
-                                }
-
-                                if (offset + headerSize + 4 > bytesRead)
-                                    return string.Empty;
-
-                                byte[] maskingKey = new byte[4];
-                                Array.Copy(buffer, offset + headerSize, maskingKey, 0, 4);
-
-                                int payloadOffset = offset + headerSize + 4;
-                                int remainingBytes = bytesRead - payloadOffset;
-                                int payloadRead = Math.Min(payloadLength, remainingBytes);
-
-                                byte[] payload = new byte[payloadRead];
-                                Array.Copy(buffer, payloadOffset, payload, 0, payloadRead);
-
-                                for (int i = 0; i < payload.Length; i++)
-                                    payload[i] ^= maskingKey[i % 4];
-
-                                if (opcode == 2)
-                                {
-                                    return " BIN " + Encoding.UTF8.GetString(payload);
-                                }
-
-                                messageBuilder.AddRange(payload);
-                                offset += headerSize + 4 + payloadRead;
-
-                                if (isFinalFragment) break;
-                                payloadLength = 0;
-                                break;
-                            }
-
-                        case 8: // Close frame
-                            {
-                                byte[] responseCloseFrame = CreateCloseFrame();
-                                try { await stream.WriteAsync(responseCloseFrame, 0, responseCloseFrame.Length); }
-                                catch { }
-                                if (_clients.TryGetValue(client, out var myClient))
-                                    myClient.IsAlive = false;
-                                return string.Empty;
-                            }
-
-                        case 9: // Ping frame
-                            {
-                                byte[] pongFrame = CreatePongFrame(buffer, bytesRead, offset);
-                                try { await stream.WriteAsync(pongFrame, 0, pongFrame.Length); }
-                                catch { }
-                                offset += 2 + (buffer[offset + 1] & 0x7F);
-                                break;
-                            }
-
-                        case 10: // Pong frame
-                            {
-                                if (_clients.TryGetValue(client, out var myClient))
-                                {
-                                    myClient.LastPingTime = DateTime.Now;
-                                }
-                                offset += 2 + (buffer[offset + 1] & 0x7F);
-                                break;
-                            }
-
-                        default:
-                            return "Unexpected frame type received";
+                        payload[i] ^= maskingKey[i % 4];
                     }
                 }
+
+                switch (opcode)
+                {
+                    case 1: // Text
+                        return Encoding.UTF8.GetString(payload);
+                    case 2: // Binary
+                        return " BIN " + Encoding.UTF8.GetString(payload);
+                    case 8: // Close
+                        if (_clients.TryGetValue(client, out var myClientClose))
+                            myClientClose.IsAlive = false;
+                        return string.Empty;
+                    case 9: // Ping
+                        byte[] pongFrame = CreatePongFrame(payload);
+                        if (_clients.TryGetValue(client, out var myClientPing))
+                        {
+                            await myClientPing.WriteLock.WaitAsync();
+                            try
+                            {
+                                await stream.WriteAsync(pongFrame, 0, pongFrame.Length);
+                                await stream.FlushAsync();
+                            }
+                            finally { myClientPing.WriteLock.Release(); }
+                        }
+                        return null;
+                    case 10: // Pong
+                        if (_clients.TryGetValue(client, out var myClientPong))
+                        {
+                            // Fixed: Correctly register client responses
+                            myClientPong.LastPingTime = DateTime.Now;
+                        }
+                        return null;
+                    default:
+                        return "Unexpected frame type received";
+                }
             }
-
-            return Encoding.UTF8.GetString(messageBuilder.ToArray());
+            catch
+            {
+                return string.Empty;
+            }
         }
 
-        private byte[] CreatePongFrame(byte[] buffer, int bytesRead, int offset)
+        private byte[] CreatePongFrame(byte[] payload)
         {
-            byte[] pongFrame = new byte[2 + (buffer[offset + 1] & 0x7F)];
-            pongFrame[0] = 0x8A;
-            pongFrame[1] = buffer[offset + 1];
-            Array.Copy(buffer, offset + 2, pongFrame, 2, pongFrame.Length - 2);
-            return pongFrame;
-        }
-
-        private byte[] CreateCloseFrame(ushort statusCode = 1000, string reason = "")
-        {
-            byte[] statusCodeBytes = BitConverter.GetBytes(statusCode);
-            Array.Reverse(statusCodeBytes);
-            byte[] reasonBytes = Encoding.UTF8.GetBytes(reason);
-            byte[] payload = new byte[2 + reasonBytes.Length];
-            payload[0] = statusCodeBytes[0];
-            payload[1] = statusCodeBytes[1];
-            Array.Copy(reasonBytes, 0, payload, 2, reasonBytes.Length);
             byte[] frame = new byte[2 + payload.Length];
-            frame[0] = 0x88;
+            frame[0] = 0x8A; // FIN=1, Opcode=10 (Pong)
             frame[1] = (byte)payload.Length;
             Array.Copy(payload, 0, frame, 2, payload.Length);
             return frame;
@@ -815,6 +713,7 @@ namespace BNet.WebSocket.Server
             {
                 try
                 {
+                    myClient.IsAlive = false;
                     myClient.Stream?.Dispose();
                     client?.Close();
                 }

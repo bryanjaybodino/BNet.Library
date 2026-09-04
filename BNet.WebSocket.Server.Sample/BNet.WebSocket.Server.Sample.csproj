@@ -34,7 +34,8 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="BNet.WebSocket.Server, Version=10.0.0.0, Culture=neutral, processorArchitecture=MSIL">
-      <HintPath>..\packages\BNet.WebSocket.Server.10.0.0\lib\net472\BNet.WebSocket.Server.dll</HintPath>
+      <SpecificVersion>False</SpecificVersion>
+      <HintPath>..\BNet.WebSocket.Server\bin\Debug\net4.7.2\BNet.WebSocket.Server.dll</HintPath>
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />
