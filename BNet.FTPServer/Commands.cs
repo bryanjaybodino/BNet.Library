@@ -13,7 +13,7 @@ using System.Threading;
 using System.Security.Authentication;
 namespace BNet.FTPServer
 {
-    public class Commands
+       public class Commands
     {
         //https://www.serv-u.com/resources/tutorial/cwd-cdup-pwd-rmd-dele-smnt-site-ftp-command
         #region Private Components
@@ -80,7 +80,7 @@ namespace BNet.FTPServer
             {
                 isRunning = true;
                 _listener.Start();
-                Console.WriteLine("Server started. Waiting for clients...");
+                 FTPLogger.Log("Server started. Waiting for clients...");
 
                 while (isRunning)
                 {
@@ -99,7 +99,7 @@ namespace BNet.FTPServer
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Exception: {ex.Message}");
+                         FTPLogger.Log($"Exception: {ex.Message}");
                         // You might want to log exceptions and continue accepting new clients
                     }
                 }
@@ -133,9 +133,9 @@ namespace BNet.FTPServer
                 }
                 catch (OperationCanceledException ex)
                 {
-                    Console.WriteLine(ex.Message);
+                     FTPLogger.Log(ex.Message);
                 }
-                Console.WriteLine("Server stopped.");
+                 FTPLogger.Log("Server stopped.");
             }
             catch { }
         }
@@ -163,7 +163,7 @@ namespace BNet.FTPServer
                         var command = line.Split(' ')[0].ToUpperInvariant();
                         var argument = line.Length > command.Length ? line.Substring(command.Length + 1).Trim() : string.Empty;
 
-                        Console.WriteLine($"Received command: {command} {argument}");
+                         FTPLogger.Log($"Received command: {command} {argument}");
 
                         switch (command)
                         {
@@ -305,11 +305,11 @@ namespace BNet.FTPServer
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Exception while handling client: {ex.Message}");
+                 FTPLogger.Log($"Exception while handling client: {ex.Message}");
             }
             finally
             {
-                Console.WriteLine("Client disconnected.");
+                 FTPLogger.Log("Client disconnected.");
                 // Optionally remove the client from the dictionary
                 dictionaryTCPClientRemove(client);
 
@@ -537,7 +537,7 @@ namespace BNet.FTPServer
             try
             {
                 CheckConnection();
-                Console.WriteLine("Waiting for data connection...");
+                 FTPLogger.Log("Waiting for data connection...");
                 _dataClient = await _dataListener.AcceptTcpClientAsync();
                 var dataStream = _dataClient.GetStream();
                 var dataWriter = new StreamWriter(dataStream) { AutoFlush = true };
@@ -572,7 +572,7 @@ namespace BNet.FTPServer
             {
                 _dataClient?.Close();
                 _dataClient = null;
-                Console.WriteLine("Data connection closed\n");
+                 FTPLogger.Log("Data connection closed\n");
             }
         }
         #endregion
@@ -610,7 +610,7 @@ namespace BNet.FTPServer
             {
                 _dataClient?.Close();
                 _dataClient = null;
-                Console.WriteLine("Data connection closed\n");
+                 FTPLogger.Log("Data connection closed\n");
             }
         }
         #endregion
@@ -656,7 +656,7 @@ namespace BNet.FTPServer
             {
                 _dataClient?.Close();
                 _dataClient = null;
-                Console.WriteLine("Data connection closed\n");
+                 FTPLogger.Log("Data connection closed\n");
             }
         }
         #endregion
@@ -887,10 +887,9 @@ namespace BNet.FTPServer
             await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
             await stream.FlushAsync();
             await writer.FlushAsync();
-            Console.WriteLine("Server Reply : " + message + "\n");
+            FTPLogger.Log("Server Reply : " + message + "\n");
         }
         #endregion
-
 
         private void CheckConnection()
         {
@@ -917,5 +916,21 @@ namespace BNet.FTPServer
         }
         #endregion
 
+    }
+
+    public static class FTPLogger
+    {
+        // Event triggered for every log
+        public static event Action<string> OnLog;
+
+        // Call this instead of  FTPLogger.Log
+        public static void Log(string message)
+        {
+            var timestamp = DateTime.Now.ToString("HH:mm:ss");
+            var formatted = $"[{timestamp}] {message.Replace("Received command: ","")}";
+
+            // Trigger the event
+            OnLog?.Invoke(formatted);
+        }
     }
 }
