@@ -1,19 +1,20 @@
-﻿using System.IO;
-using System.Net.Security;
-using System.Net.Sockets;
-using System.Net;
-using System.Security.Cryptography.X509Certificates;
-using System.Threading.Tasks;
-using System;
-using System.Linq;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
-using System.Threading;
 using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading;
+using System.Threading.Tasks;
 namespace BNet.FTPServer
 {
-       public class Commands
+    public class Commands
     {
         //https://www.serv-u.com/resources/tutorial/cwd-cdup-pwd-rmd-dele-smnt-site-ftp-command
         #region Private Components
@@ -80,7 +81,7 @@ namespace BNet.FTPServer
             {
                 isRunning = true;
                 _listener.Start();
-                 FTPLogger.Log("Server started. Waiting for clients...");
+                FTPLogger.Log("Server started. Waiting for clients...");
 
                 while (isRunning)
                 {
@@ -88,6 +89,7 @@ namespace BNet.FTPServer
                     {
                         // Accept a new client
                         var client = await _listener.AcceptTcpClientAsync();
+                        client.NoDelay = true; // Prevents TCP packet aggregation delays
 
                         var clientCancellationTokenSource = new CancellationTokenSource();
                         // Handle the new client connection
@@ -99,7 +101,7 @@ namespace BNet.FTPServer
                     }
                     catch (Exception ex)
                     {
-                         FTPLogger.Log($"Exception: {ex.Message}");
+                        FTPLogger.Log($"Exception: {ex.Message}");
                         // You might want to log exceptions and continue accepting new clients
                     }
                 }
@@ -133,9 +135,9 @@ namespace BNet.FTPServer
                 }
                 catch (OperationCanceledException ex)
                 {
-                     FTPLogger.Log(ex.Message);
+                    FTPLogger.Log(ex.Message);
                 }
-                 FTPLogger.Log("Server stopped.");
+                FTPLogger.Log("Server stopped.");
             }
             catch { }
         }
@@ -173,7 +175,7 @@ namespace BNet.FTPServer
                         var command = line.Split(' ')[0].ToUpperInvariant();
                         var argument = line.Length > command.Length ? line.Substring(command.Length + 1).Trim() : string.Empty;
 
-                         FTPLogger.Log($"Received command: {command} {argument}");
+                        FTPLogger.Log($"Received command: {command} {argument}");
 
                         switch (command)
                         {
@@ -302,6 +304,9 @@ namespace BNet.FTPServer
                                 await ReplyAsync(networkStream, writer, 215, "UNIX Type: L8");
                                 Console.ResetColor();
                                 break;
+                            case "XZIP":
+                                await HandleXZipCommandAsync(client, networkStream, writer, argument);
+                                break;
                             default:
                                 await ReplyAsync(networkStream, writer, 502, "Command not implemented");
                                 break;
@@ -315,11 +320,11 @@ namespace BNet.FTPServer
             }
             catch (Exception ex)
             {
-                 FTPLogger.Log($"Exception while handling client: {ex.Message}");
+                FTPLogger.Log($"Exception while handling client: {ex.Message}");
             }
             finally
             {
-                 FTPLogger.Log("Client disconnected.");
+                FTPLogger.Log("Client disconnected.");
                 // Optionally remove the client from the dictionary
                 dictionaryTCPClientRemove(client);
 
@@ -327,6 +332,43 @@ namespace BNet.FTPServer
         }
 
 
+        #region HandleXZipCommandAsync
+        private async Task HandleXZipCommandAsync(TcpClient client, NetworkStream stream, StreamWriter writer, string targetPath)
+        {
+            if (string.IsNullOrWhiteSpace(targetPath))
+            {
+                await ReplyAsync(stream, writer, 501, "Syntax error in parameters or arguments.");
+                return;
+            }
+
+            var sourceDir = Path.Combine(dictionaryCurrentDirectory(client), targetPath);
+
+            if (!Directory.Exists(sourceDir))
+            {
+                await ReplyAsync(stream, writer, 550, "Directory not found.");
+                return;
+            }
+
+            string zipFilePath = sourceDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + ".zip";
+
+            try
+            {
+                if (File.Exists(zipFilePath))
+                {
+                    File.Delete(zipFilePath);
+                }
+
+                // Compress directory on server thread/task
+                await Task.Run(() => ZipFile.CreateFromDirectory(sourceDir, zipFilePath, CompressionLevel.Fastest, includeBaseDirectory: false));
+
+                await ReplyAsync(stream, writer, 200, $"Directory zipped successfully to {Path.GetFileName(zipFilePath)}");
+            }
+            catch (Exception ex)
+            {
+                await ReplyAsync(stream, writer, 550, $"Failed to create zip: {ex.Message}");
+            }
+        }
+        #endregion
         #region HandlePortCommandAsync
         private async Task HandlePortCommandAsync(TcpClient client, NetworkStream networkStream, StreamWriter writer, string argument)
         {
@@ -482,16 +524,21 @@ namespace BNet.FTPServer
                 return;
             }
 
-            string fullPath = Path.IsPathRooted(directoryName) ? Path.GetFullPath(directoryName) : Path.GetFullPath(Path.Combine(dictionaryCurrentDirectory(client), directoryName));
+            string fullPath = Path.IsPathRooted(directoryName)
+                ? Path.GetFullPath(directoryName)
+                : Path.GetFullPath(Path.Combine(dictionaryCurrentDirectory(client), directoryName));
 
             try
             {
-                Directory.CreateDirectory(fullPath);
+                if (!Directory.Exists(fullPath))
+                {
+                    Directory.CreateDirectory(fullPath);
+                }
                 await ReplyAsync(stream, writer, 257, $"\"{directoryName}\" directory created.");
             }
             catch (Exception ex)
             {
-                await ReplyAsync(stream, writer, 550, "Failed to create directory.");
+                await ReplyAsync(stream, writer, 550, $"Failed to create directory: {ex.Message}");
             }
         }
         #endregion
@@ -547,7 +594,7 @@ namespace BNet.FTPServer
             try
             {
                 CheckConnection();
-                 FTPLogger.Log("Waiting for data connection...");
+                FTPLogger.Log("Waiting for data connection...");
                 _dataClient = await _dataListener.AcceptTcpClientAsync();
                 var dataStream = _dataClient.GetStream();
                 var dataWriter = new StreamWriter(dataStream) { AutoFlush = true };
@@ -582,7 +629,7 @@ namespace BNet.FTPServer
             {
                 _dataClient?.Close();
                 _dataClient = null;
-                 FTPLogger.Log("Data connection closed\n");
+                FTPLogger.Log("Data connection closed\n");
             }
         }
         #endregion
@@ -605,9 +652,11 @@ namespace BNet.FTPServer
                 var dataStream = _dataClient.GetStream();
 
                 var filePath = Path.Combine(dictionaryCurrentDirectory(client), fileName);
-                using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write))
+
+                // Use an 80 KB buffer for fast sequential disk I/O
+                using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
                 {
-                    await dataStream.CopyToAsync(fileStream);
+                    await dataStream.CopyToAsync(fileStream, 81920);
                 }
 
                 await ReplyAsync(stream, writer, 226, "Transfer complete");
@@ -620,7 +669,6 @@ namespace BNet.FTPServer
             {
                 _dataClient?.Close();
                 _dataClient = null;
-                 FTPLogger.Log("Data connection closed\n");
             }
         }
         #endregion
@@ -666,7 +714,7 @@ namespace BNet.FTPServer
             {
                 _dataClient?.Close();
                 _dataClient = null;
-                 FTPLogger.Log("Data connection closed\n");
+                FTPLogger.Log("Data connection closed\n");
             }
         }
         #endregion
@@ -805,26 +853,25 @@ namespace BNet.FTPServer
         #region ListDirectoryContents
         private async Task ListDirectoryContents(StreamWriter dataWriter, string directory)
         {
-            var dirs = Directory.GetDirectories(directory);
-            var files = Directory.GetFiles(directory);
+            var dirInfo = new DirectoryInfo(directory);
 
-            foreach (var dir in dirs)
+            // Batch lines into a buffer to minimize write calls
+            var sb = new System.Text.StringBuilder();
+
+            foreach (var dir in dirInfo.EnumerateDirectories())
             {
-                dataWriter.AutoFlush = true;
-                var dirInfo = new DirectoryInfo(dir);
-                var date = dirInfo.LastWriteTime.ToString("MMM dd yyyy");
-                await dataWriter.WriteLineAsync($"drwxr-xr-x 1 owner group 0 {date} {dirInfo.Name}");
-                await dataWriter.FlushAsync();
+                var date = dir.LastWriteTime.ToString("MMM dd yyyy");
+                sb.AppendLine($"drwxr-xr-x 1 owner group 0 {date} {dir.Name}");
             }
 
-            foreach (var file in files)
+            foreach (var file in dirInfo.EnumerateFiles())
             {
-                dataWriter.AutoFlush = true;
-                var fileInfo = new FileInfo(file);
-                var date = fileInfo.LastWriteTime.ToString("MMM dd yyyy");
-                await dataWriter.WriteLineAsync($"-rw-r--r-- 1 owner group {fileInfo.Length} {date} {fileInfo.Name}");
-                await dataWriter.FlushAsync();
+                var date = file.LastWriteTime.ToString("MMM dd yyyy");
+                sb.AppendLine($"-rw-r--r-- 1 owner group {file.Length} {date} {file.Name}");
             }
+
+            await dataWriter.WriteAsync(sb.ToString());
+            await dataWriter.FlushAsync();
         }
         #endregion
 
@@ -937,7 +984,7 @@ namespace BNet.FTPServer
         public static void Log(string message)
         {
             var timestamp = DateTime.Now.ToString("HH:mm:ss");
-            var formatted = $"[{timestamp}] {message.Replace("Received command: ","")}";
+            var formatted = $"[{timestamp}] {message.Replace("Received command: ", "")}";
 
             // Trigger the event
             OnLog?.Invoke(formatted);
