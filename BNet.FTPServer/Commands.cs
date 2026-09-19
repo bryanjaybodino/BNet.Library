@@ -19,7 +19,7 @@ namespace BNet.FTPServer
         #region Private Components
         private System.Text.Encoding encoding = System.Text.Encoding.UTF8;
         private ConcurrentDictionary<TcpClient, Task> _clients = new ConcurrentDictionary<TcpClient, Task>();
-        private Dictionary<TcpClient, string> TcpClientDictionary = new Dictionary<TcpClient, string>();
+        private ConcurrentDictionary<TcpClient, string> TcpClientDictionary = new ConcurrentDictionary<TcpClient, string>();
         private readonly object _lock = new object(); //Thread Safety: Use the _lock object to synchronize access to _isRunning and _listener.
         private readonly ConcurrentDictionary<Task, CancellationTokenSource> _clientCancellationTokens = new ConcurrentDictionary<Task, CancellationTokenSource>();
 
@@ -146,7 +146,7 @@ namespace BNet.FTPServer
         {
             try
             {
-                TcpClientDictionary.Add(client, Path.GetFullPath(_rootFolder));
+                TcpClientDictionary.TryAdd(client, Path.GetFullPath(_rootFolder));
                 var networkStream = client.GetStream();
                 var reader = new StreamReader(networkStream, encoding);
                 var writer = new StreamWriter(networkStream) { AutoFlush = true };
@@ -158,7 +158,17 @@ namespace BNet.FTPServer
                     try
                     {
                         var line = await reader.ReadLineAsync();
-                        if (string.IsNullOrEmpty(line)) continue;
+
+                        // End of stream reached (client disconnected)
+                        if (line == null)
+                        {
+                            break;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(line))
+                        {
+                            continue;
+                        }
 
                         var command = line.Split(' ')[0].ToUpperInvariant();
                         var argument = line.Length > command.Length ? line.Substring(command.Length + 1).Trim() : string.Empty;
@@ -903,11 +913,11 @@ namespace BNet.FTPServer
         #region THIS CODES IS FOR LISTING ALL TCP CLIENTS TO GET CURRENT DIRECTORY
         private string dictionaryCurrentDirectory(TcpClient client)
         {
-            return TcpClientDictionary[client].ToString();
+            return TcpClientDictionary.TryGetValue(client, out var dir) ? dir : _rootFolder;
         }
         private void dictionaryTCPClientRemove(TcpClient client)
         {
-            TcpClientDictionary.Remove(client);
+            TcpClientDictionary.TryRemove(client, out _);
             _clients.TryRemove(client, out _);
         }
         private void dictionaryTCPClientUpdate(TcpClient client, string newDirectory)
