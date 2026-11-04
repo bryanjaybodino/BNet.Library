@@ -91,24 +91,45 @@ namespace BNet.FTPServer
                         var client = await _listener.AcceptTcpClientAsync();
                         client.NoDelay = true; // Prevents TCP packet aggregation delays
 
+                        // Enable TCP Keep-Alive to prevent NAT/firewall idle drops
+                        SetTcpKeepAlive(client, true, 60000, 20000);
+
                         var clientCancellationTokenSource = new CancellationTokenSource();
-                        // Handle the new client connection
-                        var clientTask = Task.Run(() => HandleClientAsync(client), clientCancellationTokenSource.Token);
+                        var clientTask = Task.Run(() => HandleClientAsync(client, clientCancellationTokenSource.Token), clientCancellationTokenSource.Token);
 
-
-                        // Store the task in the dictionary
                         _clients[client] = clientTask;
+                        _clientCancellationTokens[clientTask] = clientCancellationTokenSource;
                     }
                     catch (Exception ex)
                     {
                         FTPLogger.Log($"Exception: {ex.Message}");
-                        // You might want to log exceptions and continue accepting new clients
                     }
                 }
             }
             catch { }
         }
+        private void SetTcpKeepAlive(TcpClient client, bool enabled, int timeMs, int intervalMs)
+        {
+            try
+            {
+                client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, enabled);
+
+                // For Windows .NET Framework / .NET Core compatibility
+                byte[] inValue = new byte[ef(enabled) ? 12 : 4];
+                BitConverter.GetBytes(enabled ? 1 : 0).CopyTo(inValue, 0);
+                BitConverter.GetBytes(timeMs).CopyTo(inValue, 4);
+                BitConverter.GetBytes(intervalMs).CopyTo(inValue, 8);
+                client.Client.IOControl(IOControlCode.KeepAliveValues, inValue, null);
+            }
+            catch
+            {
+                // Fallback if IOControl isn't supported on specific runtime environments
+            }
+        }
+
+        private bool ef(bool val) => val;
         #endregion
+
 
         #region StopAsync
         public async Task StopAsync()
@@ -144,33 +165,31 @@ namespace BNet.FTPServer
 
         #endregion
 
-        private async Task HandleClientAsync(TcpClient client)
+        private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
         {
             try
             {
                 TcpClientDictionary.TryAdd(client, Path.GetFullPath(_rootFolder));
                 var networkStream = client.GetStream();
+
+                // Set a generous read timeout (e.g., 5 minutes) to drop dead/abandoned connections cleanly
+                networkStream.ReadTimeout = 300000;
+
                 var reader = new StreamReader(networkStream, encoding);
                 var writer = new StreamWriter(networkStream) { AutoFlush = true };
 
                 await ReplyAsync(networkStream, writer, 220, "Welcome to Simple FTP Server");
 
-                while (isRunning)
+                while (isRunning && !cancellationToken.IsCancellationRequested)
                 {
                     try
                     {
-                        var line = await reader.ReadLineAsync();
+                        // Use a task wrapper or cancellation-aware read
+                        var readTask = reader.ReadLineAsync();
+                        var line = await readTask;
 
-                        // End of stream reached (client disconnected)
-                        if (line == null)
-                        {
-                            break;
-                        }
-
-                        if (string.IsNullOrWhiteSpace(line))
-                        {
-                            continue;
-                        }
+                        if (line == null) break;
+                        if (string.IsNullOrWhiteSpace(line)) continue;
 
                         var command = line.Split(' ')[0].ToUpperInvariant();
                         var argument = line.Length > command.Length ? line.Substring(command.Length + 1).Trim() : string.Empty;
